@@ -255,6 +255,7 @@ function resizeScreen () {
     setTimeout(function() { resizeScreen(); },200);
   } else {
     if (term.cols!= geom.cols || term.rows != geom.rows) {
+      term.resize(geom.cols, geom.rows);
       if(authenticated){
         if (resizewait) { 
           resizepending=true; 
@@ -415,6 +416,7 @@ function onmessage(message) {
           formstatus.innerHTML="";
           loginform.style.display="none";
           terminaldiv.style.display="block";
+          term.refresh(0,term.rows-1);
           term.focus();
           setTimeout(function () {term.scrollToBottom();},200);
           resizeScreen();
@@ -428,10 +430,13 @@ function onmessage(message) {
           if ('shareid' in json) setShareid(json.shareid);
           document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
+          term.reset();
+          term.refresh(0,term.rows-1);
           var formstatus=document.getElementById('formstatus');
           formstatus.innerHTML="";
           loginform.style.display="none";
           term.focus();
+          resizeScreen();
           break;;
         case "warn":
           showsnack(json.warn);

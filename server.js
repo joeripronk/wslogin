@@ -160,7 +160,8 @@ function create_mirror(cols, rows) {
     bytesSinceCheckpoint: 0,
     lastCheckpoint: now(),
     busy: false,
-    saving: false
+    saving: false,
+    saveRequested: false
   };
 }
 
@@ -219,20 +220,21 @@ function checkpoint_due(session) {
 
 function maybe_save_checkpoint(session) {
   var mirror=session.mirror;
-  if (!mirror || mirror.busy || mirror.saving || !checkpoint_due(session)) return;
-  save_checkpoint(session);
+  if (!mirror || mirror.busy || mirror.saving) return;
+  if (!mirror.saveRequested && !checkpoint_due(session)) return;
+  if (save_checkpoint(session)) mirror.saveRequested=false;
 }
 
 function save_checkpoint(session) {
   var mirror=session.mirror;
-  if (!session.pty || !session.pty.file || !session.checkpoint_path) return;
+  if (!session.pty || !session.pty.file || !session.checkpoint_path) return false;
   var offset=mirror.offset;
   try {
     if (fs.fstatSync(session.pty.file).size < offset) {
-      return;
+      return false;
     }
   } catch (error) {
-    return;
+    return false;
   }
   var checkpoint={
     version:1,
@@ -261,6 +263,13 @@ function save_checkpoint(session) {
       mirror.saving=false;
     });
   });
+  return true;
+}
+
+function checkpoint_on_disconnect(session) {
+  if (!session || !session.mirror) return;
+  session.mirror.saveRequested=true;
+  maybe_save_checkpoint(session);
 }
 
 setInterval(function() {
@@ -419,7 +428,7 @@ wsServer.on('request', function(request) {
       // force a redrwa, to fix term properties at cursor for tmux and others
       // currently terminal properties of the last drawn character are active
       // e.g. the green bar of tmux
-      if (rows>1 && cols >1 && (serial.cols!=cols || serial.rows != serial.rows)) {
+      if (rows>1 && cols >1 && (serial.cols!=cols || serial.rows != rows)) {
         console.log("resizing reconnected to "+sessioncookie+' to '+cols+'x'+rows);
         sessions[username][sessioncookie].pty.resize(cols,rows);
       } else {
@@ -828,6 +837,7 @@ wsServer.on('request', function(request) {
 	if (connection.username in sessions && connection.sessioncookie in sessions[connection.username] && sessions[connection.username][connection.sessioncookie].pty.main == connection) {
 	  console.log("Main connection for "+connection.username+" "+connection.sessioncookie+" disconnected");
 	  sessions[connection.username][connection.sessioncookie].pty.main=false;
+	  checkpoint_on_disconnect(sessions[connection.username][connection.sessioncookie]);
 	}
       } else {
         console.log("username and session "+connection.sessioncookie+" for  "+connection.username+" already cleaned up");
