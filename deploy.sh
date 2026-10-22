@@ -34,6 +34,7 @@ if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
     --exclude='node_modules/' \
     --exclude='sessions/' \
     --exclude='cookies/' \
+    --exclude='ssl/' \
     --exclude='*.key' \
     --exclude='*.crt' \
     --exclude='*.cert' \

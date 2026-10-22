@@ -3,6 +3,9 @@ process.title = 'wslogin';
 var webSocketServer = require('websocket').server;
 //const isValidUTF8 = require('utf-8-validate');
 const http = require('http');
+const https = require('https');
+const net = require('net');
+const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const readline = require('readline');
@@ -10,6 +13,7 @@ const pty = require('node-pty');
 const { Terminal } =  require ("@xterm/headless");
 //const { Terminal } =  require ("@xterm/xterm");
 const { SerializeAddon } = require("@xterm/addon-serialize");
+const { loadSslOptions, allowPlaintext } = require('./ssl');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
@@ -20,7 +24,13 @@ function now() {
 }
 
 var ini = require('ini');
-var config = ini.parse(fs.readFileSync('/etc/wslogin/config.ini', 'utf-8',true));
+var configPath = process.env.WSLOGIN_CONFIG || '/etc/wslogin/config.ini';
+if (!fs.existsSync(configPath)) {
+  console.error("configuration file not found: "+configPath);
+  process.exit(1);
+}
+var config = ini.parse(fs.readFileSync(configPath, 'utf-8',true));
+console.log("using configuration file "+configPath);
 if ('cookie_dir' in config) {
   console.log("cookie_dir="+config.cookie_dir);
 } else {
@@ -47,10 +57,27 @@ if (checkpoint_interval_seconds==0 && checkpoint_bytes==0) {
 console.log("checkpoints: enabled="+checkpoint_enabled
   +" interval="+checkpoint_interval_seconds+"s bytes="+checkpoint_bytes);
 
-console.log(JSON.stringify(config));
+function redactConfig(cfg) {
+  var copy = JSON.parse(JSON.stringify(cfg));
+  var httpsSection = copy['https'];
+  if (httpsSection && typeof httpsSection == 'object') {
+    if ('passphrase' in httpsSection) httpsSection.passphrase = '***';
+    if ('key_password' in httpsSection) httpsSection.key_password = '***';
+  }
+  return copy;
+}
+
+console.log(JSON.stringify(redactConfig(config)));
 var shell = os.platform() === 'win32' ? 'powershell.exe' : '/bin/bash';
 
-const webSocketsServerPort = 9022;
+const webSocketsServerPort = configInt('port', 9022);
+var session_dir = config.session_dir
+  ? path.resolve(__dirname, config.session_dir)
+  : path.join(__dirname, 'sessions');
+console.log("session_dir="+session_dir);
+function session_path(username, sessioncookie, suffix) {
+  return path.join(session_dir, username, sessioncookie+suffix);
+}
 var clients = [ ];
 var logins = {};
 var sessions = {};
@@ -308,7 +335,7 @@ function sendInfo(c,msg) {
 /**
  * HTTP server
  */
-var server = http.createServer(function(request, response) {
+function httpHandler(request, response) {
   // Not important for us. We're writing WebSocket server,
   // not HTTP server    
 
@@ -327,11 +354,74 @@ var server = http.createServer(function(request, response) {
     response.statusCode = 404;
     response.end('');
   }
-});
+}
+
+var httpServer = http.createServer(httpHandler);
+
+/**
+ * HTTPS server, enabled through the [https] section of the configuration.
+ * When no certificate and key are configured, a self-signed certificate
+ * is generated automatically.
+ */
+var httpsServer = null;
+var sslOptions = null;
+try {
+  sslOptions = loadSslOptions(config, {baseDir: __dirname});
+} catch (error) {
+  console.error("ssl configuration error: "+error.message);
+  process.exit(1);
+}
+if (sslOptions) {
+  httpsServer = https.createServer(sslOptions, httpHandler);
+  console.log("https enabled using "+sslOptions.certFile
+    + (sslOptions.selfSigned ? " (self-signed)" : ""));
+}
+
+var allow_http = allowPlaintext(config);
+if (!httpsServer && !allow_http) {
+  console.error("plain http is disabled but https is not enabled, there is nothing to serve");
+  process.exit(1);
+}
+if (httpsServer && !allow_http) {
+  console.log("plain http is disabled, only https/wss is served");
+}
+
+/**
+ * When https is enabled both plain http and https are served on the same
+ * port. The first byte of the connection tells us which protocol to use:
+ * 0x16 is the start of a TLS handshake. Plain http connections are refused
+ * when allow_http is disabled.
+ */
+var server = httpServer;
+if (httpsServer) {
+  server = net.createServer(function(socket) {
+    socket.once('data', function(chunk) {
+      socket.pause();
+      socket.unshift(chunk);
+      if (chunk[0] === 0x16) {
+        httpsServer.emit('connection', socket);
+      } else if (allow_http) {
+        httpServer.emit('connection', socket);
+        // the http server does not resume the socket for us
+        socket.resume();
+      } else {
+        var message = "plain http is disabled, use https";
+        socket.resume();
+        socket.end("HTTP/1.1 403 Forbidden\r\n"
+          +"Connection: close\r\n"
+          +"Content-Type: text/plain\r\n"
+          +"Content-Length: "+Buffer.byteLength(message)+"\r\n"
+          +"\r\n"
+          +message);
+      }
+    });
+  });
+}
 
 server.listen(webSocketsServerPort, function() {
   console.log("Server is listening on port "
-    + webSocketsServerPort + ".");
+    + webSocketsServerPort
+    + (httpsServer ? (allow_http ? " (http and https)" : " (https only)") : "") + ".");
 });
 
 /**
@@ -341,7 +431,7 @@ var wsServer = new webSocketServer({
   // WebSocket server is tied to a HTTP server. WebSocket
   // request is just an enhanced HTTP request. For more info 
   // http://tools.ietf.org/html/rfc6455#page-6
-  httpServer: server,
+  httpServer: httpsServer ? (allow_http ? [httpServer, httpsServer] : httpsServer) : httpServer,
   autoAcceptConnections: false
 });
 function originIsAllowed(origin) {
@@ -411,8 +501,8 @@ wsServer.on('request', function(request) {
     */
   async function replay_pty(username,sessioncookie,cols,rows,connection) {
     console.log("reconnected to "+sessioncookie+" "+sessions[username][sessioncookie].pty.file);
-    var checkpointfile=checkpoint_enabled ? 'sessions/'+username+'/'+sessioncookie+'.checkpoint.json' : null;
-    var serial = await create_replayed_terminal('sessions/'+username+'/'+sessioncookie+'.json', checkpointfile);
+    var checkpointfile=checkpoint_enabled ? session_path(username,sessioncookie,'.checkpoint.json') : null;
+    var serial = await create_replayed_terminal(session_path(username,sessioncookie,'.json'), checkpointfile);
     connection.sendUTF('\0'+JSON.stringify({cmd:"resize",cols:serial.cols,rows:serial.rows}));
     connection.sendUTF('\1'+serial.s);
     console.log("sending replayed terminal");
@@ -524,10 +614,10 @@ wsServer.on('request', function(request) {
       //  }
       var session=sessions[username][sessioncookie];
       session.sessioncookie=sessioncookie;
-      session.checkpoint_path='sessions/'+username+'/'+sessioncookie+'.checkpoint.json';
+      session.checkpoint_path=session_path(username,sessioncookie,'.checkpoint.json');
       session.mirror=create_mirror(connection.columns, connection.rows);
-      fs.mkdirSync('sessions/'+username, { recursive: true });
-      //file = fs.createWriteStream('sessions/'+username+'/'+sessioncookie+'.json', { flags: 'a' });
+      fs.mkdirSync(path.join(session_dir,username), { recursive: true });
+      //file = fs.createWriteStream(session_path(username,sessioncookie,'.json'), { flags: 'a' });
       sessions[username][sessioncookie].pty = pty.spawn('sudo', ['-u',username,'-i'], {
         name: 'xterm',
         cols: connection.columns,
@@ -535,7 +625,7 @@ wsServer.on('request', function(request) {
         cwd: '/',
         env: { USER: username,VIEWID: viewid,VIEWURL: request.origin+'/#view='+viewid,SUDO_USER: username }
       });
-      sessions[username][sessioncookie].pty.file = fopen('sessions/'+username+'/'+sessioncookie+'.json', 'a+');
+      sessions[username][sessioncookie].pty.file = fopen(session_path(username,sessioncookie,'.json'), 'a+');
       /*        sessions[username][sessioncookie].pty.sessioncookie=sessioncookie;
         sessions[username][sessioncookie].pty.username=username;
         */
