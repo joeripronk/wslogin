@@ -1,0 +1,1 @@
+../node_modules/xterm-addon-web-links/lib/xterm-addon-web-links.js
