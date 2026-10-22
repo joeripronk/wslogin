@@ -1,1 +1,1 @@
-../node_modules/xterm-addon-fit/lib/xterm-addon-fit.js
+t/xterm-addon-fit.js

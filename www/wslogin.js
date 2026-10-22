@@ -123,7 +123,6 @@ var authenticated=false;
 var options = {
   scrollback: 10000,
   cursorBlink: true,
-  bellStyle: 'visual',
   fontSize: 14,
   lineHeight: 1,
   theme: {
@@ -206,7 +205,6 @@ var term = new window.Terminal({
   theme: baseTheme,
   cursorBlink: true,
   scrollback: 10000,
-  bellStyle: 'visual',
   convertEol: false
 });
 term.onTitleChange(function (title) {
@@ -273,12 +271,12 @@ function resizeScreen () {
 socket.onclose = function (connection) {
   if(connected) {
     //  console.log('connection closed');
-    term.writeUtf8("\r\nConnection closed         \r\n");
+    term.write("\r\nConnection closed         \r\n");
     connected=false;
     authenticated=false;
     loginform.style.display="none";
   } else {
-    term.writeUtf8("\rConnection failed\r\n");
+    term.write("\rConnection failed\r\n");
     showsnack("Failed to connect");
     loginform.style.display="none";
   }
@@ -390,7 +388,7 @@ socket.onmessage = function (message) {
       }
       break;;
     case '\1':
-      term.writeUtf8(data);
+      term.write(data);
       break;;
     default:
       alert(message.data);

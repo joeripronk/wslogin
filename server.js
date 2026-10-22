@@ -7,9 +7,9 @@ const fs = require('fs');
 const os = require('os');
 const readline = require('readline');
 const pty = require('node-pty');
-const { Terminal } =  require ("xterm-headless");
-//const { Terminal } =  require ("xterm");
-const { SerializeAddon } = require("xterm-addon-serialize");
+const { Terminal } =  require ("@xterm/headless");
+//const { Terminal } =  require ("@xterm/xterm");
+const { SerializeAddon } = require("@xterm/addon-serialize");
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
@@ -49,7 +49,7 @@ function fopen(fname,flags) {
 async function create_replayed_terminal (file) {
   return new Promise((resolve, reject) => {
     var i=0;
-    var terminal = new Terminal();
+    var terminal = new Terminal({ allowProposedApi: true });
     var rd = readline.createInterface({
       input: fs.createReadStream(file),
       terminal: false
@@ -62,10 +62,10 @@ async function create_replayed_terminal (file) {
           terminal.resize(c.cols,c.rows);
         }
       } else if (json.c==1) {
-        terminal.writeUtf8(json.d);
+        terminal.write(json.d);
       }
     }).on('close', function() {
-      terminal.writeUtf8("",function () {
+      terminal.write("",function () {
         const {isCursorHidden} = terminal._core._inputHandler._coreService;
         if (isCursorHidden) {
           console.log("cursor is hidden");
@@ -353,7 +353,7 @@ wsServer.on('request', function(request) {
       });
       connection.sessioncookie=sessioncookie;
       sessions[username][sessioncookie].pty.on('resize', function() {
-        cmdtxt='\0'+JSON.stringify({cmd:"resize",rows:sessions[connection.username][connection.sessioncookie].pty.stdout.rows,cols:sessions[connection.username][connection.sessioncookie].pty.stdout.columns});
+        cmdtxt='\0'+JSON.stringify({cmd:"resize",rows:sessions[connection.username][connection.sessioncookie].pty.rows,cols:sessions[connection.username][connection.sessioncookie].pty.cols});
         console.log("DEBUG: "+cmdtext);
         write(sessions[connection.username][connection.sessioncookie].pty.file,cmdtext+'\n');
 

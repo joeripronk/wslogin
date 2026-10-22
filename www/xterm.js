@@ -1,1 +1,1 @@
-../node_modules/xterm/lib/xterm.js
+t/xterm.js
