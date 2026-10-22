@@ -27,6 +27,26 @@ if ('cookie_dir' in config) {
   console.log("no cookie_dir, local sessions disabled");
 }
 
+function configInt(name, fallback) {
+  if (!(name in config)) return fallback;
+  var value = parseInt(config[name], 10);
+  return Number.isFinite(value) ? value : fallback;
+}
+function configBool(name, fallback) {
+  if (!(name in config)) return fallback;
+  var value = String(config[name]).toLowerCase();
+  return !(value=='0' || value=='false' || value=='no' || value=='off');
+}
+
+var checkpoint_enabled = configBool('checkpoint_enabled', true);
+var checkpoint_interval_seconds = Math.max(0, configInt('checkpoint_interval_seconds', 3600));
+var checkpoint_bytes = Math.max(0, configInt('checkpoint_bytes', 1024 * 1024));
+if (checkpoint_interval_seconds==0 && checkpoint_bytes==0) {
+  checkpoint_enabled=false;
+}
+console.log("checkpoints: enabled="+checkpoint_enabled
+  +" interval="+checkpoint_interval_seconds+"s bytes="+checkpoint_bytes);
+
 console.log(JSON.stringify(config));
 var shell = os.platform() === 'win32' ? 'powershell.exe' : '/bin/bash';
 
@@ -36,6 +56,7 @@ var logins = {};
 var sessions = {};
 var views = {};
 var shares = {};
+var reconnects = {};
 var wwwdir = "www"; 
 
 function write(fd,d) {
@@ -46,37 +67,218 @@ function write(fd,d) {
 function fopen(fname,flags) {
   return fs.openSync(fname,flags);
 }
-async function create_replayed_terminal (file) {
+function serialize_terminal(terminal, serializeAddon) {
+  const {isCursorHidden} = terminal._core._inputHandler._coreService;
+  return serializeAddon.serialize()+(isCursorHidden ? '\x1b[?25l' : '\x1b[?25h');
+}
+
+function load_checkpoint(file, checkpointfile) {
+  if (!fs.existsSync(checkpointfile)) {
+    return null;
+  }
+  try {
+    var checkpoint=JSON.parse(fs.readFileSync(checkpointfile, 'utf-8'));
+    if (checkpoint.version!==1 ||
+        !Number.isInteger(checkpoint.offset) || checkpoint.offset<0 ||
+        !Number.isInteger(checkpoint.cols) || checkpoint.cols<1 ||
+        !Number.isInteger(checkpoint.rows) || checkpoint.rows<1 ||
+        typeof checkpoint.serialized !== 'string') {
+      console.log("ignoring invalid checkpoint "+checkpointfile);
+      return null;
+    }
+    if (checkpoint.offset > fs.statSync(file).size) {
+      console.log("ignoring checkpoint past end of "+file);
+      return null;
+    }
+    console.log("using checkpoint "+checkpointfile+" at offset "+checkpoint.offset);
+    return checkpoint;
+  } catch (error) {
+    console.error("error reading checkpoint "+checkpointfile+": "+error.message);
+    return null;
+  }
+}
+
+async function create_replayed_terminal (file, checkpointfile) {
+  var checkpoint=checkpointfile ? load_checkpoint(file, checkpointfile) : null;
   return new Promise((resolve, reject) => {
-    var i=0;
     var terminal = new Terminal({ allowProposedApi: true });
-    var rd = readline.createInterface({
-      input: fs.createReadStream(file),
-      terminal: false
-    });
-    rd.on('line', function(line) {
-      json=JSON.parse(line);
-      if (json.c==0) {
-        const c=JSON.parse(json.d);
-        if (c.cmd=="resize") {
-          terminal.resize(c.cols,c.rows);
-        }
-      } else if (json.c==1) {
-        terminal.write(json.d);
-      }
-    }).on('close', function() {
+    var serializeAddon = new SerializeAddon();
+    terminal.loadAddon(serializeAddon);
+    const finish = function() {
       terminal.write("",function () {
         const {isCursorHidden} = terminal._core._inputHandler._coreService;
         if (isCursorHidden) {
           console.log("cursor is hidden");
         }
-        const serializeAddon = new SerializeAddon();
-        terminal.loadAddon(serializeAddon);
-        resolve({cols:terminal.cols,rows:terminal.rows,s:serializeAddon.serialize()+(isCursorHidden ? '\x1b[?25l' : '\x1b[?25h')});
+        resolve({cols:terminal.cols,rows:terminal.rows,s:serialize_terminal(terminal, serializeAddon)});
       })
+    };
+    const replay = function() {
+      var options=checkpoint ? {start:checkpoint.offset} : undefined;
+      var rd = readline.createInterface({
+        input: fs.createReadStream(file, options),
+        terminal: false
+      });
+      rd.on('line', function(line) {
+        try {
+          var json=JSON.parse(line);
+          if (json.c==0) {
+            const c=JSON.parse(json.d);
+            if (c.cmd=="resize") {
+              terminal.resize(c.cols,c.rows);
+            }
+          } else if (json.c==1) {
+            terminal.write(json.d);
+          }
+        } catch (error) {
+          console.error("error replaying "+file+": "+error.message);
+        }
+      }).on('close', finish);
+    };
+    if (checkpoint) {
+      terminal.resize(checkpoint.cols,checkpoint.rows);
+      terminal.write(checkpoint.serialized, function() { replay(); });
+    } else {
+      replay();
+    }
+  });
+}
+
+function create_mirror(cols, rows) {
+  if (!checkpoint_enabled) {
+    return null;
+  }
+  var terminal = new Terminal({ allowProposedApi: true });
+  var serializeAddon = new SerializeAddon();
+  terminal.loadAddon(serializeAddon);
+  terminal.resize(cols, rows);
+  return {
+    terminal: terminal,
+    serializeAddon: serializeAddon,
+    queue: [],
+    offset: 0,
+    bytesSinceCheckpoint: 0,
+    lastCheckpoint: now(),
+    busy: false,
+    saving: false
+  };
+}
+
+function append_session_log(session, log) {
+  var text=JSON.stringify(log)+'\n';
+  var bytes=Buffer.byteLength(text);
+  session.logBytes=(session.logBytes||0)+bytes;
+  if (session.pty && session.pty.file) {
+    write(session.pty.file,text);
+  }
+  return {offset:session.logBytes,bytes:bytes};
+}
+
+function pump_mirror(session) {
+  var mirror=session.mirror;
+  if (!mirror || mirror.busy) return;
+  var op=mirror.queue.shift();
+  if (!op) return;
+  mirror.busy=true;
+  const done=function() {
+    mirror.offset=op.offset;
+    if (op.type=='data') {
+      mirror.bytesSinceCheckpoint+=op.bytes;
+    }
+    mirror.busy=false;
+    maybe_save_checkpoint(session);
+    pump_mirror(session);
+  };
+  try {
+    if (op.type=='resize') {
+      mirror.terminal.resize(op.cols,op.rows);
+      done();
+    } else {
+      mirror.terminal.write(op.data,done);
+    }
+  } catch (error) {
+    console.error("error updating checkpoint terminal: "+error.message);
+    mirror.busy=false;
+    pump_mirror(session);
+  }
+}
+
+function queue_mirror(session, op) {
+  if (!session.mirror) return;
+  session.mirror.queue.push(op);
+  pump_mirror(session);
+}
+
+function checkpoint_due(session) {
+  var mirror=session.mirror;
+  if (!mirror || !checkpoint_enabled || mirror.bytesSinceCheckpoint<=0) return false;
+  var bytesdue=checkpoint_bytes>0 && mirror.bytesSinceCheckpoint>=checkpoint_bytes;
+  var timedue=checkpoint_interval_seconds>0 && (now()-mirror.lastCheckpoint)>=checkpoint_interval_seconds;
+  return bytesdue || timedue;
+}
+
+function maybe_save_checkpoint(session) {
+  var mirror=session.mirror;
+  if (!mirror || mirror.busy || mirror.saving || !checkpoint_due(session)) return;
+  save_checkpoint(session);
+}
+
+function save_checkpoint(session) {
+  var mirror=session.mirror;
+  if (!session.pty || !session.pty.file || !session.checkpoint_path) return;
+  var offset=mirror.offset;
+  try {
+    if (fs.fstatSync(session.pty.file).size < offset) {
+      return;
+    }
+  } catch (error) {
+    return;
+  }
+  var checkpoint={
+    version:1,
+    offset:offset,
+    cols:mirror.terminal.cols,
+    rows:mirror.terminal.rows,
+    time:now(),
+    serialized:serialize_terminal(mirror.terminal, mirror.serializeAddon)
+  };
+  var tmp=session.checkpoint_path+'.tmp';
+  mirror.saving=true;
+  mirror.bytesSinceCheckpoint=0;
+  mirror.lastCheckpoint=now();
+  fs.writeFile(tmp, JSON.stringify(checkpoint), function(error) {
+    if (error) {
+      console.error("error writing checkpoint "+tmp+": "+error.message);
+      mirror.saving=false;
+      return;
+    }
+    fs.rename(tmp, session.checkpoint_path, function(error) {
+      if (error) {
+        console.error("error saving checkpoint "+session.checkpoint_path+": "+error.message);
+      } else {
+        console.log("checkpoint saved for "+session.sessioncookie+" at offset "+offset);
+      }
+      mirror.saving=false;
     });
   });
 }
+
+setInterval(function() {
+  for (const username in sessions) {
+    for (const sessioncookie in sessions[username]) {
+      var session=sessions[username][sessioncookie];
+      if (session && session.mirror) {
+        maybe_save_checkpoint(session);
+      }
+    }
+  }
+  for (const token in reconnects) {
+    var r=reconnects[token];
+    if (r.stale && (now()-r.time)>7*24*3600) {
+      delete reconnects[token];
+    }
+  }
+}, 1000).unref();
 
 function sendError(c,msg) {
   cmd={cmd:'error',error:msg};
@@ -200,7 +402,8 @@ wsServer.on('request', function(request) {
     */
   async function replay_pty(username,sessioncookie,cols,rows,connection) {
     console.log("reconnected to "+sessioncookie+" "+sessions[username][sessioncookie].pty.file);
-    var serial = await create_replayed_terminal('sessions/'+username+'/'+sessioncookie+'.json');
+    var checkpointfile=checkpoint_enabled ? 'sessions/'+username+'/'+sessioncookie+'.checkpoint.json' : null;
+    var serial = await create_replayed_terminal('sessions/'+username+'/'+sessioncookie+'.json', checkpointfile);
     connection.sendUTF('\0'+JSON.stringify({cmd:"resize",cols:serial.cols,rows:serial.rows}));
     connection.sendUTF('\1'+serial.s);
     console.log("sending replayed terminal");
@@ -210,7 +413,7 @@ wsServer.on('request', function(request) {
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log("send replaydone to "+sessioncookie);
     } else {
-      var cmd={cmd:"reconnected",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid};
+      var cmd={cmd:"reconnected",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid};
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log("send reconnected to "+sessioncookie);
       // force a redrwa, to fix term properties at cursor for tmux and others
@@ -238,14 +441,15 @@ wsServer.on('request', function(request) {
     connection.paused=false;
   }
 
-  function create_pty(username,sessioncookie,cols,rows,connection) {
+  function create_pty(username,sessioncookie,cols,rows,connection,forceNew) {
     var viewid=false;
     connection.loggedin=true;
     connection.username=username;
-    if (( username in sessions)) {
+    if (!forceNew && ( username in sessions)) {
       var list='sessioncookies:\r\n';
       for (const [key, value] of Object.entries(sessions[username])) {
-        if(sessions[username][key].pty.main) {
+        var requested = sessioncookie==key;
+        if(sessions[username][key].pty.main && !requested) {
 		console.log("ignoring " + key + " still connected");
 		continue;
 	}
@@ -260,7 +464,7 @@ wsServer.on('request', function(request) {
             }
           }
         }
-        if(((connection.viewonly || connection.shared) && sessioncookie==key) || (!connection.viewonly && !connection.shared && !mainconnection)) {
+        if(requested || (!connection.viewonly && !connection.shared && !mainconnection)) {
           sessioncookie=key;
           connection.paused=true;
           if(connection.viewonly) {
@@ -272,6 +476,16 @@ wsServer.on('request', function(request) {
             sendInfo(sessions[username][sessioncookie].pty.main,"someone is sharing your session");
           } else {
             sendInfo(connection,"Reconnected to your session");
+            if (!requested) {
+              var oldreconnectid=sessions[username][sessioncookie].reconnectid;
+              var newreconnectid=uuid_v4();
+              sessions[username][sessioncookie].reconnectid=newreconnectid;
+              reconnects[newreconnectid]={username:username,sessioncookie:sessioncookie};
+              if (oldreconnectid && oldreconnectid!=newreconnectid) {
+                reconnects[oldreconnectid]={username:username,stale:true,time:now()};
+                console.log("rotated reconnect token for "+sessioncookie);
+              }
+            }
             sessions[username][sessioncookie].pty.main=connection;
           } 
           replay_pty(username,sessioncookie,cols,rows,connection);
@@ -294,9 +508,15 @@ wsServer.on('request', function(request) {
       sessioncookie=uuid_v4();
       viewid=uuid_v4();
       shareid=uuid_v4();
+      var reconnectid=uuid_v4();
       //  if (!(sessioncookie in sessions[username])) {
-      sessions[username][sessioncookie]={viewid:viewid,shareid:shareid,connections:{}};
+      sessions[username][sessioncookie]={viewid:viewid,shareid:shareid,reconnectid:reconnectid,connections:{}};
+      reconnects[reconnectid]={username:username,sessioncookie:sessioncookie};
       //  }
+      var session=sessions[username][sessioncookie];
+      session.sessioncookie=sessioncookie;
+      session.checkpoint_path='sessions/'+username+'/'+sessioncookie+'.checkpoint.json';
+      session.mirror=create_mirror(connection.columns, connection.rows);
       fs.mkdirSync('sessions/'+username, { recursive: true });
       //file = fs.createWriteStream('sessions/'+username+'/'+sessioncookie+'.json', { flags: 'a' });
       sessions[username][sessioncookie].pty = pty.spawn('sudo', ['-u',username,'-i'], {
@@ -316,22 +536,20 @@ wsServer.on('request', function(request) {
       console.log("created pty "+sessioncookie+" "+connection.columns+"x"+connection.rows+" for "+index);
       cmd={"cmd":"resize","cols":connection.columns,"rows":connection.rows}
       log={t:now(),d:JSON.stringify(cmd),c:0}
-      //console.log('write: '+JSON.stringify(log));
-      //file.write(JSON.stringify(log)+'\n');
-      write(sessions[username][sessioncookie].pty.file,JSON.stringify(log)+'\n');
+      var written=append_session_log(session,log);
+      queue_mirror(session,{type:'resize',cols:connection.columns,rows:connection.rows,offset:written.offset,bytes:written.bytes});
       // connection.sendUTF('\1'+list);
       sessions[username][sessioncookie].pty.on('data', function(data) {
-        //console.log('write: '+JSON.stringify(log));
-        //file.write(JSON.stringify(log)+'\n');
         var senddata=false;
         if (JSON.stringify(data)) {
           var log={t:now(),d:data,c:1};
-          write(sessions[username][sessioncookie].pty.file,JSON.stringify(log)+'\n');
+          var written=append_session_log(session,log);
+          queue_mirror(session,{type:'data',data:data,offset:written.offset,bytes:written.bytes});
           senddata='\1'+ data;
         } else {
           cmd={cmd:'b64',data:btoa(data)}
           var log={t:now(),d:JSON.stringify(cmd),c:0};
-          write(sessions[username][sessioncookie].pty.file,JSON.stringify(log)+'\n');
+          append_session_log(session,log);
           senddata='\0'+ JSON.stringify(cmd);
         }
 
@@ -353,13 +571,15 @@ wsServer.on('request', function(request) {
       });
       connection.sessioncookie=sessioncookie;
       sessions[username][sessioncookie].pty.on('resize', function() {
-        cmdtxt='\0'+JSON.stringify({cmd:"resize",rows:sessions[connection.username][connection.sessioncookie].pty.rows,cols:sessions[connection.username][connection.sessioncookie].pty.cols});
-        console.log("DEBUG: "+cmdtext);
-        write(sessions[connection.username][connection.sessioncookie].pty.file,cmdtext+'\n');
+        var resize={cmd:"resize",rows:session.pty.rows,cols:session.pty.cols};
+        var cmdtext='\0'+JSON.stringify(resize);
+        var log={t:now(),d:JSON.stringify(resize),c:0};
+        var written=append_session_log(session,log);
+        queue_mirror(session,{type:'resize',cols:resize.cols,rows:resize.rows,offset:written.offset,bytes:written.bytes});
 
-        for (const [key, conn] of Object.entries(sessions[connection.username][connection.sessioncookie]['connections'])) {
+        for (const [key, conn] of Object.entries(session.connections)) {
           if (conn.paused) {
-            console.log("buffering 0 for "+cmdtxt+" session "+connection.sessioncookie);
+            console.log("buffering 0 for "+cmdtext+" session "+connection.sessioncookie);
             conn.sendbuffer.push(cmdtext);
           } else {
             conn.send(cmdtext);
@@ -370,7 +590,7 @@ wsServer.on('request', function(request) {
       sessions[username][sessioncookie].pty.on('exit', function(data) {
         console.log("pty "+connection.sessioncookie+" for "+connection.username+" exited with status "+ data);
         var log={t:now(),d:data,c:3};
-        write(sessions[connection.username][connection.sessioncookie].pty.file,JSON.stringify(log)+'\n');
+        append_session_log(session,log);
         for (const [key, conn] of Object.entries(sessions[connection.username][connection.sessioncookie]['connections'])) {
           if (sessions[connection.username][connection.sessioncookie].pty.main == conn) {
             sendInfo(sessions[connection.username][connection.sessioncookie].pty.main,"Your session ended");
@@ -390,6 +610,7 @@ wsServer.on('request', function(request) {
           console.log("deleting all views for "+connection.username);
           delete views[connection.username];
         }     
+        delete reconnects[sessions[connection.username][connection.sessioncookie].reconnectid];
         delete shares[sessions[connection.username][connection.sessioncookie].shareid];
         if (connection.username in shares && shares[connection.username].length==0) {
           console.log("deleting all shared views for "+connection.username);
@@ -402,7 +623,7 @@ wsServer.on('request', function(request) {
           delete sessions[connection.username];
         }     
       });
-      var cmd={cmd:"authenticated",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid};
+      var cmd={cmd:"authenticated",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid};
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log(username + " authenticated!");
     }
@@ -438,7 +659,8 @@ wsServer.on('request', function(request) {
                     console.log("received resize to "+m.cols+"x"+m.rows+" "+connection.sessioncookie+" "+sessions[connection.username][connection.sessioncookie].pty.file);
                     sessions[connection.username][connection.sessioncookie].pty.resize(m.cols,m.rows);
                     console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+sessions[connection.username][connection.sessioncookie].pty.file);
-                    write(sessions[connection.username][connection.sessioncookie].pty.file,JSON.stringify(log)+'\n');
+                    var written=append_session_log(sessions[connection.username][connection.sessioncookie],log);
+                    queue_mirror(sessions[connection.username][connection.sessioncookie],{type:'resize',cols:m.cols,rows:m.rows,offset:written.offset,bytes:written.bytes});
                     if(Object.keys(sessions[connection.username][connection.sessioncookie]['connections']).length>0) {
                       //  console.log("broadcasting resize");
                       for (const [key, conn] of Object.entries(sessions[connection.username][connection.sessioncookie]['connections'])) {
@@ -489,6 +711,35 @@ wsServer.on('request', function(request) {
                 }
                 break;;
 
+              case 'reconnect':
+                if (!connection.viewonly) {
+                  if (m.reconnect && m.reconnect in reconnects) {
+                    var r=reconnects[m.reconnect];
+                    if ('cols' in m && 'rows' in m) {
+                      connection.columns=m.cols;
+                      connection.rows=m.rows;
+                    }
+                    if (r.stale) {
+                      delete reconnects[m.reconnect];
+                      connection.username=r.username;
+                      console.log("reconnect "+m.reconnect+" was taken over, starting a new session for "+r.username);
+                      connection.sessioncookie=create_pty(r.username,false,connection.columns,connection.rows,connection,true);
+                    } else if (r.sessioncookie && r.username in sessions && r.sessioncookie in sessions[r.username] && sessions[r.username][r.sessioncookie].pty) {
+                      connection.username=r.username;
+                      connection.sessioncookie=r.sessioncookie;
+                      console.log("reconnect "+m.reconnect+" by "+r.username+" to "+r.sessioncookie);
+                      create_pty(r.username,r.sessioncookie,connection.columns,connection.rows,connection);
+                    } else {
+                      delete reconnects[m.reconnect];
+                      sendError(connection,"Your session has expired");
+                      connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
+                    }
+                  } else {
+                    sendError(connection,"Your session has expired");
+                    connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
+                  }
+                }
+                break;;
               case 'login':
                 if (!connection.viewonly) {
                   if('cols' in m && 'rows' in m) {
@@ -555,7 +806,7 @@ wsServer.on('request', function(request) {
             var input=message.utf8Data.substr(1);
             var log={t:now(),d:input,c:2};
             //		console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+sessions[connection.username][connection.sessioncookie].pty.file);
-            write(sessions[connection.username][connection.sessioncookie].pty.file,JSON.stringify(log)+'\n');
+            append_session_log(sessions[connection.username][connection.sessioncookie],log);
             sessions[connection.username][connection.sessioncookie].pty.write(message.utf8Data.substr(1));
           } else {
             console.log("received data while not authed"+ message.utf8Data.substr(1));
@@ -574,7 +825,7 @@ wsServer.on('request', function(request) {
         if (connection.sessioncookie in sessions[connection.username]) {
           delete sessions[connection.username][connection.sessioncookie]['connections'][index];
         }
-	if (connection.username in sessions && connection.sessioncookie in sessions[connection.username] && sessions[connection.username][connection.sessioncookie].pty.main) {
+	if (connection.username in sessions && connection.sessioncookie in sessions[connection.username] && sessions[connection.username][connection.sessioncookie].pty.main == connection) {
 	  console.log("Main connection for "+connection.username+" "+connection.sessioncookie+" disconnected");
 	  sessions[connection.username][connection.sessioncookie].pty.main=false;
 	}

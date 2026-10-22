@@ -144,11 +144,11 @@ window.addEventListener("beforeunload", function(e){
 }, false);
 // only support for SSL
 var socket=false;
-if (window.location.protocol == 'https:') {
-  socket = new WebSocket('wss://'+window.location.host+window.location.pathname+'pty');
-} else {
-  socket = new WebSocket('ws://'+window.location.host+window.location.pathname+'pty');
-}
+var reconnectToken=false;
+try { reconnectToken = sessionStorage.getItem('wslogin.reconnect') || false; } catch(e) {}
+var reconnectAttempts=0;
+var reconnectTimer=false;
+var sessionEnded=false;
 const fitAddon = new FitAddon.FitAddon();
 //const webglAddon = new WebglAddon.WebglAddon();
 
@@ -211,7 +211,7 @@ term.onTitleChange(function (title) {
   document.title = title;
 })
 term.onData(function (data) {
-  if (!viewonly) socket.send('\1'+data);
+  if (!viewonly && socket && socket.readyState==1) socket.send('\1'+data);
 })
 //terminaldiv.addEventListener(
 window.addEventListener(
@@ -224,10 +224,10 @@ window.addEventListener(
         return false;
       }
     }
-    if (e.which==2 && authenticated && middle_button_helper) {
+    if (e.which==2 && authenticated && middle_button_helper && socket && socket.readyState==1) {
       navigator.clipboard.readText().then(text => {
         showsnack("Pasted:<div align=left><pre>"+text+"</pre></div>");
-        socket.send('\1'+text.replaceAll("\r\n","\r").replaceAll("\n","\r"));
+        if (socket && socket.readyState==1) socket.send('\1'+text.replaceAll("\r\n","\r").replaceAll("\n","\r"));
         return false;
       })
     }
@@ -259,7 +259,7 @@ function resizeScreen () {
         if (resizewait) { 
           resizepending=true; 
         } else {
-          socket.send('\0{"cmd":"resize","cols":' +  geom.cols + ',"rows":' + geom.rows + '}');
+          if (socket && socket.readyState==1) socket.send('\0{"cmd":"resize","cols":' +  geom.cols + ',"rows":' + geom.rows + '}');
           resizewait=setTimeout(function() { resizewait=false;if (resizepending) resizeScreen(); },150);
         }
       }
@@ -268,14 +268,60 @@ function resizeScreen () {
   }
 }
 
-socket.onclose = function (connection) {
+function setReconnectToken(token) {
+  reconnectToken = token || false;
+  try {
+    if (reconnectToken) sessionStorage.setItem('wslogin.reconnect', reconnectToken);
+    else sessionStorage.removeItem('wslogin.reconnect');
+  } catch(e) {}
+}
+function showLoginForm() {
+  var formstatus=document.getElementById('formstatus');
+  var usernameinput=document.getElementById('username');
+  terminaldiv.style.display="none";
+  formstatus.innerHTML="please login";
+  loginform.style.display="block";
+  usernameinput.focus();
+  loginform.onsubmit=function (event) {
+    event.preventDefault();
+    // TODO: properly disable double submit
+    //  loginform.onsubmit=function (event) { event.preventDefault(); return false; };
+    var username=document.getElementById('username');
+    var password=document.getElementById('password');
+    terminaldiv.style.display="block";
+    fitAddon.fit();
+    terminaldiv.style.display="none";
+    if (!socket || socket.readyState!=1) return false;
+    cmd={cmd:'login',username:username.value,password:password.value,rememberme:rememberme.value,cols:term.cols,rows:term.rows}
+    socket.send('\0' + JSON.stringify(cmd));
+    var formstatus=document.getElementById('formstatus');
+    formstatus.innerHTML="Authenticating";
+    return false;
+  };
+}
+function shouldReconnect() {
+  return !sessionEnded && (viewonly || shared || authenticated || !!reconnectToken);
+}
+function scheduleReconnect() {
+  if (!shouldReconnect()) return false;
+  if (reconnectTimer) return true;
+  var delay=Math.min(30000, 1000*Math.pow(2, reconnectAttempts));
+  if (reconnectAttempts==0) showsnack("Connection lost, reconnecting...");
+  reconnectAttempts++;
+  reconnectTimer=setTimeout(function() {
+    reconnectTimer=false;
+    connect();
+  }, delay);
+  return true;
+}
+function onclose(connection) {
   if(connected) {
     //  console.log('connection closed');
     term.write("\r\nConnection closed         \r\n");
     connected=false;
     authenticated=false;
     loginform.style.display="none";
-  } else {
+  } else if (!reconnectTimer && reconnectAttempts==0 && !shouldReconnect()) {
     term.write("\rConnection failed\r\n");
     showsnack("Failed to connect");
     loginform.style.display="none";
@@ -285,14 +331,27 @@ socket.onclose = function (connection) {
     rel.style.display="block";
     //  resizeScreen();
   }
-};
-socket.onopen = function (connection) {
+  scheduleReconnect();
+}
+function onopen(connection) {
   connected=true;
   //console.log('connection opened');
   resizeScreen();
   window.addEventListener('resize', resizeScreen, false);
-};
-socket.onmessage = function (message) {
+}
+function connect() {
+  if (socket && (socket.readyState==0 || socket.readyState==1)) return;
+  if (window.location.protocol == 'https:') {
+    socket = new WebSocket('wss://'+window.location.host+window.location.pathname+'pty');
+  } else {
+    socket = new WebSocket('ws://'+window.location.host+window.location.pathname+'pty');
+  }
+  socket.onopen=onopen;
+  socket.onclose=onclose;
+  socket.onerror=function(){};
+  socket.onmessage=onmessage;
+}
+function onmessage(message) {
   var data=message.data.substr(1);
   switch (message.data[0]) {
     case '\0':
@@ -313,29 +372,17 @@ socket.onmessage = function (message) {
             if(connected) socket.send('\0{"cmd":"view","view":"' +  window.location.hash.substr(6) + '"}');
           } else if (shared) {
             if(connected) socket.send('\0{"cmd":"share","share":"' +  window.location.hash.substr(7) + '"}');
+          } else if (reconnectToken) {
+            if(connected) socket.send('\0' + JSON.stringify({cmd:'reconnect',reconnect:reconnectToken,cols:term.cols,rows:term.rows}));
           } else {
-            var formstatus=document.getElementById('formstatus');
-            var usernameinput=document.getElementById('username');
-            terminaldiv.style.display="none";
-            formstatus.innerHTML="please login";
-            loginform.style.display="block";
-            usernameinput.focus();
-            loginform.onsubmit=function (event) {
-              event.preventDefault();
-              // TODO: properly disable double submit
-              //  loginform.onsubmit=function (event) { event.preventDefault(); return false; };
-              var username=document.getElementById('username');
-              var password=document.getElementById('password');
-              terminaldiv.style.display="block";
-              fitAddon.fit();
-              terminaldiv.style.display="none";
-              cmd={cmd:'login',username:username.value,password:password.value,rememberme:rememberme.value,cols:term.cols,rows:term.rows}
-              socket.send('\0' + JSON.stringify(cmd));
-              var formstatus=document.getElementById('formstatus');
-              formstatus.innerHTML="Authenticating";
-              return false;
-            };
+            showLoginForm();
           }
+          break;;
+        case 'reconnectfailed':
+          setReconnectToken(false);
+          showLoginForm();
+          var formstatus=document.getElementById('formstatus');
+          formstatus.innerHTML="<font color=red>Your session has expired, please login again</font>";
           break;;
         case 'authfailed':
           terminaldiv.style.display="none";
@@ -344,7 +391,10 @@ socket.onmessage = function (message) {
           formstatus.innerHTML="<font color=red>Authentication failed</font>";
           break;;
         case 'replaydone':
+          sessionEnded=false;
+          reconnectAttempts=0;
           if (!viewonly) authenticated=true;
+          document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
           var formstatus=document.getElementById('formstatus');
           formstatus.innerHTML="";
@@ -353,9 +403,13 @@ socket.onmessage = function (message) {
           setTimeout(function () {term.scrollToBottom();},200);
           break;;
         case 'reconnected':
+          sessionEnded=false;
+          reconnectAttempts=0;
           authenticated=true;
+          if ('reconnect' in json) setReconnectToken(json.reconnect);
           if ('viewid' in json) setViewid(json.viewid);
           if ('shareid' in json) setShareid(json.shareid);
+          document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
           var formstatus=document.getElementById('formstatus');
           formstatus.innerHTML="";
@@ -366,9 +420,13 @@ socket.onmessage = function (message) {
           resizeScreen();
           break;;
         case 'authenticated':
+          sessionEnded=false;
+          reconnectAttempts=0;
           authenticated=true;
+          if ('reconnect' in json) setReconnectToken(json.reconnect);
           if ('viewid' in json) setViewid(json.viewid);
           if ('shareid' in json) setShareid(json.shareid);
+          document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
           var formstatus=document.getElementById('formstatus');
           formstatus.innerHTML="";
@@ -379,6 +437,10 @@ socket.onmessage = function (message) {
           showsnack(json.warn);
           break;;
         case "info":
+          if (/session ended/i.test(json.info)) {
+            sessionEnded=true;
+            setReconnectToken(false);
+          }
           showsnack(json.info);
           break;;
         case "error":
@@ -411,3 +473,4 @@ function goFullScreen(){
     elem.msRequestFullscreen();
   }
 }
+connect();

@@ -99,7 +99,7 @@ const replacements = [
   ['new Terminal()', 'new Terminal({ allowProposedApi: true })'],
 ];
 
-for (const file of ['server.js', 'server-noindent.js', 'www/wslogin.js', 'www/i.html', 'www/index.html.withscript']) {
+for (const file of ['server.js', 'www/wslogin.js', 'www/i.html', 'www/index.html.withscript']) {
   if (!fs.existsSync(file)) continue;
   const original = fs.readFileSync(file, 'utf8');
   let text = original;
