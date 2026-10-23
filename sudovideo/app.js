@@ -34,15 +34,17 @@ var state = {
   idleVideoTimer: null,
   idleAutoSkipTimer: null,
   idleTimer: null,
+  idleCountdownTimer: null,
   activity: null,
   idleConfig: {
     enabled: true,
-    thresholdSeconds: 300,
+    thresholdSeconds: 10,
     video: 'onehour.mp4',
     videoDelaySeconds: 5,
     overlayDelaySeconds: 1,
     autoSkipSeconds: 10,
-    movieAutoSkipSeconds: 0
+    movieAutoSkipSeconds: 0,
+    showVideoSeconds: 600
   }
 };
 
@@ -85,6 +87,8 @@ var els = {
   idleSkipOverlay: byId('idle-skip-overlay'),
   idleSkipText: byId('idle-skip-text'),
   idleSkipNow: byId('idle-skip-now'),
+  idleCountdown: byId('idle-countdown'),
+  idleSkipCountdown: byId('idle-skip-countdown'),
   play: byId('play'),
   stop: byId('stop'),
   time: byId('time'),
@@ -484,6 +488,29 @@ function clearIdleTimers() {
     clearTimeout(state.idleTimer);
     state.idleTimer = null;
   }
+  if (state.idleCountdownTimer) {
+    clearInterval(state.idleCountdownTimer);
+    state.idleCountdownTimer = null;
+  }
+}
+
+function startCountdown(element, ms) {
+  if (state.idleCountdownTimer) {
+    clearInterval(state.idleCountdownTimer);
+    state.idleCountdownTimer = null;
+  }
+  if (!element) return;
+  var end = Date.now() + ms;
+  function update() {
+    var left = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+    element.textContent = 'skip in ' + left + 's';
+    if (left <= 0 && state.idleCountdownTimer) {
+      clearInterval(state.idleCountdownTimer);
+      state.idleCountdownTimer = null;
+    }
+  }
+  update();
+  state.idleCountdownTimer = setInterval(update, 200);
 }
 
 function cancelIdleSkip() {
@@ -517,18 +544,24 @@ function showIdleSkipOverlay() {
   var skipped = Math.max(0, state.idleTo - state.time);
   els.idleSkipText.textContent = 'Skipping ' + formatDuration(skipped)
     + ' of idle time';
+  if (els.idleSkipCountdown) els.idleSkipCountdown.textContent = '';
   els.idleSkipOverlay.classList.remove('hidden');
 
   var autoSkip = Math.max(0,
     Number(state.idleConfig.autoSkipSeconds) || 0) * 1000;
   if (autoSkip > 0) {
     state.idleAutoSkipTimer = setTimeout(finishIdleSkip, autoSkip);
+    startCountdown(els.idleSkipCountdown, autoSkip);
   }
 }
 
 function playIdleMovie() {
   if (!state.idleSkipping) return;
   state.idleVideoTimer = null;
+  if (state.idleCountdownTimer) {
+    clearInterval(state.idleCountdownTimer);
+    state.idleCountdownTimer = null;
+  }
   if (state.idleAutoSkipTimer) {
     clearTimeout(state.idleAutoSkipTimer);
     state.idleAutoSkipTimer = null;
@@ -559,8 +592,13 @@ function playIdleMovie() {
   }
   var movieAutoSkip = Math.max(0,
     Number(state.idleConfig.movieAutoSkipSeconds) || 0) * 1000;
-  state.idleTimer = setTimeout(finishIdleSkip,
-    movieAutoSkip > 0 ? movieAutoSkip : 60000);
+  if (movieAutoSkip > 0) {
+    state.idleTimer = setTimeout(finishIdleSkip, movieAutoSkip);
+    startCountdown(els.idleCountdown, movieAutoSkip);
+  } else {
+    if (els.idleCountdown) els.idleCountdown.textContent = '';
+    state.idleTimer = setTimeout(finishIdleSkip, 60000);
+  }
 }
 
 function startIdleSkip(target) {
@@ -569,6 +607,16 @@ function startIdleSkip(target) {
   els.idleOverlay.classList.add('hidden');
   els.idleSkipOverlay.classList.add('hidden');
   clearIdleTimers();
+
+  var showVideoSeconds = Number(state.idleConfig.showVideoSeconds) || 0;
+  if (showVideoSeconds > 0 && target - state.time < showVideoSeconds) {
+    var overlayOnlyDelay = Math.max(0,
+      (Number(state.idleConfig.overlayDelaySeconds) || 0)) * 1000;
+    if (overlayOnlyDelay <= 0) showIdleSkipOverlay();
+    else state.idleOverlayTimer = setTimeout(showIdleSkipOverlay,
+      overlayOnlyDelay);
+    return;
+  }
 
   var videoDelay = Math.max(0,
     Number(state.idleConfig.videoDelaySeconds) || 0) * 1000;
@@ -677,6 +725,16 @@ function tick(timestamp) {
     }
   }
 
+  if (state.live && state.idleConfig.enabled && !state.dragging
+      && !state.idleSkipping) {
+    var idleNow = Date.now() / 1000;
+    if (Number.isFinite(state.end)
+        && idleNow - state.end > state.idleConfig.thresholdSeconds) {
+      startIdleSkip(idleNow);
+      return;
+    }
+  }
+
   if (!state.streamDone && state.active && empty
       && state.time >= state.end - 0.25) {
     state.time = state.end;
@@ -760,6 +818,7 @@ function handleMessage(message, streamId) {
     c: message.c,
     o: message.o
   };
+  if (state.idleSkipping && state.live) finishIdleSkip();
   if (Number.isFinite(event.t)) {
     state.lastEventT = event.t;
     state.end = Math.max(state.end, event.t);
@@ -976,6 +1035,10 @@ async function loadPlaybackConfig() {
     var movieAutoSkip = Number(data.idle_movie_auto_skip_seconds);
     if (Number.isFinite(movieAutoSkip) && movieAutoSkip >= 0) {
       state.idleConfig.movieAutoSkipSeconds = movieAutoSkip;
+    }
+    var showVideo = Number(data.idle_skip_seconds_show_video);
+    if (Number.isFinite(showVideo) && showVideo >= 0) {
+      state.idleConfig.showVideoSeconds = showVideo;
     }
   } catch (error) {}
 }

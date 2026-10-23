@@ -23,7 +23,7 @@ const DEFAULT_CHECKPOINT_INTERVAL_MS = 60000;
 const DEFAULT_CHECKPOINT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_CHECKPOINTS = 500;
 const DEFAULT_ACTIVE_SECONDS = 60;
-const DEFAULT_IDLE_SKIP_SECONDS = 300;
+const DEFAULT_IDLE_SKIP_SECONDS = 10;
 const ACTIVITY_BUCKET_SECONDS = 1;
 const ACTIVITY_BINS = 600;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -\/]*[@-~]/g;
@@ -247,6 +247,8 @@ function createPlayback(config, options) {
     configInt(config, 'playback_idle_overlay_delay_seconds', 1)));
   var idleAutoSkipSeconds = Math.max(0, configInt(config,
     'playback_idle_auto_skip_seconds', 10));
+  var idleShowVideoSeconds = Math.max(0, configInt(config,
+    'playback_idle_skip_seconds_show_video', 600));
   var idleMovieAutoSkipSeconds = Math.max(0, configInt(config,
     'playback_idle_movie_auto_skip_seconds', 0));
   var idleVideo = config.playback_idle_video
@@ -1237,7 +1239,8 @@ function titleDescription(titles, lastTitle) {
         idle_video_delay_seconds: idleVideoDelaySeconds,
         idle_overlay_delay_seconds: idleOverlayDelaySeconds,
         idle_auto_skip_seconds: idleAutoSkipSeconds,
-        idle_movie_auto_skip_seconds: idleMovieAutoSkipSeconds
+        idle_movie_auto_skip_seconds: idleMovieAutoSkipSeconds,
+        idle_skip_seconds_show_video: idleShowVideoSeconds
       });
       return;
     }
@@ -1321,6 +1324,7 @@ function titleDescription(titles, lastTitle) {
     idleOverlayDelaySeconds: idleOverlayDelaySeconds,
     idleAutoSkipSeconds: idleAutoSkipSeconds,
     idleMovieAutoSkipSeconds: idleMovieAutoSkipSeconds,
+    idleShowVideoSeconds: idleShowVideoSeconds,
     handle: handle,
     serveStatic: function(response, relative) {
       serveStatic(response, wwwDir, relative);
