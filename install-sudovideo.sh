@@ -68,6 +68,11 @@ if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
   for file in playback-server.js playback.js template.js; do
     install -o root -g root -m 0644 "$SOURCE_DIR/$file" "$APP_DIR/$file"
   done
+  if [[ -d "$SOURCE_DIR/sudovideo" ]]; then
+    echo "Installing sudovideo files in $APP_DIR/sudovideo"
+    install -d -o root -g root -m 0755 "$APP_DIR/sudovideo"
+    install -o root -g root -m 0644 "$SOURCE_DIR/sudovideo/"* "$APP_DIR/sudovideo/"
+  fi
 fi
 
 echo "Preparing cache directory $CACHE_DIR"

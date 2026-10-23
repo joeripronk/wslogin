@@ -561,12 +561,36 @@ button:disabled {
   line-height: 1;
 }
 
-.time-display {
+.time-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
   min-width: 112px;
+}
+
+.time-date {
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.time-display {
+  min-width: 0;
+  padding: 2px 6px;
+  border-color: transparent;
+  background: transparent;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--muted);
   text-align: center;
+  white-space: nowrap;
+}
+
+.time-display:hover {
+  border-color: var(--border);
+  background: var(--panel-2);
 }
 
 .seek-wrap {
@@ -660,6 +684,13 @@ button:disabled {
   background: #173020;
 }
 
+.idle-timer {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 240px minmax(0, 1fr);
@@ -726,8 +757,11 @@ button:disabled {
     padding: 8px 10px;
   }
 
-  .time-display {
+  .time-box {
     min-width: 86px;
+  }
+
+  .time-display {
     font-size: 11px;
   }
 

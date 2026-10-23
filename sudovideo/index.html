@@ -65,7 +65,10 @@
     <div class="controls">
       <button class="play-button" id="play" type="button" title="Play or pause (Space)">&#9654;</button>
       <button class="icon-button stop-button" id="stop" type="button" title="Stop and return to session list">&#9632;</button>
-      <div class="time-display" id="time">--:-- / --:--</div>
+      <div class="time-box">
+        <div class="time-date hidden" id="time-date"></div>
+        <button class="time-display" id="time" type="button" title="Toggle wall clock / elapsed time">--:-- / --:--</button>
+      </div>
       <div class="seek-wrap">
         <canvas class="activity-canvas" id="activity-canvas" title="Activity: orange output, blue input, red hidden input"></canvas>
         <input class="seek" id="seek" type="range" min="0" max="0" step="0.01" value="0">
@@ -80,6 +83,7 @@
         <option value="16">16x</option>
       </select>
       <button class="live-button hidden" id="live" type="button">Live</button>
+      <div class="idle-timer hidden" id="idle-timer" title="Time since last activity"></div>
     </div>
   </section>
 </main>

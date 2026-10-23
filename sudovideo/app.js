@@ -36,6 +36,7 @@ var state = {
   idleTimer: null,
   idleCountdownTimer: null,
   activity: null,
+  timeMode: 'real',
   idleConfig: {
     enabled: true,
     thresholdSeconds: 10,
@@ -92,10 +93,12 @@ var els = {
   play: byId('play'),
   stop: byId('stop'),
   time: byId('time'),
+  timeDate: byId('time-date'),
   seek: byId('seek'),
   activity: byId('activity-canvas'),
   speed: byId('speed'),
-  live: byId('live')
+  live: byId('live'),
+  idleTimer: byId('idle-timer')
 };
 
 function setConnection(text, kind) {
@@ -164,6 +167,13 @@ try {
   state.headPinned = localStorage.getItem('wslogin.headPinned') == '1';
 } catch (error) {
   state.headPinned = false;
+}
+
+try {
+  state.timeMode = localStorage.getItem('wslogin.timeMode') === 'relative'
+    ? 'relative' : 'real';
+} catch (error) {
+  state.timeMode = 'real';
 }
 
 function showHead() {
@@ -254,6 +264,24 @@ function formatDate(epochSeconds) {
     }).format(new Date(epochSeconds * 1000));
   } catch (error) {
     return new Date(epochSeconds * 1000).toLocaleString();
+  }
+}
+
+function formatClockTime(epochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return '--:--:--';
+  var d = new Date(epochSeconds * 1000);
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':'
+    + pad(d.getSeconds());
+}
+
+function formatClockDate(epochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return '';
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: 'short', month: 'short', day: '2-digit'
+    }).format(new Date(epochSeconds * 1000));
+  } catch (error) {
+    return new Date(epochSeconds * 1000).toDateString();
   }
 }
 
@@ -430,11 +458,42 @@ function drawActivity() {
   drawLane(activity.hidden, 'rgba(255, 90, 95, 0.95)', 2);
 }
 
+function updateTimeDisplay(relative) {
+  var duration = Math.max(0, state.end - state.start);
+  if (!state.current) {
+    els.time.textContent = '--:-- / --:--';
+    els.timeDate.textContent = '';
+    els.timeDate.classList.add('hidden');
+    return;
+  }
+  if (state.timeMode === 'real') {
+    var epoch = state.start + relative;
+    els.time.textContent = formatClockTime(epoch);
+    els.timeDate.textContent = formatClockDate(epoch);
+    els.timeDate.classList.remove('hidden');
+  } else {
+    els.time.textContent = formatDuration(relative) + ' / '
+      + formatDuration(duration);
+    els.timeDate.textContent = '';
+    els.timeDate.classList.add('hidden');
+  }
+}
+
+var LIVE_IDLE_SECONDS = 15;
+
+function updateIdleTimer() {
+  var idle = state.live && Number.isFinite(state.end)
+    ? Date.now() / 1000 - state.end : 0;
+  var show = idle > LIVE_IDLE_SECONDS;
+  els.idleTimer.classList.toggle('hidden', !show);
+  if (show) els.idleTimer.textContent = 'Idle ' + formatDuration(idle);
+}
+
 function updateControls() {
   var duration = Math.max(0, state.end - state.start);
   var relative = Math.max(0, Math.min(duration, state.time - state.start));
-  els.time.textContent = formatDuration(relative) + ' / '
-    + formatDuration(duration);
+  updateTimeDisplay(relative);
+  updateIdleTimer();
   els.seek.max = String(duration);
   if (!state.dragging) els.seek.value = String(relative);
   els.play.textContent = state.playing ? '\u23F8' : '\u25B6';
@@ -721,16 +780,6 @@ function tick(timestamp) {
     if (Number.isFinite(nextEvent.t)
         && nextEvent.t - state.time > state.idleConfig.thresholdSeconds) {
       startIdleSkip(nextEvent.t);
-      return;
-    }
-  }
-
-  if (state.live && state.idleConfig.enabled && !state.dragging
-      && !state.idleSkipping) {
-    var idleNow = Date.now() / 1000;
-    if (Number.isFinite(state.end)
-        && idleNow - state.end > state.idleConfig.thresholdSeconds) {
-      startIdleSkip(idleNow);
       return;
     }
   }
@@ -1262,6 +1311,13 @@ els.live.addEventListener('click', function() {
   if (!state.current || !state.active) return;
   seekTo(state.end, true);
 });
+els.time.addEventListener('click', function() {
+  state.timeMode = state.timeMode === 'real' ? 'relative' : 'real';
+  try {
+    localStorage.setItem('wslogin.timeMode', state.timeMode);
+  } catch (error) {}
+  updateControls();
+});
 els.seek.addEventListener('pointerdown', function() {
   state.dragging = true;
 });
@@ -1269,10 +1325,8 @@ els.seek.addEventListener('pointerup', function() {
   state.dragging = false;
 });
 els.seek.addEventListener('input', function() {
-  var duration = Math.max(0, state.end - state.start);
   var relative = Number(els.seek.value) || 0;
-  els.time.textContent = formatDuration(relative) + ' / '
-    + formatDuration(duration);
+  updateTimeDisplay(relative);
 });
 els.seek.addEventListener('change', function() {
   state.dragging = false;
