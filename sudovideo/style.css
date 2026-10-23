@@ -703,6 +703,15 @@ button:disabled {
   filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.5));
 }
 
+.ghost-selection {
+  position: absolute;
+  z-index: 25;
+  pointer-events: none;
+  background: rgba(41, 74, 102, 0.45);
+  transition: left 180ms linear, top 180ms linear,
+    width 180ms linear, height 180ms linear;
+}
+
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 240px minmax(0, 1fr);

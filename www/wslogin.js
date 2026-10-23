@@ -241,6 +241,34 @@ var loginform = document.getElementById('loginform');
 term.open(document.getElementById('terminal'));
 //      term.loadAddon(attachAddon); 
 term.loadAddon(fitAddon);
+var lastMouseSent={x:-1,y:-1,t:0};
+function mouseCell(e) {
+  if (!term.element) return null;
+  var screen=term.element.querySelector('.xterm-screen');
+  if (!screen) return null;
+  var rect=screen.getBoundingClientRect();
+  if (rect.width<=0||rect.height<=0) return null;
+  var col=Math.floor((e.clientX-rect.left)*term.cols/rect.width);
+  var row=Math.floor((e.clientY-rect.top)*term.rows/rect.height);
+  if (col<0||row<0||col>=term.cols||row>=term.rows) return null;
+  return {x:col+1,y:row+1};
+}
+function sendMouse(e,b) {
+  if (!authenticated||viewonly||shared) return;
+  if (!socket||socket.readyState!=1) return;
+  var cell=mouseCell(e);
+  if (!cell) return;
+  var now=Date.now();
+  if (b==0) {
+    if (cell.x==lastMouseSent.x&&cell.y==lastMouseSent.y) return;
+    if (now-lastMouseSent.t<40) return;
+  }
+  lastMouseSent={x:cell.x,y:cell.y,t:now};
+  socket.send('\2'+JSON.stringify({x:cell.x,y:cell.y,b:b,k:b==1?e.button:0}));
+}
+terminaldiv.addEventListener('mousemove',function(e){sendMouse(e,0);});
+terminaldiv.addEventListener('mousedown',function(e){sendMouse(e,1);});
+window.addEventListener('mouseup',function(e){sendMouse(e,2);},true);
 //        term.loadAddon(webglAddon); 
 function resizeScreen () {
   if (terminaldiv.style.display=="none") return;

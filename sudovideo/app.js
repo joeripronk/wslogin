@@ -53,6 +53,8 @@ var terminal = null;
 var fitAddon = null;
 var resizeObserver = null;
 var mouseOverlay = null;
+var ghostOverlay = null;
+var mouseDrag = null;
 var mouseTracking = { click: false, drag: false, motion: false, sgr: false, urxvt: false, utf8: false };
 
 function byId(id) {
@@ -343,6 +345,10 @@ function newTerminal(cols, rows) {
   mouseOverlay.className = 'mouse-cursor hidden';
   mouseOverlay.setAttribute('aria-hidden', 'true');
   terminal.element.appendChild(mouseOverlay);
+  ghostOverlay = document.createElement('div');
+  ghostOverlay.className = 'ghost-selection hidden';
+  ghostOverlay.setAttribute('aria-hidden', 'true');
+  terminal.element.appendChild(ghostOverlay);
   resetMouseTracking();
   terminal.onTitleChange(function(title) {
     els.headTab.textContent = title || '';
@@ -410,7 +416,9 @@ function resetMouseTracking() {
     click: false, drag: false, motion: false,
     sgr: false, urxvt: false, utf8: false
   };
+  mouseDrag = null;
   if (mouseOverlay) mouseOverlay.classList.add('hidden');
+  if (ghostOverlay) ghostOverlay.classList.add('hidden');
 }
 
 function mouseTrackingActive() {
@@ -430,15 +438,13 @@ function trackMouseModes(data) {
     else if (mode === 1015) mouseTracking.urxvt = on;
     else if (mode === 1005) mouseTracking.utf8 = on;
   }
-  if (!mouseTrackingActive() && mouseOverlay) {
-    mouseOverlay.classList.add('hidden');
+  if (!mouseTrackingActive()) {
+    endDrag();
+    if (mouseOverlay) mouseOverlay.classList.add('hidden');
   }
 }
 
-function showMouseCursor(col, row) {
-  if (!mouseOverlay || !terminal) return;
-  col = Math.min(Math.max(col, 0), terminal.cols - 1);
-  row = Math.min(Math.max(row, 0), terminal.rows - 1);
+function gridMetrics() {
   var cell;
   try {
     cell = terminal._core._renderService.dimensions.css.cell;
@@ -447,11 +453,47 @@ function showMouseCursor(col, row) {
   }
   if (!cell || !cell.width || !cell.height) cell = cellMetrics(14);
   var screen = terminal.element.querySelector('.xterm-screen');
-  var left = (screen ? screen.offsetLeft : 0) + col * cell.width;
-  var top = (screen ? screen.offsetTop : 0) + row * cell.height;
-  mouseOverlay.style.left = Math.floor(left) + 'px';
-  mouseOverlay.style.top = Math.floor(top) + 'px';
+  return { cell: cell, offsetX: screen ? screen.offsetLeft : 0,
+    offsetY: screen ? screen.offsetTop : 0 };
+}
+
+function showMouseCursor(col, row) {
+  if (!mouseOverlay || !terminal) return;
+  col = Math.min(Math.max(col, 0), terminal.cols - 1);
+  row = Math.min(Math.max(row, 0), terminal.rows - 1);
+  var grid = gridMetrics();
+  mouseOverlay.style.left = Math.floor(grid.offsetX + col * grid.cell.width) + 'px';
+  mouseOverlay.style.top = Math.floor(grid.offsetY + row * grid.cell.height) + 'px';
   mouseOverlay.classList.remove('hidden');
+}
+
+function showGhostSelection(colA, rowA, colB, rowB) {
+  if (!ghostOverlay || !terminal) return;
+  var grid = gridMetrics();
+  var c0 = Math.min(Math.max(Math.min(colA, colB), 0), terminal.cols - 1);
+  var c1 = Math.min(Math.max(Math.max(colA, colB), 0), terminal.cols - 1);
+  var r0 = Math.min(Math.max(Math.min(rowA, rowB), 0), terminal.rows - 1);
+  var r1 = Math.min(Math.max(Math.max(rowA, rowB), 0), terminal.rows - 1);
+  ghostOverlay.style.left = Math.floor(grid.offsetX + c0 * grid.cell.width) + 'px';
+  ghostOverlay.style.top = Math.floor(grid.offsetY + r0 * grid.cell.height) + 'px';
+  ghostOverlay.style.width = Math.ceil((c1 - c0 + 1) * grid.cell.width) + 'px';
+  ghostOverlay.style.height = Math.ceil((r1 - r0 + 1) * grid.cell.height) + 'px';
+  ghostOverlay.classList.remove('hidden');
+}
+
+function startDrag(col, row) {
+  mouseDrag = { col: col, row: row };
+  showGhostSelection(col, row, col, row);
+}
+
+function extendDrag(col, row) {
+  if (!mouseDrag) return;
+  showGhostSelection(mouseDrag.col, mouseDrag.row, col, row);
+}
+
+function endDrag() {
+  mouseDrag = null;
+  if (ghostOverlay) ghostOverlay.classList.add('hidden');
 }
 
 function handleMouseReports(data) {
@@ -461,19 +503,28 @@ function handleMouseReports(data) {
   var found = false;
   while ((match = re.exec(data))) {
     found = true;
+    var col = Number(match[2]) - 1;
+    var row = Number(match[3]) - 1;
     if (match[4] === 'M') {
-      showMouseCursor(Number(match[2]) - 1, Number(match[3]) - 1);
-    } else if (mouseOverlay) {
-      mouseOverlay.classList.add('hidden');
+      var btn = Number(match[1]);
+      showMouseCursor(col, row);
+      if (btn & 32) extendDrag(col, row);
+      else startDrag(col, row);
+    } else {
+      endDrag();
+      if (mouseOverlay) mouseOverlay.classList.add('hidden');
     }
   }
   re = /\x1b\[M([\s\S])([\s\S])([\s\S])/g;
   while ((match = re.exec(data))) {
     found = true;
-    showMouseCursor(
-      match[1].charCodeAt(0) - 33,
-      match[2].charCodeAt(0) - 33
-    );
+    var btn = match[1].charCodeAt(0) - 32;
+    var col = match[2].charCodeAt(0) - 33;
+    var row = match[3].charCodeAt(0) - 33;
+    showMouseCursor(col, row);
+    if (btn === 3) endDrag();
+    else if (btn & 32) extendDrag(col, row);
+    else startDrag(col, row);
   }
   if (mouseTracking.urxvt && !found) {
     re = /\x1b\[(\d+);(\d+);(\d+)M/g;
@@ -493,6 +544,25 @@ function applyEvent(event) {
   }
   if (event.c === 2) {
     handleMouseReports(String(event.d || ''));
+    return;
+  }
+  if (event.c === 3) {
+    try {
+      var mouse = JSON.parse(String(event.d || ''));
+      var col = Number(mouse.x) - 1;
+      var row = Number(mouse.y) - 1;
+      if (mouse.b === 2) {
+        endDrag();
+        if (mouseOverlay) mouseOverlay.classList.add('hidden');
+      } else if (mouse.b === 1) {
+        showMouseCursor(col, row);
+        if (mouse.k === 0) startDrag(col, row);
+        else endDrag();
+      } else {
+        showMouseCursor(col, row);
+        extendDrag(col, row);
+      }
+    } catch (error) {}
     return;
   }
   if (event.c === 0 && typeof event.d === 'string') {
@@ -911,6 +981,7 @@ function handleMessage(message, streamId) {
     state.termRows = message.rows || state.termRows;
     state.lastEventT = message.t;
     terminal.reset();
+    resetMouseTracking();
     terminal.resize(state.termCols, state.termRows);
     if (message.serialized) terminal.write(message.serialized);
     state.activity = message.activity || null;
@@ -924,6 +995,7 @@ function handleMessage(message, streamId) {
     state.termRows = message.rows || state.termRows;
     state.lastEventT = message.t;
     terminal.reset();
+    resetMouseTracking();
     terminal.resize(state.termCols, state.termRows);
     state.activity = message.activity || null;
     requestAnimationFrame(scaleTerminal);
@@ -950,6 +1022,7 @@ function handleMessage(message, streamId) {
   }
   if (message.type === 'reset') {
     setStatus('Session log was truncated, reloading', 'error');
+    resetMouseTracking();
     return;
   }
 

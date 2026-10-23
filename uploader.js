@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { performance } = require('perf_hooks');
 const { WebSocket } = require('ws');
 const { match: matchTemplate } = require('./template');
 
@@ -18,6 +19,7 @@ const LOG_SUFFIX = '.json';
 const CHECKPOINT_LOG_SUFFIX = '.checkpoint.json';
 const FINISHED_SUFFIX = '.done';
 const UPLOADED_SUFFIX = '.uploaded';
+const MAX_UPLOADED_TRACKED = 10000;
 
 function configBool(config, name, fallback) {
   if (!(name in config)) return fallback;
@@ -579,7 +581,12 @@ function createUploader(config, options) {
     }
     if (config.upload_ca) {
       var caPath = path.resolve(baseDir, String(config.upload_ca));
-      ca = fs.readFileSync(caPath);
+      try {
+        ca = fs.readFileSync(caPath);
+      } catch (error) {
+        throw new Error('cannot read upload_ca "' + caPath + '": '
+          + error.message);
+      }
     }
   }
 
@@ -592,7 +599,7 @@ function createUploader(config, options) {
     active: 0,
     stopped: false,
     queue: [],
-    uploaded: {},
+    uploaded: new Map(),
     idleWaiters: []
   };
 
@@ -630,7 +637,7 @@ function createUploader(config, options) {
         throw error;
       }
       info.startdate = await readStartDate(job.file);
-      if (state.uploaded[key] == info.sha256) {
+      if (state.uploaded.get(key) === info.sha256) {
         uploaded(job);
         success = true;
         return;
@@ -639,7 +646,10 @@ function createUploader(config, options) {
       for (var attempt = 0; ; attempt++) {
         try {
           await transport.send(job, info);
-          state.uploaded[key] = info.sha256;
+          state.uploaded.set(key, info.sha256);
+          if (state.uploaded.size > MAX_UPLOADED_TRACKED) {
+            state.uploaded.delete(state.uploaded.keys().next().value);
+          }
           log('uploaded ' + job.kind + ' for ' + job.username + '/'
             + job.sessioncookie + ' (' + info.size + ' bytes)');
           uploaded(job);
@@ -893,8 +903,8 @@ async function run(config, options) {
         if (!entry.finished) {
           if (!uploadActive) continue;
           var last = lastActive.get(entry.file) || 0;
-          if (Date.now() - last < activeInterval * 1000) continue;
-          lastActive.set(entry.file, Date.now());
+          if (performance.now() - last < activeInterval * 1000) continue;
+          lastActive.set(entry.file, performance.now());
         }
         seen.set(entry.file, stamp);
         scheduleUpload(entry);
@@ -975,8 +985,10 @@ async function run(config, options) {
     if (scanTimer) clearTimeout(scanTimer);
     closeWatcher();
     pending.clear();
+    // Close the transport first so in-flight uploads fail fast instead of
+    // waiting for their stream timeouts.
+    uploader.close();
     uploader.idle().then(function() {
-      uploader.close();
       process.exit(0);
     });
   }

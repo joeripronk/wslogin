@@ -1098,6 +1098,23 @@ wsServer.on('request', function(request) {
             console.log("received data while not authed"+ message.utf8Data.substr(1));
           }
           break;;
+        case '\2':
+          if (connection.sessioncookie!=false && !connection.viewonly) {
+            var mouse=message.utf8Data.substr(1);
+            var nowms=Date.now();
+            if (mouse.length<=256 && nowms-(connection.lastmouse||0)>=40) {
+              try {
+                var m=JSON.parse(mouse);
+                if (Number.isInteger(m.x)&&Number.isInteger(m.y)
+                    &&Number.isInteger(m.b)&&m.b>=0&&m.b<=2) {
+                  connection.lastmouse=nowms;
+                  var log={t:now(),d:mouse,c:3};
+                  append_session_log(sessions[connection.username][connection.sessioncookie],log);
+                }
+              } catch(error) {}
+            }
+          }
+          break;;
         default: console.log("unknown message type "+ message.utf8Data);
       }
     }

@@ -223,6 +223,12 @@ function createPlayback(config, options) {
   var archiveTemplate = config.playback_archive_template
     ? String(config.playback_archive_template)
     : '<%date YYYY-mm-dd>/<hostname>/<username>/<session>.json';
+  var activeDir = config.playback_active_dir
+    ? path.resolve(baseDir, String(config.playback_active_dir))
+    : null;
+  var activeTemplate = config.playback_active_template
+    ? String(config.playback_active_template)
+    : '<hostname>/<username>/<session>.json';
   var cacheDir = config.playback_cache_dir
     ? path.resolve(baseDir, String(config.playback_cache_dir))
     : path.join(baseDir, 'playback-cache');
@@ -292,6 +298,20 @@ function createPlayback(config, options) {
     if (!archiveTemplate.endsWith('.json')) {
       throw new Error('playback_archive_template must end in .json: '
         + archiveTemplate);
+    }
+  }
+  if (activeDir) {
+    var activeNames = templatePlaceholders(activeTemplate);
+    activeNames.delete('username');
+    activeNames.delete('session');
+    activeNames.delete('hostname');
+    if (activeNames.size > 0) {
+      throw new Error('playback_active_template may only use <hostname>, '
+        + '<username> and <session>: ' + activeTemplate);
+    }
+    if (!activeTemplate.endsWith('.json')) {
+      throw new Error('playback_active_template must end in .json: '
+        + activeTemplate);
     }
   }
 
@@ -848,23 +868,19 @@ function titleDescription(titles, lastTitle) {
       'local', options.hostname || require('os').hostname());
   }
 
+  async function listActiveFiles() {
+    if (!activeDir) return [];
+    return listFiles(activeDir, activeTemplate,
+      ['hostname', 'username', 'session'], 'active', null);
+  }
+
   async function listArchiveFiles() {
     if (!archiveDir) return [];
     return listFiles(archiveDir, archiveTemplate,
       ['hostname', 'username', 'session'], 'archive', null);
   }
 
-  async function findSessionFile(username, session, hostname) {
-    if (!isSafeSessionName(username, session)) return null;
-    var local = findLocalFile(username, session);
-    if (local && (!hostname || hostname == local.hostname)) return local;
-    if (!archiveDir) return null;
-    var entries = await listArchiveFiles();
-    var matches = entries.filter(function(entry) {
-      return entry.username == username && entry.session == session
-        && (!hostname || entry.hostname == hostname);
-    });
-    if (!matches.length) return null;
+  async function pickBest(matches) {
     var best = matches[0];
     var bestStat = null;
     try {
@@ -882,10 +898,31 @@ function titleDescription(titles, lastTitle) {
     return best;
   }
 
+  function filterMatches(entries, username, session, hostname) {
+    return entries.filter(function(entry) {
+      return entry.username == username && entry.session == session
+        && (!hostname || entry.hostname == hostname);
+    });
+  }
+
+  async function findSessionFile(username, session, hostname) {
+    if (!isSafeSessionName(username, session)) return null;
+    var local = findLocalFile(username, session);
+    if (local && (!hostname || hostname == local.hostname)) return local;
+    var activeMatches = filterMatches(await listActiveFiles(),
+      username, session, hostname);
+    if (activeMatches.length) return await pickBest(activeMatches);
+    var archiveMatches = filterMatches(await listArchiveFiles(),
+      username, session, hostname);
+    if (!archiveMatches.length) return null;
+    return await pickBest(archiveMatches);
+  }
+
   async function listSessionFiles() {
     var local = await listLocalFiles();
+    var active = await listActiveFiles();
     var archive = await listArchiveFiles();
-    return local.concat(archive);
+    return local.concat(active, archive);
   }
 
   async function readStartDate(file) {
@@ -976,7 +1013,8 @@ function titleDescription(titles, lastTitle) {
     var enddate = metadata && metadata.lastT != null
       ? metadata.lastT : await readLastDate(entry.file);
     var active = entry.finished ? false
-      : (isActive ? !!isActive(entry.username, entry.session)
+      : (entry.source == 'local' && isActive
+        ? !!isActive(entry.username, entry.session)
         : Date.now() - stat.mtimeMs < activeSeconds * 1000);
     var titleInfo = metadata && metadata.titleSeconds
       ? {titles: metadata.titleSeconds, lastTitle: metadata.currentTitle}
@@ -1017,7 +1055,8 @@ function titleDescription(titles, lastTitle) {
       var value = await describe(entries[i], stat);
       var key = value.hostname + '/' + value.username + '/' + value.session;
       var old = merged.get(key);
-      if (!old || value.active
+      if (!old
+          || (value.active && !(old.active && old.source == 'local'))
           || (!old.active && old.source != 'archive'
             && value.source == 'archive')) {
         merged.set(key, value);
