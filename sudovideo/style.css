@@ -691,6 +691,18 @@ button:disabled {
   white-space: nowrap;
 }
 
+.mouse-cursor {
+  position: absolute;
+  z-index: 30;
+  width: 12px;
+  height: 18px;
+  pointer-events: none;
+  transition: left 180ms linear, top 180ms linear;
+  background: rgba(242, 242, 242, 0.35);
+  clip-path: polygon(0 0, 0 100%, 30% 72%, 48% 100%, 62% 94%, 44% 66%, 100% 66%);
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.5));
+}
+
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 240px minmax(0, 1fr);

@@ -52,6 +52,8 @@ var state = {
 var terminal = null;
 var fitAddon = null;
 var resizeObserver = null;
+var mouseOverlay = null;
+var mouseTracking = { click: false, drag: false, motion: false, sgr: false, urxvt: false, utf8: false };
 
 function byId(id) {
   return document.getElementById(id);
@@ -304,6 +306,7 @@ function newTerminal(cols, rows) {
     allowProposedApi: true,
     convertEol: false,
     cursorBlink: false,
+    cursorInactiveStyle: 'block',
     fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
     fontSize: 14,
     lineHeight: 1.05,
@@ -336,6 +339,11 @@ function newTerminal(cols, rows) {
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
   terminal.open(els.terminalHost);
+  mouseOverlay = document.createElement('div');
+  mouseOverlay.className = 'mouse-cursor hidden';
+  mouseOverlay.setAttribute('aria-hidden', 'true');
+  terminal.element.appendChild(mouseOverlay);
+  resetMouseTracking();
   terminal.onTitleChange(function(title) {
     els.headTab.textContent = title || '';
   });
@@ -397,10 +405,94 @@ function scheduleFit() {
   fitTimer = setTimeout(scaleTerminal, 80);
 }
 
+function resetMouseTracking() {
+  mouseTracking = {
+    click: false, drag: false, motion: false,
+    sgr: false, urxvt: false, utf8: false
+  };
+  if (mouseOverlay) mouseOverlay.classList.add('hidden');
+}
+
+function mouseTrackingActive() {
+  return mouseTracking.click || mouseTracking.drag || mouseTracking.motion;
+}
+
+function trackMouseModes(data) {
+  var match;
+  var re = /\x1b\[\?(\d+)([hl])/g;
+  while ((match = re.exec(data))) {
+    var mode = Number(match[1]);
+    var on = match[2] === 'h';
+    if (mode === 1000) mouseTracking.click = on;
+    else if (mode === 1002) mouseTracking.drag = on;
+    else if (mode === 1003) mouseTracking.motion = on;
+    else if (mode === 1006) mouseTracking.sgr = on;
+    else if (mode === 1015) mouseTracking.urxvt = on;
+    else if (mode === 1005) mouseTracking.utf8 = on;
+  }
+  if (!mouseTrackingActive() && mouseOverlay) {
+    mouseOverlay.classList.add('hidden');
+  }
+}
+
+function showMouseCursor(col, row) {
+  if (!mouseOverlay || !terminal) return;
+  col = Math.min(Math.max(col, 0), terminal.cols - 1);
+  row = Math.min(Math.max(row, 0), terminal.rows - 1);
+  var cell;
+  try {
+    cell = terminal._core._renderService.dimensions.css.cell;
+  } catch (error) {
+    cell = null;
+  }
+  if (!cell || !cell.width || !cell.height) cell = cellMetrics(14);
+  var screen = terminal.element.querySelector('.xterm-screen');
+  var left = (screen ? screen.offsetLeft : 0) + col * cell.width;
+  var top = (screen ? screen.offsetTop : 0) + row * cell.height;
+  mouseOverlay.style.left = Math.floor(left) + 'px';
+  mouseOverlay.style.top = Math.floor(top) + 'px';
+  mouseOverlay.classList.remove('hidden');
+}
+
+function handleMouseReports(data) {
+  if (!mouseTrackingActive()) return;
+  var match;
+  var re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+  var found = false;
+  while ((match = re.exec(data))) {
+    found = true;
+    if (match[4] === 'M') {
+      showMouseCursor(Number(match[2]) - 1, Number(match[3]) - 1);
+    } else if (mouseOverlay) {
+      mouseOverlay.classList.add('hidden');
+    }
+  }
+  re = /\x1b\[M([\s\S])([\s\S])([\s\S])/g;
+  while ((match = re.exec(data))) {
+    found = true;
+    showMouseCursor(
+      match[1].charCodeAt(0) - 33,
+      match[2].charCodeAt(0) - 33
+    );
+  }
+  if (mouseTracking.urxvt && !found) {
+    re = /\x1b\[(\d+);(\d+);(\d+)M/g;
+    while ((match = re.exec(data))) {
+      showMouseCursor(Number(match[2]) - 1, Number(match[3]) - 1);
+    }
+  }
+}
+
 function applyEvent(event) {
   if (!terminal || !event) return;
   if (event.c === 1) {
-    terminal.write(String(event.d || ''));
+    var data = String(event.d || '');
+    trackMouseModes(data);
+    terminal.write(data);
+    return;
+  }
+  if (event.c === 2) {
+    handleMouseReports(String(event.d || ''));
     return;
   }
   if (event.c === 0 && typeof event.d === 'string') {
