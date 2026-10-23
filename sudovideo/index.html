@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session playback</title>
+<link rel="icon" href="./favicon.png">
+<link rel="stylesheet" href="./xterm.css">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <span>wslogin playback</span>
+  </div>
+  <div class="connection" id="connection">Connecting</div>
+</header>
+<button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Show sessions" aria-controls="sidebar" aria-expanded="false">
+  <span class="sidebar-toggle-chevron" aria-hidden="true"></span>
+  <span>Sessions</span>
+</button>
+<main class="layout sidebar-hidden" id="layout">
+  <aside class="sidebar" id="sidebar" aria-hidden="true">
+    <div class="sidebar-head">
+      <h2>Sessions</h2>
+      <button class="icon-button" id="refresh" type="button" title="Refresh sessions">Refresh</button>
+    </div>
+    <input class="filter" id="filter" type="search" placeholder="Filter by user or session" autocomplete="off">
+    <div class="session-list" id="session-list"></div>
+    <div class="list-status" id="list-status"></div>
+  </aside>
+  <section class="viewer">
+    <div class="viewer-head">
+      <div class="viewer-title">
+        <h1 id="session-title">Select a session</h1>
+        <div class="session-meta" id="session-meta"></div>
+      </div>
+      <div class="viewer-actions">
+        <div class="search-box">
+          <input id="search-input" type="search" placeholder="Find in terminal" autocomplete="off">
+          <span id="search-count"></span>
+          <button class="icon-button" id="search-prev" type="button" title="Previous match">Prev</button>
+          <button class="icon-button" id="search-next" type="button" title="Next match">Next</button>
+        </div>
+        <a class="icon-button hidden" id="download" href="#" download>Download</a>
+      </div>
+    </div>
+    <div class="terminal-frame" id="terminal-frame">
+      <div class="terminal-host" id="terminal"></div>
+      <div class="empty-state" id="empty-state">
+        <div class="empty-title">No session selected</div>
+        <div>Choose a session from the list to replay it.</div>
+      </div>
+      <div class="loading-state hidden" id="loading-state">
+        <div class="spinner"></div>
+        <div id="loading-text">Loading session</div>
+      </div>
+      <div class="idle-overlay hidden" id="idle-overlay" role="status" aria-live="polite">
+        <video class="idle-video" id="idle-video" playsinline preload="metadata"></video>
+        <div class="idle-caption">
+          <span class="idle-text" id="idle-text">Skipping idle time</span>
+          <button class="icon-button" id="idle-skip" type="button">Skip</button>
+        </div>
+      </div>
+      <div class="idle-skip-overlay hidden" id="idle-skip-overlay" role="status" aria-live="polite">
+        <span class="idle-skip-text" id="idle-skip-text">Skipping idle time</span>
+        <button class="icon-button" id="idle-skip-now" type="button">Skip now</button>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="play-button" id="play" type="button" title="Play or pause (Space)">Play</button>
+      <div class="time-display" id="time">--:-- / --:--</div>
+      <div class="seek-wrap">
+        <canvas class="activity-canvas" id="activity-canvas" title="Activity: orange output, blue input, red hidden input"></canvas>
+        <input class="seek" id="seek" type="range" min="0" max="0" step="0.01" value="0">
+      </div>
+      <select class="speed" id="speed" title="Playback speed">
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+        <option value="8">8x</option>
+        <option value="16">16x</option>
+      </select>
+      <button class="live-button hidden" id="live" type="button">Live</button>
+    </div>
+    <div class="status-line" id="status-line"></div>
+  </section>
+</main>
+<script src="./xterm.js"></script>
+<script src="./addon-fit.js"></script>
+<script src="./addon-web-links.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

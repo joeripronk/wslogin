@@ -198,14 +198,14 @@ var otherTheme = {
 };
 var isBaseTheme = true;
 
-  //fontFamily: 'Ubuntu Mono,monospace',
-//fontFamily: '"Cascadia Code", Menlo, monospace',
-//fontFamily: '"UbuntuMono"',
+var BASE_FONT_SIZE=14;
 var term = new window.Terminal({
   theme: baseTheme,
   cursorBlink: true,
   scrollback: 10000,
-  convertEol: false
+  convertEol: false,
+  fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
+  fontSize: BASE_FONT_SIZE
 });
 term.onTitleChange(function (title) {
   document.title = title;
@@ -237,37 +237,151 @@ window.addEventListener(
 );
 var resizewait=false;
 var resizepending=false;
+var fitTimer=false;
 var loginform = document.getElementById('loginform');
 term.open(document.getElementById('terminal'));
 //      term.loadAddon(attachAddon); 
 term.loadAddon(fitAddon);
 //        term.loadAddon(webglAddon); 
-function resizeScreen () {
-  if (viewonly) return;
-  if (terminaldiv.style.display=="none") return;
-  var geom=undefined;
-  try {
-    geom = fitAddon.proposeDimensions();
-  } catch(e) {
-    console.log(e);
+var baseCell={width:0,height:0};
+function currentCell () {
+  var dims=term._core && term._core._renderService && term._core._renderService.dimensions;
+  if (!dims || !dims.css || !dims.css.cell) return undefined;
+  return dims.css.cell;
+}
+function terminalGeometry (cell) {
+  var element=term.element;
+  var parent=element && element.parentElement;
+  if (!parent) return undefined;
+  if (!cell) cell=currentCell();
+  if (!cell || !cell.width || !cell.height) return undefined;
+  var parentStyle=window.getComputedStyle(parent);
+  var width=Math.max(0,parseInt(parentStyle.getPropertyValue('width'))||0);
+  var height=parseInt(parentStyle.getPropertyValue('height'))||0;
+  var elementStyle=window.getComputedStyle(element);
+  var padHor=(parseInt(elementStyle.getPropertyValue('padding-left'))||0)
+           +(parseInt(elementStyle.getPropertyValue('padding-right'))||0);
+  var padVer=(parseInt(elementStyle.getPropertyValue('padding-top'))||0)
+           +(parseInt(elementStyle.getPropertyValue('padding-bottom'))||0);
+  var viewport=element.querySelector('.xterm-viewport');
+  var scrollbar=viewport?Math.max(0,viewport.offsetWidth-viewport.clientWidth):0;
+  var availableWidth=Math.max(0,width-padHor-scrollbar);
+  var availableHeight=Math.max(0,height-padVer);
+  return {
+    width: availableWidth,
+    height: availableHeight,
+    cell: cell,
+    cols: Math.max(2,Math.floor(availableWidth/cell.width)),
+    rows: Math.max(1,Math.floor(availableHeight/cell.height))
+  };
+}
+function applyFont (size) {
+  size=Math.max(4,Math.min(64,size));
+  if (Math.abs(size-term.options.fontSize)>0.01) {
+    term.options.fontSize=size;
+    term.refresh(0,term.rows-1);
   }
+}
+function refineScale (steps) {
+  if (steps<=0) return;
+  requestAnimationFrame(function() {
+    if (!term.element) return;
+    var cell=currentCell();
+    if (!cell || !cell.width || !cell.height) return;
+    var geom=terminalGeometry(baseCell.width?baseCell:cell);
+    if (!geom) return;
+    var w=term.cols*cell.width;
+    var h=term.rows*cell.height;
+    var cur=term.options.fontSize;
+    // xterm quantizes the cell size, so the proportional estimate can end up
+    // a few pixels too wide. Step down until the grid fits the window.
+    if (w>geom.width+0.5 || h>geom.height+0.5) {
+      applyFont(Math.floor(cur*10)/10-0.1);
+      refineScale(steps-1);
+      return;
+    }
+    // Consume the slack left by flooring the font size. Growth is verified
+    // on the next frame, so quantization cannot leave the grid overflowing.
+    var slackW=geom.width-w;
+    var slackH=geom.height-h;
+    if (slackW>cell.width*0.2 && slackH>cell.height*0.2 && cur<64) {
+      var grow=Math.floor(Math.min(64,cur*Math.min(geom.width/w,geom.height/h)*0.99)*10)/10;
+      if (grow>cur) applyFont(grow);
+    }
+    refineScale(steps-1);
+  });
+}
+function scaleTerminal (geom, cell) {
+  if (!geom || !cell) return;
+  var factor=Math.min(geom.width/(term.cols*cell.width),
+                      geom.height/(term.rows*cell.height));
+  applyFont(Math.floor(BASE_FONT_SIZE*factor*10)/10);
+  refineScale(8);
+}
+function resizeScreen () {
+  if (terminaldiv.style.display=="none") return;
+  var cell=currentCell();
+  if (!cell || !cell.width || !cell.height) {
+    setTimeout(function() { resizeScreen(); },200);
+    return;
+  }
+  // The font is scaled to fill the window, so the cell size at the scaled
+  // font cannot be used to propose the pty geometry: that would feed the
+  // scaling back into the size of the terminal. All geometry is calculated
+  // with the cell size of the base font, which is cached whenever the
+  // terminal happens to be at the base font size. Changing the font size is
+  // applied asynchronously, so the cache is also used when it is not.
+  if (term.options.fontSize==BASE_FONT_SIZE) {
+    baseCell.width=cell.width;
+    baseCell.height=cell.height;
+  }
+  var geom=terminalGeometry(baseCell.width?baseCell:cell);
   if (geom==undefined) {
     setTimeout(function() { resizeScreen(); },200);
   } else {
     if (term.cols!= geom.cols || term.rows != geom.rows) {
-      term.resize(geom.cols, geom.rows);
-      if(authenticated){
+      if(viewonly || shared){
+        // Viewonly and shared clients mirror the size of the session they
+        // watch. They must not resize the pty (that would garble the screen
+        // of the owner) and must not resize the local terminal (that would
+        // garble their own screen), so only the font is scaled below.
+      } else if(authenticated){
+        // Do not resize the local terminal here. The pty is still at the old
+        // size until the server confirms, and rendering its output in a
+        // differently sized terminal garbles the screen. The server echoes the
+        // resize back (see the 'resize' case below), which keeps both in sync.
         if (resizewait) { 
           resizepending=true; 
         } else {
           if (socket && socket.readyState==1) socket.send('\0{"cmd":"resize","cols":' +  geom.cols + ',"rows":' + geom.rows + '}');
           resizewait=setTimeout(function() { resizewait=false;if (resizepending) resizeScreen(); },150);
         }
+        scaleTerminal(geom, baseCell.width?baseCell:cell);
+        return;
+      } else {
+        term.resize(geom.cols,geom.rows);
       }
     }
-
+    scaleTerminal(geom, baseCell.width?baseCell:cell);
   }
 }
+function scheduleResize () {
+  if (fitTimer) clearTimeout(fitTimer);
+  fitTimer=setTimeout(function() { fitTimer=false; resizeScreen(); },80);
+}
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(function() {
+    // The webfont changes the cell size, so measure the base cell size again
+    // once it is loaded. Applying a font size is asynchronous, so wait for
+    // the terminal to settle before measuring.
+    term.options.fontSize=BASE_FONT_SIZE;
+    requestAnimationFrame(function() {
+      requestAnimationFrame(resizeScreen);
+    });
+  });
+}
+document.addEventListener('fullscreenchange',scheduleResize,false);
+document.addEventListener('webkitfullscreenchange',scheduleResize,false);
 
 function setReconnectToken(token) {
   reconnectToken = token || false;
@@ -290,7 +404,7 @@ function showLoginForm() {
     var username=document.getElementById('username');
     var password=document.getElementById('password');
     terminaldiv.style.display="block";
-    fitAddon.fit();
+    resizeScreen();
     terminaldiv.style.display="none";
     if (!socket || socket.readyState!=1) return false;
     cmd={cmd:'login',username:username.value,password:password.value,rememberme:rememberme.value,cols:term.cols,rows:term.rows}
@@ -338,7 +452,7 @@ function onopen(connection) {
   connected=true;
   //console.log('connection opened');
   resizeScreen();
-  window.addEventListener('resize', resizeScreen, false);
+  window.addEventListener('resize', scheduleResize, false);
 }
 function connect() {
   if (socket && (socket.readyState==0 || socket.readyState==1)) return;
@@ -363,7 +477,11 @@ function onmessage(message) {
           term.write(atob(json.data));
           break;;
         case 'resize':
-          term.resize(json.cols,json.rows);
+          if (term.cols!=json.cols || term.rows!=json.rows) {
+            term.resize(json.cols,json.rows);
+            term.refresh(0,term.rows-1);
+            scheduleResize();
+          }
           break;;
         case 'cookie':
           document.cookie=json.cookie;

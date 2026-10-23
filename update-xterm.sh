@@ -49,6 +49,16 @@ install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js" www/t/xterm-addon-
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js.map" www/t/xterm-addon-web-links.js.map
 rm -f www/t/xterm-addon-webgl.js www/t/xterm-addon-webgl.js.map
 
+echo "vendoring browser assets into sudovideo"
+mkdir -p sudovideo
+install -m 0644 "$TMP/xterm/lib/xterm.js" sudovideo/xterm.js
+install -m 0644 "$TMP/xterm/lib/xterm.js.map" sudovideo/xterm.js.map
+install -m 0644 "$TMP/xterm/css/xterm.css" sudovideo/xterm.css
+install -m 0644 "$TMP/addon-fit/lib/addon-fit.js" sudovideo/addon-fit.js
+install -m 0644 "$TMP/addon-fit/lib/addon-fit.js.map" sudovideo/addon-fit.js.map
+install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js" sudovideo/addon-web-links.js
+install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js.map" sudovideo/addon-web-links.js.map
+
 echo "updating www symlinks"
 link_asset() {
   local name="$1"

@@ -14,6 +14,9 @@ const { Terminal } =  require ("@xterm/headless");
 //const { Terminal } =  require ("@xterm/xterm");
 const { SerializeAddon } = require("@xterm/addon-serialize");
 const { loadSslOptions, allowPlaintext } = require('./ssl');
+const { render: renderTemplate, placeholders: templatePlaceholders,
+  match: matchTemplate, isSafeRelative } = require('./template');
+const { createPlayback } = require('./playback');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
@@ -75,9 +78,87 @@ var session_dir = config.session_dir
   ? path.resolve(__dirname, config.session_dir)
   : path.join(__dirname, 'sessions');
 console.log("session_dir="+session_dir);
-function session_path(username, sessioncookie, suffix) {
-  return path.join(session_dir, username, sessioncookie+suffix);
+// The active session layout, relative to session_dir. Only <username> and
+// <session> are allowed here; uploader.js uses the same template.
+var session_template = config.session_template
+  ? String(config.session_template)
+  : '<username>/<session>.json';
+var session_template_names = templatePlaceholders(session_template);
+session_template_names.delete('username');
+session_template_names.delete('session');
+if (session_template_names.size > 0) {
+  console.error("session_template may only use <username> and <session>: "
+    + session_template);
+  process.exit(1);
 }
+if (!session_template.endsWith('.json')) {
+  console.error("session_template must end in .json: "+session_template);
+  process.exit(1);
+}
+console.log("session_template="+session_template);
+function session_log_path(username, sessioncookie) {
+  var relative = renderTemplate(session_template,
+    {username: username, session: sessioncookie});
+  if (!isSafeRelative(relative)) {
+    throw new Error("session_template produced unsafe path "+relative);
+  }
+  return path.join(session_dir, relative);
+}
+function session_checkpoint_path(username, sessioncookie) {
+  var file = session_log_path(username, sessioncookie);
+  return file.slice(0, -'.json'.length) + '.checkpoint.json';
+}
+// Renaming the log of an ended session signals uploader.js that the session is
+// complete and can be uploaded. Checkpoints are not uploaded.
+function finish_path(file) {
+  try {
+    if (fs.existsSync(file)) {
+      fs.renameSync(file, file+'.done');
+      console.log("marked "+file+" as finished");
+    }
+  } catch (error) {
+    console.error("error marking "+file+" as finished: "+error.message);
+  }
+}
+function finish_session(username, sessioncookie) {
+  try {
+    finish_path(session_log_path(username, sessioncookie));
+  } catch (error) {
+    console.error("error finishing session "+username+"/"+sessioncookie
+      +": "+error.message);
+  }
+}
+// A log that still exists without the .done suffix at startup belongs to a
+// session that was interrupted by a crash, so mark it finished for uploader.js.
+function finish_interrupted_sessions() {
+  if (!fs.existsSync(session_dir)) return;
+  function walk(dir, relative) {
+    var entries;
+    try {
+      entries = fs.readdirSync(dir, {withFileTypes: true});
+    } catch (error) {
+      console.error("error scanning "+dir+": "+error.message);
+      return;
+    }
+    for (var i=0; i<entries.length; i++) {
+      var entry = entries[i];
+      var rel = relative ? relative+'/'+entry.name : entry.name;
+      if (entry.isDirectory()) {
+        walk(path.join(dir, entry.name), rel);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith('.json')
+          || entry.name.endsWith('.checkpoint.json')) continue;
+      if (!matchTemplate(session_template, rel, ['username', 'session'])) {
+        continue;
+      }
+      finish_path(path.join(dir, entry.name));
+    }
+  }
+  walk(session_dir, '');
+}
+finish_interrupted_sessions();
 var clients = [ ];
 var logins = {};
 var sessions = {};
@@ -86,10 +167,62 @@ var shares = {};
 var reconnects = {};
 var wwwdir = "www"; 
 
-function write(fd,d) {
-  return fs.write(fd,d,function (err) {
-    if (err) console.error("error: " + err.message);
+var playback = null;
+try {
+  playback = createPlayback(config, {
+    baseDir: __dirname,
+    hostname: os.hostname(),
+    isActive: function(username, session) {
+      return !!(sessions[username] && sessions[username][session]
+        && sessions[username][session].pty);
+    },
+    authenticate: function(username, password, callback) {
+      pam.authenticate(username, password, function(error) {
+        callback(error);
+      }, {serviceName: config.playback_auth_service || 'sshd'});
+    }
   });
+} catch (error) {
+  console.error("playback configuration error: "+error.message);
+  process.exit(1);
+}
+console.log("playback: enabled="+playback.enabled+" dir="+playback.sessionDir
+  +" www="+playback.wwwDir+" cache="+playback.cacheDir
+  +" auth="+playback.authRequired);
+
+var writeQueues = new Map();
+function writeAll(fd,buffer) {
+  return new Promise(function(resolve) {
+    var offset=0;
+    function next() {
+      if (offset>=buffer.length) { resolve(); return; }
+      fs.write(fd,buffer,offset,buffer.length-offset,null,
+        function(err,written) {
+          if (err) {
+            console.error("error: " + err.message);
+            resolve();
+            return;
+          }
+          if (!written) { resolve(); return; }
+          offset+=written;
+          next();
+        });
+    }
+    next();
+  });
+}
+function write(fd,d) {
+  var buffer=Buffer.isBuffer(d) ? d : Buffer.from(String(d),'utf8');
+  var previous=writeQueues.get(fd) || Promise.resolve();
+  var pending=previous.catch(function() {}).then(function() {
+    return writeAll(fd,buffer);
+  });
+  writeQueues.set(fd,pending);
+  function done() {
+    if (writeQueues.get(fd)===pending) writeQueues.delete(fd);
+  }
+  pending.then(done,done);
+  return pending;
 }
 function fopen(fname,flags) {
   return fs.openSync(fname,flags);
@@ -335,25 +468,78 @@ function sendInfo(c,msg) {
 /**
  * HTTP server
  */
-function httpHandler(request, response) {
-  // Not important for us. We're writing WebSocket server,
-  // not HTTP server    
-
-  let path = request.url.substring(1);
-  if(path == '') {
-    path = 'index.html';
+var static_types = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+};
+function serve_www(request, response, relative) {
+  var root = path.resolve(__dirname, wwwdir);
+  var localpath = path.resolve(root, '.'+path.sep+relative);
+  if (localpath != root && !localpath.startsWith(root+path.sep)) {
+    response.statusCode = 400;
+    response.end('bad path');
+    return;
   }
-  var localpath = wwwdir + '/' + path;
-  if(fs.existsSync(localpath)) {
-    console.log("serving " + localpath);
-    if(path.indexOf('.js') === path.length-3) {
-      response.setHeader('Content-Type', 'application/javascript');
+  fs.stat(localpath, function(error, stat) {
+    if (error || !stat.isFile()) {
+      response.statusCode = 404;
+      response.end('');
+      return;
     }
-    response.end(fs.readFileSync(localpath));
-  } else {
-    response.statusCode = 404;
-    response.end('');
+    response.setHeader('Content-Type',
+      static_types[path.extname(localpath).toLowerCase()]
+      || 'application/octet-stream');
+    response.setHeader('Content-Length', stat.size);
+    fs.createReadStream(localpath).pipe(response);
+  });
+}
+function httpHandler(request, response) {
+  var url;
+  try {
+    url = new URL(request.url, 'http://localhost');
+  } catch (error) {
+    response.statusCode = 400;
+    response.end('bad request');
+    return;
   }
+  if (url.pathname == '/api/playback'
+      || url.pathname.startsWith('/api/playback/')) {
+    playback.handle(request, response, url).catch(function(error) {
+      console.error("playback request failed: "+error.message);
+      if (!response.headersSent) {
+        response.statusCode = 500;
+        response.end('internal server error');
+      } else if (!response.writableEnded) {
+        response.end();
+      }
+    });
+    return;
+  }
+  if (url.pathname == '/playback') {
+    response.statusCode = 302;
+    response.setHeader('Location', '/playback/');
+    response.end('');
+    return;
+  }
+  if (url.pathname == '/playback/' || url.pathname.startsWith('/playback/')) {
+    var asset = url.pathname.slice('/playback/'.length) || 'index.html';
+    playback.serveStatic(response, asset);
+    return;
+  }
+  var relative = url.pathname.substring(1);
+  if(relative == '') {
+    relative = 'index.html';
+  }
+  serve_www(request, response, relative);
 }
 
 var httpServer = http.createServer(httpHandler);
@@ -501,8 +687,8 @@ wsServer.on('request', function(request) {
     */
   async function replay_pty(username,sessioncookie,cols,rows,connection) {
     console.log("reconnected to "+sessioncookie+" "+sessions[username][sessioncookie].pty.file);
-    var checkpointfile=checkpoint_enabled ? session_path(username,sessioncookie,'.checkpoint.json') : null;
-    var serial = await create_replayed_terminal(session_path(username,sessioncookie,'.json'), checkpointfile);
+    var checkpointfile=checkpoint_enabled ? session_checkpoint_path(username,sessioncookie) : null;
+    var serial = await create_replayed_terminal(session_log_path(username,sessioncookie), checkpointfile);
     connection.sendUTF('\0'+JSON.stringify({cmd:"resize",cols:serial.cols,rows:serial.rows}));
     connection.sendUTF('\1'+serial.s);
     console.log("sending replayed terminal");
@@ -614,10 +800,10 @@ wsServer.on('request', function(request) {
       //  }
       var session=sessions[username][sessioncookie];
       session.sessioncookie=sessioncookie;
-      session.checkpoint_path=session_path(username,sessioncookie,'.checkpoint.json');
+      session.checkpoint_path=session_checkpoint_path(username,sessioncookie);
       session.mirror=create_mirror(connection.columns, connection.rows);
-      fs.mkdirSync(path.join(session_dir,username), { recursive: true });
-      //file = fs.createWriteStream(session_path(username,sessioncookie,'.json'), { flags: 'a' });
+      fs.mkdirSync(path.dirname(session_log_path(username,sessioncookie)), { recursive: true });
+      //file = fs.createWriteStream(session_log_path(username,sessioncookie), { flags: 'a' });
       sessions[username][sessioncookie].pty = pty.spawn('sudo', ['-u',username,'-i'], {
         name: 'xterm',
         cols: connection.columns,
@@ -625,7 +811,7 @@ wsServer.on('request', function(request) {
         cwd: '/',
         env: { USER: username,VIEWID: viewid,VIEWURL: request.origin+'/#view='+viewid,SUDO_USER: username }
       });
-      sessions[username][sessioncookie].pty.file = fopen(session_path(username,sessioncookie,'.json'), 'a+');
+      sessions[username][sessioncookie].pty.file = fopen(session_log_path(username,sessioncookie), 'a+');
       /*        sessions[username][sessioncookie].pty.sessioncookie=sessioncookie;
         sessions[username][sessioncookie].pty.username=username;
         */
@@ -704,6 +890,7 @@ wsServer.on('request', function(request) {
            fs.close(sessions[connection.username][connection.sessioncookie].pty.file);
            sessions[connection.username][connection.sessioncookie].pty.file=false;
         }
+        finish_session(connection.username, connection.sessioncookie);
         delete views[sessions[connection.username][connection.sessioncookie].viewid];
         if (connection.username in views && views[connection.username].length==0) {
           console.log("deleting all views for "+connection.username);

@@ -1,0 +1,1101 @@
+'use strict';
+
+var API = '/api/playback';
+var state = {
+  sessions: [],
+  current: null,
+  active: false,
+  start: 0,
+  end: 0,
+  time: 0,
+  seekTarget: 0,
+  speed: 1,
+  playing: false,
+  live: false,
+  streamDone: false,
+  streamId: 0,
+  abort: null,
+  autoPlay: false,
+  started: false,
+  queue: [],
+  queueIndex: 0,
+  lastEventT: null,
+  termCols: 80,
+  termRows: 24,
+  dragging: false,
+  lastFrame: 0,
+  lastUi: 0,
+  matches: [],
+  matchIndex: -1,
+  searchQuery: '',
+  idleSkipping: false,
+  idleTo: 0,
+  idleOverlayTimer: null,
+  idleVideoTimer: null,
+  idleAutoSkipTimer: null,
+  idleTimer: null,
+  activity: null,
+  idleConfig: {
+    enabled: true,
+    thresholdSeconds: 300,
+    video: 'onehour.mp4',
+    videoDelaySeconds: 5,
+    overlayDelaySeconds: 1,
+    autoSkipSeconds: 10,
+    movieAutoSkipSeconds: 0
+  }
+};
+
+var terminal = null;
+var fitAddon = null;
+var resizeObserver = null;
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+var els = {
+  layout: byId('layout'),
+  sidebar: byId('sidebar'),
+  sidebarToggle: byId('sidebar-toggle'),
+  connection: byId('connection'),
+  refresh: byId('refresh'),
+  filter: byId('filter'),
+  list: byId('session-list'),
+  listStatus: byId('list-status'),
+  title: byId('session-title'),
+  meta: byId('session-meta'),
+  searchInput: byId('search-input'),
+  searchCount: byId('search-count'),
+  searchPrev: byId('search-prev'),
+  searchNext: byId('search-next'),
+  download: byId('download'),
+  frame: byId('terminal-frame'),
+  terminalHost: byId('terminal'),
+  empty: byId('empty-state'),
+  loading: byId('loading-state'),
+  loadingText: byId('loading-text'),
+  idleOverlay: byId('idle-overlay'),
+  idleVideo: byId('idle-video'),
+  idleText: byId('idle-text'),
+  idleSkip: byId('idle-skip'),
+  idleSkipOverlay: byId('idle-skip-overlay'),
+  idleSkipText: byId('idle-skip-text'),
+  idleSkipNow: byId('idle-skip-now'),
+  play: byId('play'),
+  time: byId('time'),
+  seek: byId('seek'),
+  activity: byId('activity-canvas'),
+  speed: byId('speed'),
+  live: byId('live'),
+  status: byId('status-line')
+};
+
+function setConnection(text, kind) {
+  els.connection.textContent = text;
+  els.connection.className = 'connection' + (kind ? ' ' + kind : '');
+}
+
+function setSidebarVisible(visible) {
+  els.layout.classList.toggle('sidebar-hidden', !visible);
+  els.sidebar.setAttribute('aria-hidden', visible ? 'false' : 'true');
+  els.sidebarToggle.setAttribute('aria-expanded', visible ? 'true' : 'false');
+  els.sidebarToggle.title = visible ? 'Hide sessions' : 'Show sessions';
+  scheduleFit();
+}
+
+function toggleSidebar() {
+  setSidebarVisible(els.layout.classList.contains('sidebar-hidden'));
+}
+
+function setStatus(text, kind) {
+  els.status.textContent = text;
+  els.status.className = 'status-line' + (kind ? ' ' + kind : '');
+}
+
+function setLoading(text) {
+  if (text) {
+    els.loadingText.textContent = text;
+    els.loading.classList.remove('hidden');
+  } else {
+    els.loading.classList.add('hidden');
+  }
+}
+
+function markLoaded() {
+  els.loading.classList.add('hidden');
+  els.empty.classList.add('hidden');
+  if (!state.started && state.autoPlay
+      && (state.active || state.streamDone)) {
+    state.started = true;
+    state.autoPlay = false;
+    beginPlayback();
+  }
+}
+
+function pad(value) {
+  return value < 10 ? '0' + value : String(value);
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
+  seconds = Math.floor(seconds);
+  var hours = Math.floor(seconds / 3600);
+  var minutes = Math.floor((seconds % 3600) / 60);
+  var secs = seconds % 60;
+  if (hours > 0) return hours + ':' + pad(minutes) + ':' + pad(secs);
+  return pad(minutes) + ':' + pad(secs);
+}
+
+function formatDate(epochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return '';
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    }).format(new Date(epochSeconds * 1000));
+  } catch (error) {
+    return new Date(epochSeconds * 1000).toLocaleString();
+  }
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 1024) return (bytes || 0) + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KiB';
+  if (bytes < 1024 * 1024 * 1024) {
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+  }
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GiB';
+}
+
+function newTerminal(cols, rows) {
+  if (terminal) {
+    try { terminal.dispose(); } catch (error) {}
+    terminal = null;
+  }
+  els.terminalHost.innerHTML = '';
+  terminal = new Terminal({
+    allowProposedApi: true,
+    convertEol: false,
+    cursorBlink: false,
+    fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
+    fontSize: 14,
+    lineHeight: 1.05,
+    scrollback: 10000,
+    theme: {
+      background: '#090b0e',
+      foreground: '#d8dee8',
+      cursor: '#5aa9e6',
+      cursorAccent: '#090b0e',
+      selectionBackground: '#294a66',
+      black: '#1d232b',
+      red: '#e06c75',
+      green: '#7bd88f',
+      yellow: '#e5c07b',
+      blue: '#61afef',
+      magenta: '#c678dd',
+      cyan: '#56b6c2',
+      white: '#d8dee8',
+      brightBlack: '#5c6773',
+      brightRed: '#ff7b86',
+      brightGreen: '#9be8ab',
+      brightYellow: '#f2d49b',
+      brightBlue: '#8bc4ff',
+      brightMagenta: '#dfa6ef',
+      brightCyan: '#82d9e2',
+      brightWhite: '#ffffff'
+    }
+  });
+  fitAddon = new FitAddon.FitAddon();
+  terminal.loadAddon(fitAddon);
+  terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
+  terminal.open(els.terminalHost);
+  state.termCols = Math.max(2, cols || 80);
+  state.termRows = Math.max(2, rows || 24);
+  terminal.resize(state.termCols, state.termRows);
+  requestAnimationFrame(scaleTerminal);
+}
+
+function scaleTerminal() {
+  if (!terminal || !state.current) return;
+  state.termCols = terminal.cols;
+  state.termRows = terminal.rows;
+  var dims = fitAddon.proposeDimensions();
+  if (!dims || !dims.cols || !dims.rows) return;
+  var factor = Math.min(dims.cols / state.termCols,
+    dims.rows / state.termRows);
+  factor = Math.max(0.1, Math.min(8, factor));
+  var current = terminal.options.fontSize || 14;
+  var size = Math.max(4, Math.min(64, current * factor));
+  if (Math.abs(size - current) > 0.15) {
+    terminal.options.fontSize = size;
+    requestAnimationFrame(function() {
+      if (!terminal || !state.current) return;
+      terminal.resize(state.termCols, state.termRows);
+    });
+  } else {
+    terminal.resize(state.termCols, state.termRows);
+  }
+}
+
+var fitTimer = null;
+function scheduleFit() {
+  if (fitTimer) clearTimeout(fitTimer);
+  fitTimer = setTimeout(scaleTerminal, 80);
+}
+
+function applyEvent(event) {
+  if (!terminal || !event) return;
+  if (event.c === 1) {
+    terminal.write(String(event.d || ''));
+    return;
+  }
+  if (event.c === 0 && typeof event.d === 'string') {
+    try {
+      var command = JSON.parse(event.d);
+      if (command.cmd === 'resize'
+          && Number.isInteger(command.cols) && Number.isInteger(command.rows)
+          && command.cols > 0 && command.rows > 0) {
+        state.termCols = command.cols;
+        state.termRows = command.rows;
+        terminal.resize(command.cols, command.rows);
+        scheduleFit();
+      }
+    } catch (error) {}
+  }
+}
+
+function drawActivity() {
+  var canvas = els.activity;
+  if (!canvas) return;
+  var rect = canvas.getBoundingClientRect();
+  var dpr = window.devicePixelRatio || 1;
+  var width = Math.max(1, Math.round(rect.width * dpr));
+  var height = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  var context = canvas.getContext('2d');
+  context.clearRect(0, 0, width, height);
+  var activity = state.activity;
+  if (!activity || !Number.isFinite(activity.bins)
+      || !Array.isArray(activity.output) || !Array.isArray(activity.input)
+      || !Array.isArray(activity.hidden)) {
+    return;
+  }
+  var bins = Math.max(1, activity.bins);
+  var gap = Math.max(1, Math.round(height * 0.04));
+  var laneHeight = Math.max(1, Math.floor((height - gap * 2) / 3));
+
+  function drawLane(values, color, lane) {
+    var base = lane * (laneHeight + gap) + laneHeight;
+    context.fillStyle = color;
+    for (var i = 0; i < bins; i++) {
+      var value = values[i] || 0;
+      if (value <= 0) continue;
+      var x = Math.floor(i * width / bins);
+      var next = Math.floor((i + 1) * width / bins);
+      var barWidth = Math.max(1, next - x);
+      var barHeight = Math.max(1, Math.round(value / 100 * laneHeight));
+      context.fillRect(x, base - barHeight, barWidth, barHeight);
+    }
+  }
+
+  drawLane(activity.output, 'rgba(255, 159, 67, 0.88)', 0);
+  drawLane(activity.input, 'rgba(74, 163, 255, 0.9)', 1);
+  drawLane(activity.hidden, 'rgba(255, 90, 95, 0.95)', 2);
+}
+
+function updateControls() {
+  var duration = Math.max(0, state.end - state.start);
+  var relative = Math.max(0, Math.min(duration, state.time - state.start));
+  els.time.textContent = formatDuration(relative) + ' / '
+    + formatDuration(duration);
+  els.seek.max = String(duration);
+  if (!state.dragging) els.seek.value = String(relative);
+  els.play.textContent = state.playing ? 'Pause' : 'Play';
+  els.live.classList.toggle('hidden', !state.active);
+  els.live.classList.toggle('on', state.live);
+  els.live.textContent = state.live ? 'Live' : 'Go live';
+}
+
+function requestTick() {
+  requestAnimationFrame(tick);
+}
+
+function beginPlayback() {
+  if (!state.current) return;
+  if (state.streamDone && state.time >= state.end - 0.01) {
+    seekTo(state.start, true);
+    return;
+  }
+  state.playing = true;
+  state.lastFrame = 0;
+  if (state.active && state.time >= state.end - 0.25) {
+    state.live = true;
+    state.time = state.end;
+  }
+  updateControls();
+  requestTick();
+}
+
+function pausePlayback() {
+  state.playing = false;
+  state.live = false;
+  if (state.idleSkipping) finishIdleSkip();
+  updateControls();
+}
+
+function clearIdleTimers() {
+  if (state.idleOverlayTimer) {
+    clearTimeout(state.idleOverlayTimer);
+    state.idleOverlayTimer = null;
+  }
+  if (state.idleVideoTimer) {
+    clearTimeout(state.idleVideoTimer);
+    state.idleVideoTimer = null;
+  }
+  if (state.idleAutoSkipTimer) {
+    clearTimeout(state.idleAutoSkipTimer);
+    state.idleAutoSkipTimer = null;
+  }
+  if (state.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
+}
+
+function cancelIdleSkip() {
+  clearIdleTimers();
+  state.idleSkipping = false;
+  state.idleTo = 0;
+  els.idleOverlay.classList.add('hidden');
+  els.idleSkipOverlay.classList.add('hidden');
+  try { els.idleVideo.pause(); } catch (error) {}
+}
+
+function finishIdleSkip() {
+  if (!state.idleSkipping) return;
+  var target = state.idleTo;
+  var skipped = Math.max(0, target - state.time);
+  cancelIdleSkip();
+  if (state.current && target > state.time) {
+    state.time = target;
+    setStatus('Skipped ' + formatDuration(skipped) + ' of idle time', 'ok');
+  }
+  updateControls();
+  if (state.playing) {
+    state.lastFrame = 0;
+    requestTick();
+  }
+}
+
+function showIdleSkipOverlay() {
+  if (!state.idleSkipping) return;
+  state.idleOverlayTimer = null;
+  var skipped = Math.max(0, state.idleTo - state.time);
+  els.idleSkipText.textContent = 'Skipping ' + formatDuration(skipped)
+    + ' of idle time';
+  els.idleSkipOverlay.classList.remove('hidden');
+
+  var autoSkip = Math.max(0,
+    Number(state.idleConfig.autoSkipSeconds) || 0) * 1000;
+  if (autoSkip > 0) {
+    state.idleAutoSkipTimer = setTimeout(finishIdleSkip, autoSkip);
+  }
+}
+
+function playIdleMovie() {
+  if (!state.idleSkipping) return;
+  state.idleVideoTimer = null;
+  if (state.idleAutoSkipTimer) {
+    clearTimeout(state.idleAutoSkipTimer);
+    state.idleAutoSkipTimer = null;
+  }
+  els.idleSkipOverlay.classList.add('hidden');
+  var skipped = Math.max(0, state.idleTo - state.time);
+  els.idleText.textContent = 'Skipping ' + formatDuration(skipped)
+    + ' of idle time';
+  els.idleOverlay.classList.remove('hidden');
+
+  var video = els.idleVideo;
+  var source = './' + state.idleConfig.video;
+  if (video.getAttribute('src') !== source) {
+    video.src = source;
+    video.load();
+  }
+  try { video.currentTime = 0; } catch (error) {}
+  video.muted = false;
+  var played = video.play();
+  if (played && played.catch) {
+    played.catch(function() {
+      video.muted = true;
+      var muted = video.play();
+      if (muted && muted.catch) {
+        muted.catch(function() { finishIdleSkip(); });
+      }
+    });
+  }
+  var movieAutoSkip = Math.max(0,
+    Number(state.idleConfig.movieAutoSkipSeconds) || 0) * 1000;
+  state.idleTimer = setTimeout(finishIdleSkip,
+    movieAutoSkip > 0 ? movieAutoSkip : 60000);
+}
+
+function startIdleSkip(target) {
+  state.idleSkipping = true;
+  state.idleTo = target;
+  els.idleOverlay.classList.add('hidden');
+  els.idleSkipOverlay.classList.add('hidden');
+  clearIdleTimers();
+
+  var videoDelay = Math.max(0,
+    Number(state.idleConfig.videoDelaySeconds) || 0) * 1000;
+  var overlayDelay = Math.max(0, Math.min(videoDelay,
+    (Number(state.idleConfig.overlayDelaySeconds) || 0) * 1000));
+
+  if (videoDelay <= 0) {
+    playIdleMovie();
+    return;
+  }
+  if (overlayDelay <= 0) {
+    showIdleSkipOverlay();
+  } else if (overlayDelay < videoDelay) {
+    state.idleOverlayTimer = setTimeout(showIdleSkipOverlay, overlayDelay);
+  }
+  state.idleVideoTimer = setTimeout(playIdleMovie, videoDelay);
+}
+
+function togglePlayback() {
+  if (state.playing) {
+    pausePlayback();
+  } else {
+    beginPlayback();
+  }
+}
+
+function tick(timestamp) {
+  if (!state.playing || state.idleSkipping) return;
+  if (!state.lastFrame) state.lastFrame = timestamp;
+  var delta = Math.min(1, (timestamp - state.lastFrame) / 1000);
+  state.lastFrame = timestamp;
+  var target = state.time + delta * state.speed;
+
+  while (state.queueIndex < state.queue.length
+      && state.queue[state.queueIndex].t <= target + 0.000001) {
+    var event = state.queue[state.queueIndex++];
+    applyEvent(event);
+    if (Number.isFinite(event.t)) state.time = Math.max(state.time, event.t);
+  }
+
+  state.time = Math.max(state.time, target);
+
+  if (state.queueIndex > 4096 && state.queueIndex * 2 > state.queue.length) {
+    state.queue = state.queue.slice(state.queueIndex);
+    state.queueIndex = 0;
+  }
+
+  var empty = state.queueIndex >= state.queue.length;
+
+  if (!state.live && state.idleConfig.enabled && !state.dragging
+      && state.queueIndex < state.queue.length) {
+    var nextEvent = state.queue[state.queueIndex];
+    if (Number.isFinite(nextEvent.t)
+        && nextEvent.t - state.time > state.idleConfig.thresholdSeconds) {
+      startIdleSkip(nextEvent.t);
+      return;
+    }
+  }
+
+  if (!state.streamDone && state.active && empty
+      && state.time >= state.end - 0.25) {
+    state.time = state.end;
+    state.live = true;
+  }
+
+  if (state.streamDone) {
+    state.time = Math.min(state.time, state.end);
+    if (empty && state.time >= state.end - 0.01) {
+      state.time = state.end;
+      state.playing = false;
+      state.live = false;
+      updateControls();
+      setStatus('End of session', '');
+      return;
+    }
+  }
+
+  if (state.live) state.time = state.end;
+
+  if (timestamp - state.lastUi > 80) {
+    state.lastUi = timestamp;
+    updateControls();
+  }
+
+  if (state.playing) requestTick();
+}
+
+function handleMessage(message, streamId) {
+  if (streamId !== state.streamId || !terminal) return;
+  if (message.type === 'checkpoint') {
+    state.termCols = message.cols || state.termCols;
+    state.termRows = message.rows || state.termRows;
+    state.lastEventT = message.t;
+    terminal.reset();
+    terminal.resize(state.termCols, state.termRows);
+    if (message.serialized) terminal.write(message.serialized);
+    state.activity = message.activity || null;
+    requestAnimationFrame(scaleTerminal);
+    requestAnimationFrame(drawActivity);
+    markLoaded();
+    return;
+  }
+  if (message.type === 'start') {
+    state.termCols = message.cols || state.termCols;
+    state.termRows = message.rows || state.termRows;
+    state.lastEventT = message.t;
+    terminal.reset();
+    terminal.resize(state.termCols, state.termRows);
+    state.activity = message.activity || null;
+    requestAnimationFrame(scaleTerminal);
+    requestAnimationFrame(drawActivity);
+    markLoaded();
+    return;
+  }
+  if (message.type === 'end') {
+    state.streamDone = true;
+    if (Number.isFinite(message.duration)) {
+      state.end = Math.max(state.end, state.start + message.duration / 1000);
+    }
+    if (!state.playing) updateControls();
+    return;
+  }
+  if (message.type === 'renamed') {
+    state.active = false;
+    state.streamDone = true;
+    if (state.current) state.current.active = false;
+    setStatus('Session ended and was moved to the archive', '');
+    updateControls();
+    renderSessions();
+    return;
+  }
+  if (message.type === 'reset') {
+    setStatus('Session log was truncated, reloading', 'error');
+    return;
+  }
+
+  var event = {
+    t: Number.isFinite(message.t) ? message.t : state.lastEventT,
+    d: message.d,
+    c: message.c,
+    o: message.o
+  };
+  if (Number.isFinite(event.t)) {
+    state.lastEventT = event.t;
+    state.end = Math.max(state.end, event.t);
+  }
+  if (!Number.isFinite(event.t)) event.t = state.time;
+
+  if (state.live || event.t <= state.seekTarget + 0.000001) {
+    applyEvent(event);
+    state.time = Math.max(state.time, event.t);
+  } else {
+    state.queue.push(event);
+  }
+  markLoaded();
+}
+
+async function consumeStream(response, streamId) {
+  var reader = response.body.getReader();
+  var decoder = new TextDecoder();
+  var buffer = '';
+  while (true) {
+    var result = await reader.read();
+    if (streamId !== state.streamId) return;
+    if (result.done) break;
+    buffer += decoder.decode(result.value, {stream: true});
+    var index;
+    while ((index = buffer.indexOf('\n')) >= 0) {
+      var line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      if (!line.trim()) continue;
+      var message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        continue;
+      }
+      handleMessage(message, streamId);
+    }
+  }
+  if (buffer.trim()) {
+    try {
+      handleMessage(JSON.parse(buffer), streamId);
+    } catch (error) {}
+  }
+}
+
+async function openStream(meta, target, autoplay) {
+  cancelIdleSkip();
+  var streamId = ++state.streamId;
+  if (state.abort) state.abort.abort();
+  state.abort = new AbortController();
+  state.current = meta;
+  state.active = !!meta.active;
+  state.start = Number(meta.startdate) || Date.now() / 1000;
+  state.end = Math.max(state.start + 0.001,
+    Number(meta.enddate) || state.start);
+  state.seekTarget = Math.max(state.start,
+    Math.min(state.end, Number(target) || state.start));
+  state.time = state.seekTarget;
+  state.queue = [];
+  state.queueIndex = 0;
+  state.lastEventT = null;
+  state.streamDone = false;
+  state.started = false;
+  state.autoPlay = autoplay;
+  state.playing = false;
+  state.live = false;
+  state.lastFrame = 0;
+  state.matches = [];
+  state.matchIndex = -1;
+  state.searchQuery = '';
+  state.activity = meta.activity || null;
+  drawActivity();
+  els.searchInput.value = '';
+  els.searchCount.textContent = '';
+  els.empty.classList.add('hidden');
+  setLoading(state.active ? 'Opening live session' : 'Loading session');
+  setStatus('', '');
+  newTerminal(meta.cols || 80, meta.rows || 24);
+  updateSessionHeader(meta);
+  updateControls();
+  updateHash(meta);
+  renderSessions();
+
+  var params = new URLSearchParams();
+  params.set('u', meta.username);
+  params.set('s', meta.session);
+  if (meta.hostname) params.set('h', meta.hostname);
+  params.set('from', state.seekTarget.toFixed(3));
+  if (state.active) params.set('follow', '1');
+
+  try {
+    var response = await fetch(API + '/events?' + params.toString(), {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      signal: state.abort.signal
+    });
+    if (streamId !== state.streamId) return;
+    if (response.status === 401) {
+      setLoading('');
+      setStatus('Authentication required. Reload the page to sign in.', 'error');
+      setConnection('Authentication required', 'error');
+      return;
+    }
+    if (!response.ok) {
+      var detail = '';
+      try {
+        var body = await response.json();
+        detail = body.error || '';
+      } catch (error) {}
+      throw new Error(detail || ('HTTP ' + response.status));
+    }
+    await consumeStream(response, streamId);
+    if (streamId !== state.streamId) return;
+    state.streamDone = true;
+    if (state.active) {
+      state.active = false;
+      if (state.current) state.current.active = false;
+    }
+    updateControls();
+    renderSessions();
+    if (!state.playing) {
+      if (state.autoPlay) {
+        state.autoPlay = false;
+        beginPlayback();
+      }
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    setLoading('');
+    setStatus('Playback failed: ' + error.message, 'error');
+  }
+}
+
+function updateSessionHeader(meta) {
+  els.title.textContent = meta.username + ' / ' + meta.session;
+  var parts = [];
+  if (meta.hostname) parts.push(meta.hostname);
+  parts.push(formatDate(meta.startdate));
+  if (Number.isFinite(meta.enddate) && meta.enddate >= meta.startdate) {
+    parts.push(formatDuration(meta.enddate - meta.startdate));
+  }
+  if (meta.size) parts.push(formatBytes(meta.size));
+  if (meta.active) parts.push('active');
+  els.meta.textContent = parts.join('  |  ');
+  els.download.classList.remove('hidden');
+  els.download.href = API + '/download?u=' + encodeURIComponent(meta.username)
+    + '&s=' + encodeURIComponent(meta.session)
+    + (meta.hostname ? '&h=' + encodeURIComponent(meta.hostname) : '');
+}
+
+function seekTo(target, autoplay) {
+  if (!state.current) return;
+  var meta = Object.assign({}, state.current);
+  meta.enddate = Math.max(Number(meta.enddate) || 0, state.end);
+  if (state.active) meta.active = true;
+  pausePlayback();
+  openStream(meta, target, !!autoplay);
+}
+
+function updateHash(meta) {
+  var params = new URLSearchParams();
+  params.set('u', meta.username);
+  params.set('s', meta.session);
+  if (meta.hostname) params.set('h', meta.hostname);
+  try {
+    history.replaceState(null, '', '#' + params.toString());
+  } catch (error) {}
+}
+
+function openSession(meta, target, autoplay) {
+  if (!meta) return;
+  var time = target;
+  if (!Number.isFinite(time)) {
+    time = meta.active ? (Number(meta.enddate) || meta.startdate)
+      : meta.startdate;
+  }
+  openStream(meta, time, autoplay !== false);
+}
+
+async function loadPlaybackConfig() {
+  try {
+    var response = await fetch(API, {
+      cache: 'no-store',
+      credentials: 'same-origin'
+    });
+    if (!response.ok) return;
+    var data = await response.json();
+    state.idleConfig.enabled = data.idle_skip_enabled === true;
+    var threshold = Number(data.idle_skip_seconds);
+    if (Number.isFinite(threshold) && threshold > 0) {
+      state.idleConfig.thresholdSeconds = threshold;
+    } else {
+      state.idleConfig.enabled = false;
+    }
+    if (typeof data.idle_video === 'string' && data.idle_video) {
+      state.idleConfig.video = data.idle_video;
+    }
+    var videoDelay = Number(data.idle_video_delay_seconds);
+    if (Number.isFinite(videoDelay) && videoDelay >= 0) {
+      state.idleConfig.videoDelaySeconds = videoDelay;
+    }
+    var overlayDelay = Number(data.idle_overlay_delay_seconds);
+    if (Number.isFinite(overlayDelay) && overlayDelay >= 0) {
+      state.idleConfig.overlayDelaySeconds = Math.min(
+        state.idleConfig.videoDelaySeconds, overlayDelay);
+    }
+    var autoSkip = Number(data.idle_auto_skip_seconds);
+    if (Number.isFinite(autoSkip) && autoSkip >= 0) {
+      state.idleConfig.autoSkipSeconds = autoSkip;
+    }
+    var movieAutoSkip = Number(data.idle_movie_auto_skip_seconds);
+    if (Number.isFinite(movieAutoSkip) && movieAutoSkip >= 0) {
+      state.idleConfig.movieAutoSkipSeconds = movieAutoSkip;
+    }
+  } catch (error) {}
+}
+
+async function loadSessions() {
+  setConnection('Loading', '');
+  try {
+    var response = await fetch(API + '/sessions', {
+      cache: 'no-store',
+      credentials: 'same-origin'
+    });
+    if (response.status === 401) {
+      setConnection('Authentication required', 'error');
+      els.listStatus.textContent = 'Reload the page to sign in.';
+      return;
+    }
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    var data = await response.json();
+    state.sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    setConnection('Connected', 'ok');
+    els.listStatus.textContent = state.sessions.length
+      + (state.sessions.length === 1 ? ' session' : ' sessions');
+    renderSessions();
+    openFromHash();
+  } catch (error) {
+    setConnection('Offline', 'error');
+    els.listStatus.textContent = 'Could not load sessions';
+    setStatus('Could not load sessions: ' + error.message, 'error');
+  }
+}
+
+function openFromHash() {
+  if (state.current) return;
+  var params = new URLSearchParams(location.hash.slice(1));
+  var username = params.get('u');
+  var session = params.get('s');
+  var hostname = params.get('h');
+  if (!username || !session) return;
+  var meta = state.sessions.find(function(item) {
+    return item.username === username && item.session === session
+      && (!hostname || item.hostname === hostname);
+  });
+  if (!meta) return;
+  var time = Number(params.get('t'));
+  openSession(meta, Number.isFinite(time) ? time : undefined, true);
+}
+
+function createSessionItem(meta) {
+  var button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'session-item';
+  if (state.current && state.current.username === meta.username
+      && state.current.session === meta.session) {
+    button.classList.add('selected');
+  }
+  var line = document.createElement('div');
+  line.className = 'session-line';
+  var dot = document.createElement('span');
+  dot.className = 'dot' + (meta.active ? ' active' : '');
+  var user = document.createElement('span');
+  user.className = 'session-user';
+  user.textContent = meta.username;
+  line.appendChild(dot);
+  line.appendChild(user);
+
+  var id = document.createElement('div');
+  id.className = 'session-id';
+  id.textContent = meta.session;
+
+  var sub = document.createElement('div');
+  sub.className = 'session-sub';
+  var date = document.createElement('span');
+  date.textContent = formatDate(meta.startdate);
+  var duration = document.createElement('span');
+  duration.textContent = meta.active ? 'live'
+    : (Number.isFinite(meta.duration)
+      ? formatDuration(meta.duration / 1000) : '');
+  sub.appendChild(date);
+  sub.appendChild(duration);
+
+  button.appendChild(line);
+  button.appendChild(id);
+  button.appendChild(sub);
+  button.addEventListener('click', function() {
+    setSidebarVisible(false);
+    openSession(meta);
+  });
+  return button;
+}
+
+function renderSessions() {
+  var query = els.filter.value.trim().toLowerCase();
+  var list = state.sessions.filter(function(meta) {
+    if (!query) return true;
+    return (meta.username + ' ' + meta.session + ' ' + (meta.hostname || ''))
+      .toLowerCase().indexOf(query) >= 0;
+  });
+  els.list.innerHTML = '';
+  var active = list.filter(function(meta) { return meta.active; });
+  var finished = list.filter(function(meta) { return !meta.active; });
+
+  function group(title, items) {
+    if (!items.length) return;
+    var heading = document.createElement('div');
+    heading.className = 'session-group-title';
+    heading.textContent = title;
+    els.list.appendChild(heading);
+    items.forEach(function(meta) {
+      els.list.appendChild(createSessionItem(meta));
+    });
+  }
+
+  group('Active', active);
+  group('Recent', finished);
+  if (!list.length) {
+    var empty = document.createElement('div');
+    empty.className = 'list-status';
+    empty.textContent = state.sessions.length ? 'No matching sessions' : 'No sessions';
+    els.list.appendChild(empty);
+  }
+}
+
+function clearSearch() {
+  state.matches = [];
+  state.matchIndex = -1;
+  state.searchQuery = '';
+  els.searchCount.textContent = '';
+  if (terminal) terminal.clearSelection();
+}
+
+function findMatches(query) {
+  if (!terminal || !query) return [];
+  var buffer = terminal.buffer.active;
+  var matches = [];
+  var needle = query.toLowerCase();
+  for (var row = 0; row < buffer.length; row++) {
+    var line = buffer.getLine(row);
+    if (!line) continue;
+    var text = line.translateToString(true);
+    var haystack = text.toLowerCase();
+    var start = 0;
+    var index;
+    while ((index = haystack.indexOf(needle, start)) >= 0) {
+      matches.push({row: row, col: index, length: query.length});
+      start = index + Math.max(1, needle.length);
+      if (matches.length >= 10000) return matches;
+    }
+  }
+  return matches;
+}
+
+function runSearch(reset) {
+  var query = els.searchInput.value;
+  if (!query) {
+    clearSearch();
+    return;
+  }
+  if (reset || query !== state.searchQuery) {
+    state.searchQuery = query;
+    state.matches = findMatches(query);
+    state.matchIndex = state.matches.length ? 0 : -1;
+    if (state.matchIndex >= 0) showMatch();
+  } else {
+    showMatch();
+  }
+  els.searchCount.textContent = state.matches.length
+    ? (state.matchIndex + 1) + '/' + state.matches.length : '0/0';
+}
+
+function showMatch() {
+  var match = state.matches[state.matchIndex];
+  if (!match || !terminal) return;
+  terminal.scrollToLine(match.row);
+  try {
+    terminal.select(match.col, match.row, match.length);
+  } catch (error) {}
+}
+
+function stepSearch(direction) {
+  if (!state.matches.length) {
+    runSearch(true);
+    return;
+  }
+  state.matchIndex += direction;
+  if (state.matchIndex < 0) state.matchIndex = state.matches.length - 1;
+  if (state.matchIndex >= state.matches.length) state.matchIndex = 0;
+  showMatch();
+  els.searchCount.textContent = (state.matchIndex + 1) + '/'
+    + state.matches.length;
+}
+
+function stepTime(delta) {
+  if (!state.current) return;
+  var duration = Math.max(0, state.end - state.start);
+  var target = state.time + delta;
+  target = Math.max(state.start, Math.min(state.start + duration, target));
+  seekTo(target, state.playing);
+}
+
+els.sidebarToggle.addEventListener('click', toggleSidebar);
+els.idleSkip.addEventListener('click', finishIdleSkip);
+els.idleSkipNow.addEventListener('click', finishIdleSkip);
+els.idleVideo.addEventListener('ended', finishIdleSkip);
+els.idleVideo.addEventListener('error', finishIdleSkip);
+els.idleOverlay.addEventListener('click', function(event) {
+  if (event.target === els.idleOverlay) finishIdleSkip();
+});
+els.refresh.addEventListener('click', loadSessions);
+els.filter.addEventListener('input', renderSessions);
+els.play.addEventListener('click', togglePlayback);
+els.speed.addEventListener('change', function() {
+  state.speed = Number(els.speed.value) || 1;
+});
+els.live.addEventListener('click', function() {
+  if (!state.current || !state.active) return;
+  seekTo(state.end, true);
+});
+els.seek.addEventListener('pointerdown', function() {
+  state.dragging = true;
+});
+els.seek.addEventListener('pointerup', function() {
+  state.dragging = false;
+});
+els.seek.addEventListener('input', function() {
+  var duration = Math.max(0, state.end - state.start);
+  var relative = Number(els.seek.value) || 0;
+  els.time.textContent = formatDuration(relative) + ' / '
+    + formatDuration(duration);
+});
+els.seek.addEventListener('change', function() {
+  state.dragging = false;
+  var relative = Number(els.seek.value) || 0;
+  seekTo(state.start + relative, state.playing);
+});
+els.searchInput.addEventListener('keydown', function(event) {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    if (event.shiftKey) {
+      if (state.searchQuery === els.searchInput.value) stepSearch(-1);
+      else runSearch(true);
+    } else {
+      if (state.searchQuery !== els.searchInput.value) runSearch(true);
+      else stepSearch(1);
+    }
+  } else if (event.key === 'Escape') {
+    els.searchInput.value = '';
+    clearSearch();
+    els.searchInput.blur();
+  }
+});
+els.searchInput.addEventListener('input', function() {
+  if (!els.searchInput.value) clearSearch();
+});
+els.searchNext.addEventListener('click', function() {
+  if (state.searchQuery !== els.searchInput.value) runSearch(true);
+  else stepSearch(1);
+});
+els.searchPrev.addEventListener('click', function() {
+  if (state.searchQuery !== els.searchInput.value) runSearch(true);
+  else stepSearch(-1);
+});
+
+document.addEventListener('keydown', function(event) {
+  var tag = document.activeElement && document.activeElement.tagName;
+  var typing = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
+  if (event.ctrlKey && event.key.toLowerCase() === 'f') {
+    event.preventDefault();
+    els.searchInput.focus();
+    els.searchInput.select();
+    return;
+  }
+  if (typing) return;
+  if (event.code === 'Space') {
+    event.preventDefault();
+    togglePlayback();
+  } else if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    stepTime(event.shiftKey ? -60 : -10);
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    stepTime(event.shiftKey ? 60 : 10);
+  } else if (event.key === 'Home' && state.current) {
+    event.preventDefault();
+    seekTo(state.start, state.playing);
+  } else if (event.key === 'End' && state.current) {
+    event.preventDefault();
+    seekTo(state.end, state.playing);
+  }
+});
+
+resizeObserver = new ResizeObserver(scheduleFit);
+resizeObserver.observe(els.frame);
+new ResizeObserver(function() { drawActivity(); }).observe(els.activity);
+
+updateControls();
+loadPlaybackConfig().then(loadSessions, loadSessions);
+setInterval(loadSessions, 30000);

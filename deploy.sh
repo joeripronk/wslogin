@@ -31,6 +31,7 @@ mkdir -p "$APP_DIR"
 if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
   rsync -a --delete --chown=root:root \
     --exclude='.git/' \
+    --include='*.example.ini' \
     --exclude='node_modules/' \
     --exclude='sessions/' \
     --exclude='cookies/' \
@@ -39,6 +40,7 @@ if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
     --exclude='*.crt' \
     --exclude='*.cert' \
     --exclude='*.pem' \
+    --exclude='playback-cache/' \
     --exclude='*.ini' \
     --exclude='*.swp' \
     --exclude='*.swo' \
