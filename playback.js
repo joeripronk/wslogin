@@ -18,7 +18,7 @@ const { SerializeAddon } = require('@xterm/addon-serialize');
 const { render: renderTemplate, placeholders: templatePlaceholders,
   match: matchTemplate, isSafeRelative } = require('./template');
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const DEFAULT_CHECKPOINT_INTERVAL_MS = 60000;
 const DEFAULT_CHECKPOINT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_CHECKPOINTS = 500;
@@ -28,6 +28,7 @@ const ACTIVITY_BUCKET_SECONDS = 1;
 const ACTIVITY_BINS = 600;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -\/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+const OSC_TITLE_RE = /\x1b\][012];([^\x07]*?)(?:\x07|\x1b\\)/g;
 const PASSWORD_PROMPT_RE = /(?:password|passphrase|passwort|wachtwoord)[^\r\n:]{0,80}:\s*$/i;
 const AUTH_CACHE_MS = 5 * 60 * 1000;
 const FOLLOW_POLL_MS = 300;
@@ -331,11 +332,14 @@ function createPlayback(config, options) {
         lastT: data.lastT,
         cols: data.cols,
         rows: data.rows,
-        checkpoints: data.checkpoints,
-        activity: data.activity,
-        activityPasswordPrompt: data.activityPasswordPrompt,
-        activityPromptTail: data.activityPromptTail
-      };
+      checkpoints: data.checkpoints,
+      activity: data.activity,
+      activityPasswordPrompt: data.activityPasswordPrompt,
+      activityPromptTail: data.activityPromptTail,
+      titleSeconds: data.titleSeconds,
+      currentTitle: data.currentTitle,
+      currentTitleT: data.currentTitleT
+    };
       var tmp = cacheFileFor(file) + '.' + process.pid + '.tmp';
       fs.writeFileSync(tmp, JSON.stringify(copy));
       fs.renameSync(tmp, cacheFileFor(file));
@@ -404,11 +408,38 @@ function createPlayback(config, options) {
     }
   }
 
-  function stripAnsi(value) {
-    return String(value || '')
-      .replace(ANSI_OSC_RE, '')
-      .replace(ANSI_CSI_RE, '');
+function stripAnsi(value) {
+  return String(value || '')
+    .replace(ANSI_OSC_RE, '')
+    .replace(ANSI_CSI_RE, '');
+}
+
+function extractTitles(text) {
+  var titles = [];
+  OSC_TITLE_RE.lastIndex = 0;
+  var found;
+  while ((found = OSC_TITLE_RE.exec(String(text || '')))) {
+    var title = found[1].replace(/[\x00-\x1f\x7f]+/g, ' ').trim();
+    if (title) titles.push(title.slice(0, 128));
   }
+  return titles;
+}
+
+function addTitleSpan(titles, title, start, end) {
+  if (!title || !Number.isFinite(start) || !Number.isFinite(end)
+      || end <= start) return;
+  titles[title] = (titles[title] || 0) + (end - start);
+}
+
+function titleDescription(titles, lastTitle) {
+  var ranked = Object.keys(titles || {})
+    .map(function(title) { return {title: title, seconds: titles[title]}; })
+    .filter(function(item) { return item.title && item.seconds >= 1; })
+    .sort(function(a, b) { return b.seconds - a.seconds; });
+  var parts = ranked.slice(0, 3).map(function(item) { return item.title; });
+  if (lastTitle && parts.indexOf(lastTitle) == -1) parts.push(lastTitle);
+  return parts.join(' | ');
+}
 
   function updatePasswordPrompt(data, value) {
     var text = stripAnsi((data.activityPromptTail || '') + String(value || ''))
@@ -512,6 +543,19 @@ function createPlayback(config, options) {
     return {terminal: terminal, offset: start};
   }
 
+  function addTitleTitles(data, record) {
+    if (record.c != 1 || !Number.isFinite(record.t)) return;
+    var titles = extractTitles(record.d);
+    for (var i = 0; i < titles.length; i++) {
+      if (data.currentTitle != null) {
+        addTitleSpan(data.titleSeconds, data.currentTitle,
+          data.currentTitleT, record.t);
+      }
+      data.currentTitle = titles[i];
+      data.currentTitleT = record.t;
+    }
+  }
+
   async function buildCache(file, username, session, stat, existing) {
     var data = existing || {
       version: CACHE_VERSION,
@@ -529,7 +573,10 @@ function createPlayback(config, options) {
       tail: null,
       activity: emptyActivity(),
       activityPasswordPrompt: false,
-      activityPromptTail: ''
+      activityPromptTail: '',
+      titleSeconds: {},
+      currentTitle: null,
+      currentTitleT: null
     };
     var terminal = terminalAt({cols: 80, rows: 24});
     var serialize = new SerializeAddon();
@@ -544,6 +591,9 @@ function createPlayback(config, options) {
     data.activity = emptyActivity();
     data.activityPasswordPrompt = false;
     data.activityPromptTail = '';
+    data.titleSeconds = {};
+    data.currentTitle = null;
+    data.currentTitleT = null;
 
     await readLines(file, 0, stat.size, final, async function(line, next) {
       data.offset = next;
@@ -554,6 +604,7 @@ function createPlayback(config, options) {
         data.lastT = record.t;
       }
       if (record.c == 1) updatePasswordPrompt(data, record.d);
+      addTitleTitles(data, record);
       var hiddenInput = record.c == 2
         && (record.h === 1 || record.hidden === true
           || data.activityPasswordPrompt);
@@ -584,6 +635,10 @@ function createPlayback(config, options) {
       }
     });
     await flushTerminal(terminal);
+    if (data.currentTitle != null) {
+      addTitleSpan(data.titleSeconds, data.currentTitle,
+        data.currentTitleT, data.lastT);
+    }
     data.checkpoints = thinCheckpoints(data.checkpoints);
     data.size = stat.size;
     data.mtimeMs = stat.mtimeMs;
@@ -613,6 +668,13 @@ function createPlayback(config, options) {
     data.activity = ensureActivity(data.activity);
     data.activityPasswordPrompt = !!data.activityPasswordPrompt;
     data.activityPromptTail = String(data.activityPromptTail || '');
+    if (!data.titleSeconds || typeof data.titleSeconds != 'object') {
+      data.titleSeconds = {};
+    }
+    data.currentTitle = typeof data.currentTitle == 'string'
+      ? data.currentTitle : null;
+    data.currentTitleT = Number.isFinite(data.currentTitleT)
+      ? data.currentTitleT : data.startdate;
 
     await readLines(file, restored.offset, stat.size, final,
       async function(line, next) {
@@ -624,6 +686,7 @@ function createPlayback(config, options) {
           data.lastT = record.t;
         }
         if (record.c == 1) updatePasswordPrompt(data, record.d);
+        addTitleTitles(data, record);
         var hiddenInput = record.c == 2
           && (record.h === 1 || record.hidden === true
             || data.activityPasswordPrompt);
@@ -654,6 +717,10 @@ function createPlayback(config, options) {
         }
       });
     await flushTerminal(terminal);
+    if (data.currentTitle != null) {
+      addTitleSpan(data.titleSeconds, data.currentTitle,
+        data.currentTitleT, data.lastT);
+    }
     data.checkpoints = thinCheckpoints(checkpoints);
     data.size = stat.size;
     data.mtimeMs = stat.mtimeMs;
@@ -872,6 +939,30 @@ function createPlayback(config, options) {
     }
   }
 
+  async function scanTitles(file) {
+    var titles = {};
+    var current = null;
+    var currentT = null;
+    var lastT = null;
+    var stat = await fs.promises.stat(file);
+    await readLines(file, 0, stat.size, isFinishedFile(file),
+      async function(line) {
+        var record = parseRecord(line);
+        if (!record) return;
+        if (Number.isFinite(record.t) && record.t > 0) lastT = record.t;
+        if (record.c == 1 && Number.isFinite(record.t)) {
+          var found = extractTitles(record.d);
+          for (var i = 0; i < found.length; i++) {
+            if (current != null) addTitleSpan(titles, current, currentT, record.t);
+            current = found[i];
+            currentT = record.t;
+          }
+        }
+      });
+    if (current != null) addTitleSpan(titles, current, currentT, lastT);
+    return {titles: titles, lastTitle: current};
+  }
+
   async function describe(entry, stat) {
     var key = entry.file + ':' + stat.size + ':' + stat.mtimeMs;
     var cached = metaCache.get(entry.file);
@@ -885,6 +976,9 @@ function createPlayback(config, options) {
     var active = entry.finished ? false
       : (isActive ? !!isActive(entry.username, entry.session)
         : Date.now() - stat.mtimeMs < activeSeconds * 1000);
+    var titleInfo = metadata && metadata.titleSeconds
+      ? {titles: metadata.titleSeconds, lastTitle: metadata.currentTitle}
+      : await scanTitles(entry.file);
     var value = {
       username: entry.username,
       session: entry.session,
@@ -900,6 +994,7 @@ function createPlayback(config, options) {
       checkpoints: metadata ? metadata.checkpoints.length : 0,
       activity: metadata
         ? normalizeActivity(metadata.activity, startdate, enddate) : null,
+      description: titleDescription(titleInfo.titles, titleInfo.lastTitle),
       active: active,
       finished: entry.finished
     };

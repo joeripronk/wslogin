@@ -57,8 +57,11 @@ function byId(id) {
 var els = {
   layout: byId('layout'),
   sidebar: byId('sidebar'),
-  sidebarToggle: byId('sidebar-toggle'),
+  sidebarEdge: byId('sidebar-edge'),
   connection: byId('connection'),
+  head: byId('viewer-head'),
+  headTab: byId('head-tab'),
+  pinHead: byId('pin-head'),
   refresh: byId('refresh'),
   filter: byId('filter'),
   list: byId('session-list'),
@@ -83,12 +86,12 @@ var els = {
   idleSkipText: byId('idle-skip-text'),
   idleSkipNow: byId('idle-skip-now'),
   play: byId('play'),
+  stop: byId('stop'),
   time: byId('time'),
   seek: byId('seek'),
   activity: byId('activity-canvas'),
   speed: byId('speed'),
-  live: byId('live'),
-  status: byId('status-line')
+  live: byId('live')
 };
 
 function setConnection(text, kind) {
@@ -98,20 +101,111 @@ function setConnection(text, kind) {
 
 function setSidebarVisible(visible) {
   els.layout.classList.toggle('sidebar-hidden', !visible);
+  els.layout.classList.remove('sidebar-hover');
   els.sidebar.setAttribute('aria-hidden', visible ? 'false' : 'true');
-  els.sidebarToggle.setAttribute('aria-expanded', visible ? 'true' : 'false');
-  els.sidebarToggle.title = visible ? 'Hide sessions' : 'Show sessions';
+  hoverArmed = true;
   scheduleFit();
 }
 
-function toggleSidebar() {
-  setSidebarVisible(els.layout.classList.contains('sidebar-hidden'));
+var hoverCloseTimer = false;
+var hoverArmed = true;
+var hoverCapable = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+function openSidebarHover() {
+  if (!hoverArmed) return;
+  if (hoverCloseTimer) {
+    clearTimeout(hoverCloseTimer);
+    hoverCloseTimer = false;
+  }
+  els.layout.classList.add('sidebar-hover');
+  els.sidebar.setAttribute('aria-hidden', 'false');
 }
 
-function setStatus(text, kind) {
-  els.status.textContent = text;
-  els.status.className = 'status-line' + (kind ? ' ' + kind : '');
+function closeSidebarHover() {
+  els.layout.classList.remove('sidebar-hover');
+  els.sidebar.setAttribute('aria-hidden', 'true');
+  hoverArmed = false;
 }
+
+window.addEventListener('mousemove', function(event) {
+  if (!hoverCapable) return;
+  if (!els.layout.classList.contains('sidebar-hidden')) return;
+  if (els.layout.classList.contains('sidebar-hover')) {
+    if (event.clientX > els.sidebar.offsetWidth + 24) {
+      if (!hoverCloseTimer) {
+        hoverCloseTimer = setTimeout(function() {
+          hoverCloseTimer = false;
+          closeSidebarHover();
+        }, 400);
+      }
+    } else if (hoverCloseTimer) {
+      clearTimeout(hoverCloseTimer);
+      hoverCloseTimer = false;
+    }
+  } else if (!hoverArmed && event.clientX > 40) {
+    hoverArmed = true;
+  }
+});
+
+els.sidebar.addEventListener('focusin', openSidebarHover);
+els.sidebarEdge.addEventListener('mouseenter', openSidebarHover);
+
+if (!hoverCapable) setSidebarVisible(true);
+
+var HEAD_IDLE_MS = 800;
+var headIdleTimer = null;
+var headHover = false;
+
+try {
+  state.headPinned = localStorage.getItem('wslogin.headPinned') == '1';
+} catch (error) {
+  state.headPinned = false;
+}
+
+function showHead() {
+  els.layout.classList.remove('head-hidden');
+  armHeadIdle();
+}
+
+function armHeadIdle() {
+  if (headIdleTimer) clearTimeout(headIdleTimer);
+  headIdleTimer = setTimeout(function() {
+    if (state.headPinned || headHover
+        || (document.activeElement && els.head.contains(document.activeElement))) {
+      armHeadIdle();
+      return;
+    }
+    els.layout.classList.add('head-hidden');
+  }, HEAD_IDLE_MS);
+}
+
+els.head.addEventListener('mouseenter', function() {
+  headHover = true;
+});
+
+els.headTab.addEventListener('mouseenter', function() {
+  if (!state.headPinned) showHead();
+});
+
+els.headTab.addEventListener('click', showHead);
+
+els.head.addEventListener('mouseleave', function() {
+  headHover = false;
+  armHeadIdle();
+});
+
+els.pinHead.checked = state.headPinned;
+els.pinHead.addEventListener('change', function() {
+  state.headPinned = els.pinHead.checked;
+  try {
+    localStorage.setItem('wslogin.headPinned', state.headPinned ? '1' : '0');
+  } catch (error) {}
+  showHead();
+});
+
+armHeadIdle();
+
+function setStatus(text, kind) {}
 
 function setLoading(text) {
   if (text) {
@@ -210,32 +304,59 @@ function newTerminal(cols, rows) {
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
   terminal.open(els.terminalHost);
+  terminal.onTitleChange(function(title) {
+    els.headTab.textContent = title || '';
+  });
   state.termCols = Math.max(2, cols || 80);
   state.termRows = Math.max(2, rows || 24);
   terminal.resize(state.termCols, state.termRows);
   requestAnimationFrame(scaleTerminal);
 }
 
+var measureCanvas = null;
+
+function cellMetrics(fontSize) {
+  if (!measureCanvas) measureCanvas = document.createElement('canvas');
+  var ctx = measureCanvas.getContext('2d');
+  ctx.font = fontSize + 'px "Ubuntu Mono", "DejaVu Sans Mono", monospace';
+  var width = 0;
+  var text = 'MW@mw0_';
+  for (var i = 0; i < text.length; i++) {
+    width = Math.max(width, ctx.measureText(text[i]).width);
+  }
+  var textMetrics = ctx.measureText('M');
+  var ascent = textMetrics.fontBoundingBoxAscent || fontSize * 1.15;
+  var descent = textMetrics.fontBoundingBoxDescent || fontSize * 0.3;
+  return { width: width + 0.5, height: (ascent + descent) * 1.05 + 0.5 };
+}
+
 function scaleTerminal() {
   if (!terminal || !state.current) return;
-  state.termCols = terminal.cols;
-  state.termRows = terminal.rows;
-  var dims = fitAddon.proposeDimensions();
-  if (!dims || !dims.cols || !dims.rows) return;
-  var factor = Math.min(dims.cols / state.termCols,
-    dims.rows / state.termRows);
-  factor = Math.max(0.1, Math.min(8, factor));
-  var current = terminal.options.fontSize || 14;
-  var size = Math.max(4, Math.min(64, current * factor));
-  if (Math.abs(size - current) > 0.15) {
-    terminal.options.fontSize = size;
-    requestAnimationFrame(function() {
-      if (!terminal || !state.current) return;
-      terminal.resize(state.termCols, state.termRows);
-    });
-  } else {
-    terminal.resize(state.termCols, state.termRows);
+  var cols = Math.max(2, state.termCols);
+  var rows = Math.max(2, state.termRows);
+  if (terminal.options.fontSize !== 14) terminal.options.fontSize = 14;
+  if (terminal.cols !== cols || terminal.rows !== rows) {
+    terminal.resize(cols, rows);
   }
+  var host = els.terminalHost;
+  var width = host.clientWidth;
+  var height = host.clientHeight;
+  if (!width || !height) return;
+  var cell;
+  try {
+    cell = terminal._core._renderService.dimensions.css.cell;
+  } catch (error) {
+    cell = null;
+  }
+  if (!cell || !cell.width || !cell.height) cell = cellMetrics(14);
+  var scale = Math.min(width / (cols * cell.width + 8),
+    height / (rows * cell.height));
+  scale = Math.max(0.2, Math.min(8, scale));
+  var el = terminal.element;
+  el.style.transformOrigin = '0 0';
+  el.style.transform = 'scale(' + scale + ')';
+  el.style.width = Math.floor(width / scale) + 'px';
+  el.style.height = Math.floor(height / scale) + 'px';
 }
 
 var fitTimer = null;
@@ -312,7 +433,8 @@ function updateControls() {
     + formatDuration(duration);
   els.seek.max = String(duration);
   if (!state.dragging) els.seek.value = String(relative);
-  els.play.textContent = state.playing ? 'Pause' : 'Play';
+  els.play.textContent = state.playing ? '\u23F8' : '\u25B6';
+  els.play.title = state.playing ? 'Pause (Space)' : 'Play (Space)';
   els.live.classList.toggle('hidden', !state.active);
   els.live.classList.toggle('on', state.live);
   els.live.textContent = state.live ? 'Live' : 'Go live';
@@ -471,6 +593,55 @@ function togglePlayback() {
   } else {
     beginPlayback();
   }
+}
+
+function stopSession() {
+  state.streamId++;
+  if (state.abort) state.abort.abort();
+  cancelIdleSkip();
+  state.current = null;
+  state.active = false;
+  state.playing = false;
+  state.live = false;
+  state.streamDone = false;
+  state.started = false;
+  state.autoPlay = false;
+  state.start = 0;
+  state.end = 0;
+  state.time = 0;
+  state.queue = [];
+  state.queueIndex = 0;
+  state.lastEventT = null;
+  state.activity = null;
+  clearSearch();
+  els.searchInput.value = '';
+  if (terminal) {
+    try { terminal.dispose(); } catch (error) {}
+    terminal = null;
+  }
+  els.terminalHost.innerHTML = '';
+  els.empty.classList.remove('hidden');
+  setLoading('');
+  els.title.textContent = 'Select a session';
+  els.meta.textContent = '';
+  els.headTab.textContent = '';
+  els.download.classList.add('hidden');
+  els.download.href = '#';
+  els.time.textContent = '--:-- / --:--';
+  els.seek.max = '0';
+  els.seek.value = '0';
+  drawActivity();
+  updateControls();
+  renderSessions();
+  try {
+    history.replaceState(null, '', location.pathname + location.search);
+  } catch (error) {}
+  els.layout.classList.remove('sidebar-hidden');
+  els.layout.classList.add('browsing');
+  els.layout.classList.remove('sidebar-hover');
+  els.sidebar.setAttribute('aria-hidden', 'false');
+  hoverArmed = true;
+  scheduleFit();
 }
 
 function tick(timestamp) {
@@ -636,6 +807,8 @@ async function consumeStream(response, streamId) {
 
 async function openStream(meta, target, autoplay) {
   cancelIdleSkip();
+  if (els.layout.classList.contains('browsing')) setSidebarVisible(false);
+  els.layout.classList.remove('browsing');
   var streamId = ++state.streamId;
   if (state.abort) state.abort.abort();
   state.abort = new AbortController();
@@ -723,9 +896,10 @@ async function openStream(meta, target, autoplay) {
 }
 
 function updateSessionHeader(meta) {
-  els.title.textContent = meta.username + ' / ' + meta.session;
+  els.title.textContent = meta.username
+    + (meta.hostname ? ' @ ' + meta.hostname : '');
+  els.headTab.textContent = els.title.textContent;
   var parts = [];
-  if (meta.hostname) parts.push(meta.hostname);
   parts.push(formatDate(meta.startdate));
   if (Number.isFinite(meta.enddate) && meta.enddate >= meta.startdate) {
     parts.push(formatDuration(meta.enddate - meta.startdate));
@@ -864,12 +1038,12 @@ function createSessionItem(meta) {
   var user = document.createElement('span');
   user.className = 'session-user';
   user.textContent = meta.username;
+  var host = document.createElement('span');
+  host.className = 'session-host';
+  host.textContent = meta.hostname || '';
   line.appendChild(dot);
   line.appendChild(user);
-
-  var id = document.createElement('div');
-  id.className = 'session-id';
-  id.textContent = meta.session;
+  line.appendChild(host);
 
   var sub = document.createElement('div');
   sub.className = 'session-sub';
@@ -883,8 +1057,13 @@ function createSessionItem(meta) {
   sub.appendChild(duration);
 
   button.appendChild(line);
-  button.appendChild(id);
   button.appendChild(sub);
+  if (meta.description) {
+    var desc = document.createElement('div');
+    desc.className = 'session-desc';
+    desc.textContent = meta.description;
+    button.appendChild(desc);
+  }
   button.addEventListener('click', function() {
     setSidebarVisible(false);
     openSession(meta);
@@ -896,7 +1075,8 @@ function renderSessions() {
   var query = els.filter.value.trim().toLowerCase();
   var list = state.sessions.filter(function(meta) {
     if (!query) return true;
-    return (meta.username + ' ' + meta.session + ' ' + (meta.hostname || ''))
+    return (meta.username + ' ' + meta.session + ' ' + (meta.hostname || '')
+      + ' ' + (meta.description || ''))
       .toLowerCase().indexOf(query) >= 0;
   });
   els.list.innerHTML = '';
@@ -1001,7 +1181,6 @@ function stepTime(delta) {
   seekTo(target, state.playing);
 }
 
-els.sidebarToggle.addEventListener('click', toggleSidebar);
 els.idleSkip.addEventListener('click', finishIdleSkip);
 els.idleSkipNow.addEventListener('click', finishIdleSkip);
 els.idleVideo.addEventListener('ended', finishIdleSkip);
@@ -1012,6 +1191,7 @@ els.idleOverlay.addEventListener('click', function(event) {
 els.refresh.addEventListener('click', loadSessions);
 els.filter.addEventListener('input', renderSessions);
 els.play.addEventListener('click', togglePlayback);
+els.stop.addEventListener('click', stopSession);
 els.speed.addEventListener('change', function() {
   state.speed = Number(els.speed.value) || 1;
 });

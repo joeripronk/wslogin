@@ -9,18 +9,7 @@
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-<header class="topbar">
-  <div class="brand">
-    <span class="brand-mark"></span>
-    <span>wslogin playback</span>
-  </div>
-  <div class="connection" id="connection">Connecting</div>
-</header>
-<button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Show sessions" aria-controls="sidebar" aria-expanded="false">
-  <span class="sidebar-toggle-chevron" aria-hidden="true"></span>
-  <span>Sessions</span>
-</button>
-<main class="layout sidebar-hidden" id="layout">
+<main class="layout browsing" id="layout">
   <aside class="sidebar" id="sidebar" aria-hidden="true">
     <div class="sidebar-head">
       <h2>Sessions</h2>
@@ -31,12 +20,14 @@
     <div class="list-status" id="list-status"></div>
   </aside>
   <section class="viewer">
-    <div class="viewer-head">
+    <div class="viewer-head" id="viewer-head">
       <div class="viewer-title">
         <h1 id="session-title">Select a session</h1>
         <div class="session-meta" id="session-meta"></div>
       </div>
       <div class="viewer-actions">
+        <label class="pin" title="Keep the header visible"><input type="checkbox" id="pin-head">Pin</label>
+        <div class="connection" id="connection">Connecting</div>
         <div class="search-box">
           <input id="search-input" type="search" placeholder="Find in terminal" autocomplete="off">
           <span id="search-count"></span>
@@ -47,6 +38,7 @@
       </div>
     </div>
     <div class="terminal-frame" id="terminal-frame">
+      <div class="head-tab" id="head-tab" title="Show header"></div>
       <div class="terminal-host" id="terminal"></div>
       <div class="empty-state" id="empty-state">
         <div class="empty-title">No session selected</div>
@@ -69,7 +61,8 @@
       </div>
     </div>
     <div class="controls">
-      <button class="play-button" id="play" type="button" title="Play or pause (Space)">Play</button>
+      <button class="play-button" id="play" type="button" title="Play or pause (Space)">&#9654;</button>
+      <button class="icon-button stop-button" id="stop" type="button" title="Stop and return to session list">&#9632;</button>
       <div class="time-display" id="time">--:-- / --:--</div>
       <div class="seek-wrap">
         <canvas class="activity-canvas" id="activity-canvas" title="Activity: orange output, blue input, red hidden input"></canvas>
@@ -86,9 +79,9 @@
       </select>
       <button class="live-button hidden" id="live" type="button">Live</button>
     </div>
-    <div class="status-line" id="status-line"></div>
   </section>
 </main>
+<div class="sidebar-edge" id="sidebar-edge" aria-hidden="true"></div>
 <script src="./xterm.js"></script>
 <script src="./addon-fit.js"></script>
 <script src="./addon-web-links.js"></script>
