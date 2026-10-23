@@ -287,23 +287,29 @@ function scaleTerminal (geom, cell) {
   var cols=term.cols, rows=term.rows;
   applyFont(BASE_FONT_SIZE);
   var c=currentCell();
+  var cs=term._core && term._core._charSizeService;
   if (!c || !c.width || !c.height) return;
-  var lo=4, hi=64;
-  // xterm quantizes the cell size to whole device pixels, so binary search
-  // the largest font size whose quantized grid still fits the window. The
-  // cell metrics are read from the live renderer, which keeps width and
-  // height filled within a cell in both directions.
-  if (cols*c.width<=geom.width && rows*c.height<=geom.height) lo=BASE_FONT_SIZE;
-  else hi=BASE_FONT_SIZE;
-  for (var i=0;i<10;i++) {
-    var mid=(lo+hi)/2;
-    applyFont(mid);
+  var dpr=(term._core && term._core._coreBrowserService && term._core._coreBrowserService.dpr)||window.devicePixelRatio||1;
+  // The renderer stacks the glyphs at the quantized cell width by adding a
+  // letter spacing of (cell width - glyph width). Browsers round the letter
+  // spacing to whole device pixels, so a glyph width that is fractional in
+  // device pixels makes every character overlap the next one by up to a
+  // pixel and clips its rightmost column (visible on the braille spinner).
+  // Font sizes whose glyph width is a whole number of device pixels get a
+  // zero letter spacing, so step down from the largest size that fits the
+  // window to the closest such size.
+  var perW=(cs && cs.width ? cs.width : c.width)/BASE_FONT_SIZE;
+  var perH=c.height/BASE_FONT_SIZE;
+  var max=Math.min(64,geom.width/(cols*perW),geom.height/(rows*perH));
+  var tries=0;
+  for (var k=Math.floor(max*perW*dpr);k>=4*perW*dpr && tries<20;k--,tries++) {
+    applyFont(k/(perW*dpr));
     c=currentCell();
-    if (!c || !c.width || !c.height) break;
-    if (cols*c.width<=geom.width && rows*c.height<=geom.height) lo=mid;
-    else hi=mid;
+    if (!c || !c.width || !c.height) continue;
+    if (cols*c.width>geom.width || rows*c.height>geom.height) continue;
+    if (!cs || !cs.width || Math.abs(cs.width*dpr-Math.round(cs.width*dpr))<0.25) return;
   }
-  applyFont(Math.floor(lo*2)/2);
+  applyFont(4);
 }
 function resizeScreen () {
   if (terminaldiv.style.display=="none") return;
