@@ -282,41 +282,28 @@ function applyFont (size) {
     term.refresh(0,term.rows-1);
   }
 }
-function refineScale (steps) {
-  if (steps<=0) return;
-  requestAnimationFrame(function() {
-    if (!term.element) return;
-    var cell=currentCell();
-    if (!cell || !cell.width || !cell.height) return;
-    var geom=terminalGeometry(baseCell.width?baseCell:cell);
-    if (!geom) return;
-    var w=term.cols*cell.width;
-    var h=term.rows*cell.height;
-    var cur=term.options.fontSize;
-    // xterm quantizes the cell size, so the proportional estimate can end up
-    // a few pixels too wide. Step down until the grid fits the window.
-    if (w>geom.width+0.5 || h>geom.height+0.5) {
-      applyFont(Math.floor(cur*10)/10-0.1);
-      refineScale(steps-1);
-      return;
-    }
-    // Consume the slack left by flooring the font size. Growth is verified
-    // on the next frame, so quantization cannot leave the grid overflowing.
-    var slackW=geom.width-w;
-    var slackH=geom.height-h;
-    if (slackW>cell.width*0.2 && slackH>cell.height*0.2 && cur<64) {
-      var grow=Math.floor(Math.min(64,cur*Math.min(geom.width/w,geom.height/h)*0.99)*10)/10;
-      if (grow>cur) applyFont(grow);
-    }
-    refineScale(steps-1);
-  });
-}
 function scaleTerminal (geom, cell) {
   if (!geom || !cell) return;
-  var factor=Math.min(geom.width/(term.cols*cell.width),
-                      geom.height/(term.rows*cell.height));
-  applyFont(Math.floor(BASE_FONT_SIZE*factor*10)/10);
-  refineScale(8);
+  var cols=term.cols, rows=term.rows;
+  applyFont(BASE_FONT_SIZE);
+  var c=currentCell();
+  if (!c || !c.width || !c.height) return;
+  var lo=4, hi=64;
+  // xterm quantizes the cell size to whole device pixels, so binary search
+  // the largest font size whose quantized grid still fits the window. The
+  // cell metrics are read from the live renderer, which keeps width and
+  // height filled within a cell in both directions.
+  if (cols*c.width<=geom.width && rows*c.height<=geom.height) lo=BASE_FONT_SIZE;
+  else hi=BASE_FONT_SIZE;
+  for (var i=0;i<10;i++) {
+    var mid=(lo+hi)/2;
+    applyFont(mid);
+    c=currentCell();
+    if (!c || !c.width || !c.height) break;
+    if (cols*c.width<=geom.width && rows*c.height<=geom.height) lo=mid;
+    else hi=mid;
+  }
+  applyFont(Math.floor(lo*2)/2);
 }
 function resizeScreen () {
   if (terminaldiv.style.display=="none") return;

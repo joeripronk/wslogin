@@ -119,6 +119,7 @@ body {
         height:100%;
         position:fixed;
         display: block;
+        overflow: hidden;
 	z-index: 2;
       }
 a:link {
