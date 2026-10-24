@@ -54,6 +54,13 @@ function configBool(name, fallback) {
   return !(value=='0' || value=='false' || value=='no' || value=='off');
 }
 
+var max_cols = configInt('max_cols', 1000);
+var max_rows = configInt('max_rows', 500);
+function validSize(cols, rows) {
+  return Number.isInteger(cols) && Number.isInteger(rows)
+    && cols >= 1 && rows >= 1 && cols <= max_cols && rows <= max_rows;
+}
+
 var checkpoint_enabled = configBool('checkpoint_enabled', true);
 var checkpoint_interval_seconds = Math.max(0, configInt('checkpoint_interval_seconds', 3600));
 var checkpoint_bytes = Math.max(0, configInt('checkpoint_bytes', 1024 * 1024));
@@ -97,14 +104,19 @@ function clientIpOf(request) {
   return remote;
 }
 
+var secret_key_re = /(passphrase|password|secret)/i;
 function redactConfig(cfg) {
-  var copy = JSON.parse(JSON.stringify(cfg));
-  var httpsSection = copy['https'];
-  if (httpsSection && typeof httpsSection == 'object') {
-    if ('passphrase' in httpsSection) httpsSection.passphrase = '***';
-    if ('key_password' in httpsSection) httpsSection.key_password = '***';
+  function redact(node) {
+    if (node === null || typeof node != 'object') return node;
+    if (Array.isArray(node)) return node.map(redact);
+    var copy = {};
+    for (const key in node) {
+      copy[key] = (secret_key_re.test(key) && typeof node[key] == 'string' && node[key])
+        ? '***' : redact(node[key]);
+    }
+    return copy;
   }
-  return copy;
+  return redact(cfg);
 }
 
 console.log(JSON.stringify(redactConfig(config)));
@@ -282,10 +294,13 @@ function read_session_header(file) {
 function resume_session(meta) {
   var username = meta.username, sessioncookie = meta.sessioncookie;
   var cols = meta.cols || 80, rows = meta.rows || 24;
+  // reconnectid is deliberately not stored in the session log header (the
+  // header is uploaded with the log); a resumed session gets a fresh token.
+  var reconnectid = meta.reconnectid || uuid_v4();
   sessions[username] = sessions[username] || {};
   sessions[username][sessioncookie] = {
     viewid: meta.viewid, shareid: meta.shareid,
-    reconnectid: meta.reconnectid, connections: {}
+    reconnectid: reconnectid, connections: {}
   };
   var session = sessions[username][sessioncookie];
   session.sessioncookie = sessioncookie;
@@ -293,7 +308,7 @@ function resume_session(meta) {
   var logfile = session_log_path(username, sessioncookie);
   try { session.logBytes = fs.statSync(logfile).size; } catch (error) { session.logBytes = 0; }
   session.mirror = create_mirror(cols, rows);
-  reconnects[meta.reconnectid] = {username: username, sessioncookie: sessioncookie};
+  reconnects[reconnectid] = {username: username, sessioncookie: sessioncookie};
   views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
   shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
   var shellenv = { USER: username, VIEWID: meta.viewid, VIEWURL: meta.viewurl, SUDO_USER: username, LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
@@ -313,8 +328,33 @@ function resume_session(meta) {
 }
 // Live-session state, declared before the startup scan (finish_interrupted_
 // sessions / resume_session) that rebuilds sessions from disk.
-var clients = [ ];
+// connection index counter; connections are reachable through the sessions
+// maps, no global list is kept, so closed clients do not accumulate
+var nextIndex = 0;
+// failed login tracking, ip -> {count, first, blocked_until}
 var logins = {};
+var login_max_attempts = configInt('login_max_attempts', 5);
+var login_window_seconds = configInt('login_window_seconds', 300);
+var login_block_seconds = configInt('login_block_seconds', 900);
+function loginBlockSeconds(ip) {
+  var a = logins[ip];
+  if (!a || !a.blocked_until) return 0;
+  var left = a.blocked_until - now();
+  if (left <= 0) { delete logins[ip]; return 0; }
+  return left;
+}
+function loginFailed(ip) {
+  var t = now();
+  var a = logins[ip];
+  if (!a || t - a.first > login_window_seconds) a = {count:0, first:t};
+  a.count++;
+  if (login_max_attempts > 0 && a.count > login_max_attempts) {
+    a.blocked_until = t + login_block_seconds;
+    console.log("login blocked for "+ip+" for "+login_block_seconds
+      +"s after "+a.count+" failed attempts");
+  }
+  logins[ip] = a;
+}
 var sessions = {};
 var views = {};
 var shares = {};
@@ -541,6 +581,10 @@ function create_mirror(cols, rows) {
   };
 }
 
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
 // Start a detached per-session tmux server, running as the user, with the
 // user's shell as its only pane. The shell is a direct child of the user's
 // tmux server (no lingering sudo), and survives a wslogin restart. Returns
@@ -558,10 +602,12 @@ function start_tmux_session(username, sessioncookie, cols, rows, env) {
   // Pane command: env -i drops everything tmux and sudo inject (TMUX,
   // TMUX_PANE, TERM_PROGRAM*, SUDO_*, SHLVL, PWD) and starts a login shell
   // with a minimal, hand-picked environment.
-  var panecmd = "exec env -i HOME='" + u.home + "' SHELL='" + shell + "'" +
-    " USER='" + username + "' LOGNAME='" + username + "' PATH=/usr/local/bin:/usr/bin:/bin" +
+  var panecmd = "exec env -i HOME=" + shQuote(u.home) + " SHELL=" + shQuote(shell) +
+    " USER=" + shQuote(username) + " LOGNAME=" + shQuote(username) +
+    " PATH=/usr/local/bin:/usr/bin:/bin" +
     " LANG=en_US.UTF-8 COLORTERM=truecolor TERM=xterm-256color" +
-    " VIEWID='" + viewid + "' VIEWURL='" + viewurl + "' '" + shell + "' -l";
+    " VIEWID=" + shQuote(viewid) + " VIEWURL=" + shQuote(viewurl) +
+    " " + shQuote(shell) + " -l";
   var args = ['-u', username, 'env',
     'USER=' + username, 'LOGNAME=' + username, 'HOME=' + u.home,
     'SHELL=' + shell, 'PATH=/usr/local/bin:/usr/bin:/bin',
@@ -670,7 +716,7 @@ function wire_session(username, sessioncookie) {
     }
     for (const [key, conn] of Object.entries(session['connections'])) {
       if (conn.paused) {
-        conn.sendbuffer.push(senddata);
+        bufferSend(conn, senddata);
       } else {
         conn.sendUTF(senddata);
       }
@@ -684,7 +730,7 @@ function wire_session(username, sessioncookie) {
     queue_mirror(session,{type:'resize',cols:resize.cols,rows:resize.rows,offset:written.offset,bytes:written.bytes});
     for (const [key, conn] of Object.entries(session.connections)) {
       if (conn.paused) {
-        conn.sendbuffer.push(cmdtext);
+        bufferSend(conn, cmdtext);
       } else {
         conn.send(cmdtext);
       }
@@ -795,6 +841,10 @@ setInterval(function() {
       delete reconnects[token];
     }
   }
+  for (const ip in logins) {
+    var a = logins[ip];
+    if (now()-a.first > login_block_seconds+login_window_seconds) delete logins[ip];
+  }
 }, 1000).unref();
 
 function sendError(c,msg) {
@@ -814,6 +864,15 @@ function sendInfo(c,msg) {
 }
 function peerLabel(connection) {
   return connection.peer || connection.ip || 'someone';
+}
+// cap per paused connection; a paused client that cannot keep up drops its
+// oldest buffered data instead of growing the buffer without limit
+var max_sendbuffer = configInt('max_sendbuffer', 2000);
+function bufferSend(conn, data) {
+  if (conn.sendbuffer.length >= max_sendbuffer) {
+    conn.sendbuffer.shift();
+  }
+  conn.sendbuffer.push(data);
 }
 
 /**
@@ -1037,14 +1096,22 @@ var wsServer = new webSocketServer({
   httpServer: httpsServer ? (allow_http ? [httpServer, httpsServer] : httpsServer) : httpServer,
   autoAcceptConnections: false
 });
+// Origins allowed to run websocket clients, from config.origin
+// (comma separated). A missing Origin header (non-browser clients) is
+// always allowed; with no configured allowlist all origins are allowed.
+var allowed_origins = 'origin' in config
+  ? String(config.origin).split(',').map(function(entry) { return entry.trim(); })
+      .filter(function(entry) { return entry.length > 0; })
+  : [];
+if (allowed_origins.length === 0) {
+  console.log("no origin allowlist configured, any origin is accepted");
+} else {
+  console.log("allowed origins="+allowed_origins.join(','));
+}
 function originIsAllowed(origin) {
-  // put logic here to detect whether the specified origin is allowed.
-  return true;
-  if (origin=='https://ssh.joeri.nu') {
-    return true;
-  } else {
-    return false;
-  }
+  if (!origin) return true;
+  if (allowed_origins.length === 0) return true;
+  return allowed_origins.indexOf(origin) !== -1;
 }
 function getUuidFromCookies(cookies,cookiename) {
   var filtered = cookies.filter(function(obj) {
@@ -1363,7 +1430,7 @@ wsServer.on('request', function(request) {
       shares[shareid]={sessioncookie:sessioncookie,username:username}
       console.log("created pty "+sessioncookie+" "+connection.columns+"x"+connection.rows+" for "+index);
       var headermeta={viewid:viewid,shareid:shareid,viewurl:request.origin+'/#view='+viewid,shareurl:request.origin+'/#share='+shareid,
-        username:username,sessioncookie:sessioncookie,reconnectid:reconnectid,
+        username:username,sessioncookie:sessioncookie,
         cols:connection.columns,rows:connection.rows,starttime:now()};
       if (session_tmux) headermeta.tmux=session_tmux_path(username,sessioncookie);
       var metalog={t:now(),d:JSON.stringify(headermeta),c:4};
@@ -1463,7 +1530,7 @@ wsServer.on('request', function(request) {
     console.log(mode+" link does not exist (anymore)");
   }
 
-  var index = clients.push(connection) - 1;
+  var index = nextIndex++;
 
 
   console.log('Connection from ['+remote+'] '+index+' accepted.');
@@ -1485,8 +1552,7 @@ wsServer.on('request', function(request) {
                 // Client-reported window size, sent on connect before the
                 // sso auto-login spawns the pty so it starts at the right
                 // size. If a pty exists already, treat it as a resize.
-                if (!connection.viewonly && Number.isInteger(m.cols) && Number.isInteger(m.rows)
-                    && m.cols > 0 && m.rows > 0) {
+                if (!connection.viewonly && validSize(m.cols, m.rows)) {
                   connection.columns = m.cols;
                   connection.rows = m.rows;
                   if (connection.sessioncookie!=false) {
@@ -1499,7 +1565,7 @@ wsServer.on('request', function(request) {
                 }
                 break;;
               case 'resize':
-                if (!connection.viewonly) {
+                if (!connection.viewonly && validSize(m.cols, m.rows)) {
                   connection.columns = m.cols;
                   connection.rows = m.rows;
                   if (connection.sessioncookie!=false) {
@@ -1514,7 +1580,7 @@ wsServer.on('request', function(request) {
                         if (true || key!=index) {
                           if (conn.paused) {
                             console.log("buffering 0 for "+key+" session "+connection.sessioncookie);
-                            conn.sendbuffer.push('\0' + buf2);
+                            bufferSend(conn, '\0' + buf2);
                           } else {
                             //console.log("sending resize to "+key);
                             conn.sendUTF('\0'+buf2);
@@ -1581,7 +1647,14 @@ wsServer.on('request', function(request) {
                 if (!connection.viewonly) {
                   if (m.reconnect && m.reconnect in reconnects) {
                     var r=reconnects[m.reconnect];
-                    if ('cols' in m && 'rows' in m) {
+                    // bind the token to the authenticated peer: a stolen
+                    // reconnect token cannot take over another user's session
+                    if (connection.peer && r.username && connection.peer != r.username) {
+                      console.log("reconnect "+m.reconnect+" rejected: peer "+connection.peer+" is not "+r.username);
+                      connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
+                      break;
+                    }
+                    if (validSize(m.cols, m.rows)) {
                       connection.columns=m.cols;
                       connection.rows=m.rows;
                     }
@@ -1611,10 +1684,11 @@ wsServer.on('request', function(request) {
                     && m.reconnect && m.reconnect in reconnects) {
                   var pick=reconnects[m.reconnect];
                   if (pick.username && !pick.stale && pick.username in sessions
+                      && (!connection.peer || connection.peer == pick.username)
                       && pick.sessioncookie in sessions[pick.username]
                       && sessions[pick.username][pick.sessioncookie].pty
                       && sessions[pick.username][pick.sessioncookie].pty.main === false) {
-                    if ('cols' in m && 'rows' in m) {
+                    if (validSize(m.cols, m.rows)) {
                       connection.columns=m.cols;
                       connection.rows=m.rows;
                     }
@@ -1629,7 +1703,7 @@ wsServer.on('request', function(request) {
                 break;;
               case 'newsess':
                 if (!connection.viewonly && !connection.loggedin) {
-                  if ('cols' in m && 'rows' in m) {
+                  if (validSize(m.cols, m.rows)) {
                     connection.columns=m.cols;
                     connection.rows=m.rows;
                   }
@@ -1643,7 +1717,7 @@ wsServer.on('request', function(request) {
                 break;;
               case 'login':
                 if (!connection.viewonly) {
-                  if('cols' in m && 'rows' in m) {
+                  if(validSize(m.cols, m.rows)) {
                     console.log("received login size "+m.cols+"x"+m.rows);
                     connection.columns=m.cols;
                     connection.rows=m.rows;
@@ -1677,13 +1751,21 @@ wsServer.on('request', function(request) {
                       connection.close();
                     }
                   } else if ('username' in m && 'password' in m) {
+                    var blocked = loginBlockSeconds(clientIp);
+                    if (blocked > 0) {
+                      sendError(connection, "too many failed logins, try again in "+Math.ceil(blocked)+"s");
+                      connection.sendUTF('\0' + JSON.stringify({cmd:"authfailed"}));
+                      break;
+                    }
                     pam.authenticate(m.username, m.password, function(err) {
                       if(err) {
+                        loginFailed(clientIp);
                         sendError(connection,err);
                         var cmd={cmd:"authfailed"};
                         connection.sendUTF('\0' + JSON.stringify(cmd));
                         console.log(err);
                       } else {
+                        delete logins[clientIp];
                         connection.username=m.username;
                         connection.sessioncookie=create_pty(m.username,false,connection.columns,connection.rows,connection);
                       }
@@ -1730,7 +1812,7 @@ wsServer.on('request', function(request) {
                   // can render the pointer.
                   for (const [key, conn] of Object.entries(sessions[connection.username][session]['connections'])) {
                     if (conn.paused) {
-                      conn.sendbuffer.push('\2'+mouse);
+                      bufferSend(conn, '\2'+mouse);
                     } else {
                       conn.sendUTF('\2'+mouse);
                     }
@@ -1768,8 +1850,8 @@ wsServer.on('request', function(request) {
   });
 });
 wsServer.on('connection', function(ws,req) {
-  console.log('Connection from ip ' + req.headers);
-  const ip = req.headers['x-forwarded-for'].split(',')[0].trim();
+  var forwarded = req.headers['x-forwarded-for'];
+  const ip = forwarded ? String(forwarded).split(',')[0].trim() : req.remoteAddress;
   console.log('Connection from ip ' + ip);
 });
 
