@@ -296,7 +296,7 @@ function resume_session(meta) {
   reconnects[meta.reconnectid] = {username: username, sessioncookie: sessioncookie};
   views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
   shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
-  var shellenv = { USER: username, VIEWID: meta.viewid, VIEWURL: meta.viewurl, SUDO_USER: username };
+  var shellenv = { USER: username, VIEWID: meta.viewid, VIEWURL: meta.viewurl, SUDO_USER: username, LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
   session.pty = attach_tmux(username, sessioncookie, cols, rows, shellenv, meta.tmux);
   session.pty.file = fopen(logfile, 'a+');
   session.pty.main = false;
@@ -553,14 +553,23 @@ function start_tmux_session(username, sessioncookie, cols, rows, env) {
   spawnSync('sudo', ['-u', username, 'mkdir', '-p', dir]);
   spawnSync('sudo', ['-u', username, 'chmod', '700', dir]);
   var shell = u.shell || '/bin/bash';
+  var viewid = ((env && env.VIEWID) || '');
+  var viewurl = ((env && env.VIEWURL) || '');
+  // Pane command: env -i drops everything tmux and sudo inject (TMUX,
+  // TMUX_PANE, TERM_PROGRAM*, SUDO_*, SHLVL, PWD) and starts a login shell
+  // with a minimal, hand-picked environment.
+  var panecmd = "exec env -i HOME='" + u.home + "' SHELL='" + shell + "'" +
+    " USER='" + username + "' LOGNAME='" + username + "' PATH=/usr/local/bin:/usr/bin:/bin" +
+    " LANG=en_US.UTF-8 COLORTERM=truecolor TERM=xterm-256color" +
+    " VIEWID='" + viewid + "' VIEWURL='" + viewurl + "' '" + shell + "' -l";
   var args = ['-u', username, 'env',
     'USER=' + username, 'LOGNAME=' + username, 'HOME=' + u.home,
     'SHELL=' + shell, 'PATH=/usr/local/bin:/usr/bin:/bin',
-    'VIEWID=' + ((env && env.VIEWID) || ''), 'VIEWURL=' + ((env && env.VIEWURL) || ''),
+    'VIEWID=' + viewid, 'VIEWURL=' + viewurl,
     'tmux', '-S', sock];
   if (fs.existsSync(tmux_conf)) args.push('-f', tmux_conf);
   args.push('new-session', '-d', '-s', 'main',
-    '-x', String(cols), '-y', String(rows), shell);
+    '-x', String(cols), '-y', String(rows), panecmd);
   var out = spawnSync('sudo', args, { cwd: u.home });
   if (out.status !== 0) {
     console.error("tmux new-session failed for "+username+" "+sessioncookie
@@ -576,7 +585,7 @@ function attach_tmux(username, sessioncookie, cols, rows, env, sock) {
   if (!sock) sock = session_tmux_path(username, sessioncookie);
   var u = lookupUser(username);
   return pty.spawn('tmux', ['-S', sock, 'attach', '-t', 'main'], {
-    name: 'xterm',
+    name: 'xterm-256color',
     cols: cols,
     rows: rows,
     cwd: (u && u.home) || '/',
@@ -1335,7 +1344,7 @@ wsServer.on('request', function(request) {
       session.checkpoint_path=session_checkpoint_path(username,sessioncookie);
       session.mirror=create_mirror(connection.columns, connection.rows);
       fs.mkdirSync(path.dirname(session_log_path(username,sessioncookie)), { recursive: true });
-      var shellenv = { USER: username, VIEWID: viewid, VIEWURL: request.origin+'/#view='+viewid, SUDO_USER: username };
+      var shellenv = { USER: username, VIEWID: viewid, VIEWURL: request.origin+'/#view='+viewid, SUDO_USER: username, LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
       if (session_tmux) {
         start_tmux_session(username, sessioncookie, connection.columns, connection.rows, shellenv);
         sessions[username][sessioncookie].pty = attach_tmux(username, sessioncookie, connection.columns, connection.rows, shellenv);
