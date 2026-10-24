@@ -107,7 +107,8 @@ async function readStartDate(file) {
  * it is marked saturated and additional connections are opened, up to
  * maxConnections, so uploads are spread out.
  */
-function createTransport(target, ca, identity, maxConnections, highWaterMark) {
+function createTransport(target, ca, identity, maxConnections, highWaterMark,
+  onReconnect, onDisconnect, verbose) {
   var lowWaterMark = Math.max(1, Math.floor(highWaterMark / 4));
   var connections = [];
   var pending = [];
@@ -191,44 +192,59 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
       }
       stream.reject(failure);
     }
-    if (!closed) schedulePending();
+    if (!closed) {
+      schedulePending();
+      // The last live connection is gone: the receiver's state is unknown
+      // again, so drop the local belief and let the caller rescan. The
+      // resulting uploads reconnect and re-announce every present log.
+      if (!hasLiveConnection() && onDisconnect) {
+        try { onDisconnect(); } catch (ignored) {}
+      }
+      ensureConnection();
+    }
   }
 
-  // The server tells us the state of the file it already has for a stream.
-  // When it matches the local file we tell the server it is in sync. When it
-  // differs the existing copy is marked corrupt and the file is uploaded again.
+  // The server reports the state of the file it already has for a stream. The
+  // announce carries our size, hash and file pointer (offset). A full match is
+  // confirmed with synced:true (no data, no second roundtrip). When the stored
+  // size equals our pointer the server appends the tail we stream. When it
+  // cannot honor the pointer it reports its real size (the go-wrong signal) and
+  // we upload in full. In non-verbose mode the server is silent for the normal
+  // append, so we stream the tail optimistically and react to a go-wrong report
+  // arriving from the announce or from end.
   function handleState(conn, stream, message) {
-    if (stream.phase != 'announce') return;
-    armStreamTimer(conn, stream);
-    var same = message.exists === true
-      && message.size === stream.size
-      && message.sha256 === stream.sha256;
-    if (same) {
+    if (stream.settled || stream.phase == 'reset') return;
+    if (message.synced === true) {
+      conn.streams.delete(stream.id);
+      stream.settled = true;
       stream.phase = 'synced';
-      sendMessage(conn, {type: 'synced', id: stream.id}).catch(function(error) {
-        failStream(conn, stream, error);
-      });
+      clearStreamTimer(stream);
+      stream.resolve();
+      schedulePending();
       return;
     }
-    if (message.exists === true) {
-      // A finished log must never change, so a difference means the stored copy
-      // is suspect and is kept as .corrupt. An active log is a moving snapshot:
-      // replace the previous copy in place. A finished upload usually follows an
-      // active snapshot of the same session, which is only a prefix of the
-      // final log and must be replaced rather than kept as corrupt.
-      var replace = stream.job.finished === false || message.finished !== true;
-      stream.phase = replace ? 'replace' : 'corrupt';
-      sendMessage(conn, {type: replace ? 'replace' : 'corrupt', id: stream.id})
-        .then(function() {
-          stream.phase = 'streaming';
-          pump(conn);
-        }, function(error) {
-          failStream(conn, stream, error);
-        });
+    var replace = stream.job.finished === false || message.finished !== true;
+    // Non-verbose optimistic append: the server is silent when it appends, so
+    // any state that arrives after we started streaming the tail is a go-wrong
+    // report. Re-send the whole file in full.
+    if (stream.phase == 'streaming' || stream.phase == 'waitingEnd') {
+      resetToFull(conn, stream, replace);
       return;
     }
-    stream.phase = 'streaming';
-    pump(conn);
+    var goWrong = message.exists === false
+      || (message.exists === true && message.size !== stream.offset);
+    if (goWrong) {
+      resetToFull(conn, stream, replace);
+      return;
+    }
+    // exists and size equals our pointer: append. Verbose confirms it here;
+    // non-verbose is silent and is already streaming the tail.
+    if (stream.phase == 'announce') {
+      armStreamTimer(conn, stream);
+      stream.start = stream.offset;
+      stream.phase = 'streaming';
+      pump(conn);
+    }
   }
 
   function handleMessage(conn, data) {
@@ -285,6 +301,10 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
         release();
         opened = true;
         conn.open = true;
+        // A connection opened when none was live is a (re)connect: the local
+        // view of what the receiver already has is no longer trusted, so the
+        // caller resyncs it and re-announces every present log.
+        var firstLive = !hasLiveConnection();
         connections.push(conn);
         // Watch the send buffer so a slow receiver is detected even while a
         // send is waiting, and extra connections can be opened.
@@ -304,6 +324,9 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
         if (conn.monitor.unref) conn.monitor.unref();
         resolve(conn);
         schedulePending();
+        if (firstLive && onReconnect) {
+          try { onReconnect(); } catch (ignored) {}
+        }
       });
       ws.on('error', function(error) {
         if (!opened) { release(); reject(error); return; }
@@ -354,7 +377,7 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
             }
             break;
           }
-          if (stream.size == 0) {
+          if (stream.size - (stream.start || 0) == 0) {
             stream.phase = 'waitingEnd';
             try {
               await sendMessage(conn, {type: 'end', id: stream.id});
@@ -365,7 +388,7 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
           }
           if (!stream.reader) {
             stream.reader = fs.createReadStream(stream.job.file, {
-              start: 0,
+              start: stream.start || 0,
               end: stream.size - 1,
               highWaterMark: CHUNK_SIZE
             })[Symbol.asyncIterator]();
@@ -412,7 +435,33 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
       failStream(conn, stream, error);
       return;
     }
+    // Non-verbose: the receiver is silent when it can append, so start the tail
+    // right away. A go-wrong state (from the announce or from end) resets us to
+    // a full upload. Verbose: wait for the state reply before sending anything.
+    if (!verbose && stream.offset > 0) {
+      stream.start = stream.offset;
+      stream.phase = 'streaming';
+    }
     pump(conn);
+  }
+
+  // A go-wrong report (pointer not honored): stop the optimistic tail, tell the
+  // server to reset, and re-send the whole file from the start.
+  function resetToFull(conn, stream, replace) {
+    if (stream.reader && stream.reader.return) {
+      try { stream.reader.return(); } catch (ignored) {}
+    }
+    stream.reader = null;
+    stream.start = 0;
+    stream.phase = 'reset';
+    sendMessage(conn, {type: replace ? 'replace' : 'corrupt', id: stream.id})
+      .then(function() {
+        stream.phase = 'streaming';
+        armStreamTimer(conn, stream);
+        pump(conn);
+      }, function(error) {
+        failStream(conn, stream, error);
+      });
   }
 
   function hasLiveConnection() {
@@ -420,6 +469,16 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
       if (connections[i].open && !connections[i].dead) return true;
     }
     return false;
+  }
+
+  // After the last live connection is lost the uploader stays connected to the
+  // receiver even while idle, so a dropped link is noticed and re-established
+  // and the reconnect resyncs the receiver's state.
+  function ensureConnection() {
+    if (closed || hasLiveConnection() || connecting > 0) return;
+    connect().catch(function(error) {
+      if (connections.length === 0 && connecting === 0) rejectPending(error);
+    });
   }
 
   function pickConnection() {
@@ -494,6 +553,8 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
         job: job,
         size: info.size,
         sha256: info.sha256,
+        offset: info.offset || 0,
+        start: 0,
         resolve: resolve,
         reject: reject,
         settled: false,
@@ -510,6 +571,7 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark) {
             kind: job.kind,
             size: info.size,
             sha256: info.sha256,
+            offset: info.offset || 0,
             startdate: info.startdate,
             finished: job.finished !== false
           };
@@ -572,6 +634,8 @@ function createUploader(config, options) {
     DEFAULT_CONNECTIONS));
   var highWaterMark = Math.max(64 * 1024, configInt(config,
     'upload_high_water_bytes', DEFAULT_HIGH_WATER_MARK));
+  var debug = configBool(config, 'upload_debug', false);
+  var verbose = configBool(config, 'upload_append_verbose', false);
   var target = null;
   var ca = null;
 
@@ -592,9 +656,19 @@ function createUploader(config, options) {
     }
   }
 
+  function resync() {
+    // The receiver's state is unknown again: forget what we thought it had and
+    // let the caller rescan, so every present log is re-announced and the
+    // receiver's true state is re-synced.
+    state.uploaded = new Map();
+    if (options.onReconnect) {
+      try { options.onReconnect(); } catch (ignored) {}
+    }
+  }
+
   var transport = enabled
     ? createTransport(target, ca, {hostname: hostname, hostkey: hostkey},
-        maxConnections, highWaterMark)
+        maxConnections, highWaterMark, resync, resync, verbose)
     : null;
 
   var state = {
@@ -607,6 +681,11 @@ function createUploader(config, options) {
 
   function log(message) {
     console.log('[uploader] ' + message);
+  }
+
+  // High-volume per-upload lines are only shown when upload_debug is on.
+  function debugLog(message) {
+    if (debug) console.log('[uploader] ' + message);
   }
 
   function notifyIdle() {
@@ -633,26 +712,38 @@ function createUploader(config, options) {
         info = await hashFileStream(job.file);
       } catch (error) {
         if (error.code == 'ENOENT') {
-          log('skipping missing ' + job.file);
+          debugLog('skipping missing ' + job.file);
           return;
         }
         throw error;
       }
       info.startdate = await readStartDate(job.file);
-      if (state.uploaded.get(key) === info.sha256) {
+      var stored = state.uploaded.get(key);
+      if (stored && stored.sha256 === info.sha256) {
         callUploaded(job);
         success = true;
         return;
       }
+      // File pointer: the number of bytes the receiver is known to hold. An
+      // active log only grows, so the last snapshot is a prefix of this file
+      // and only the tail after the pointer has to be sent. The receiver
+      // appends that tail by default; it only reports back (its real size) when
+      // the pointer cannot be honored, which makes us upload in full. A
+      // finished log is the final copy and is always sent in full.
+      var pointer = 0;
+      if (stored && job.finished === false && stored.offset <= info.size) {
+        pointer = stored.offset;
+      }
+      info.offset = pointer;
 
       for (var attempt = 0; ; attempt++) {
         try {
           await transport.send(job, info);
-          state.uploaded.set(key, info.sha256);
+          state.uploaded.set(key, {offset: info.size, sha256: info.sha256});
           if (state.uploaded.size > MAX_UPLOADED_TRACKED) {
             state.uploaded.delete(state.uploaded.keys().next().value);
           }
-          log('uploaded ' + job.kind + ' for ' + job.username + '/'
+          debugLog('uploaded ' + job.kind + ' for ' + job.username + '/'
             + job.sessioncookie + ' (' + info.size + ' bytes)');
           callUploaded(job);
           success = true;
@@ -670,8 +761,8 @@ function createUploader(config, options) {
             return;
           }
           var wait = RETRY_BASE_MS * Math.pow(2, attempt);
-          log(job.kind + ' upload failed (' + error.message + '), retrying in '
-            + wait + 'ms');
+          debugLog(job.kind + ' upload failed (' + error.message
+            + '), retrying in ' + wait + 'ms');
           await delay(wait);
         }
       }
@@ -791,7 +882,15 @@ async function listSessionFiles(sessionDir, template) {
  */
 async function run(config, options) {
   options = options || {};
-  var uploader = createUploader(config, {baseDir: __dirname});
+  var uploader = createUploader(config, {
+    baseDir: __dirname,
+    onReconnect: function() {
+      // After a reconnect the receiver's state is unknown again: drop the
+      // local scan cache and rescan so every present log is re-announced.
+      seen.clear();
+      requestScan(0);
+    }
+  });
   if (!uploader.enabled) {
     console.log('uploads are disabled (upload_enabled=false)');
     return 0;

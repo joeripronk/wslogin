@@ -389,6 +389,108 @@ function showLoginForm() {
   LoginForm.status("please login");
   LoginForm.focus();
 }
+var pickerdiv=document.getElementById('picker');
+var pickerTerms=[];
+function hidePicker() {
+  for (var i = 0; i < pickerTerms.length; i++) {
+    try { pickerTerms[i].dispose(); } catch (e) {}
+  }
+  pickerTerms = [];
+  pickerdiv.innerHTML = '';
+  pickerdiv.style.display = 'none';
+}
+function showSessionPicker(list) {
+  hidePicker();
+  terminaldiv.style.display="none";
+  loginform.style.display="none";
+  pickerdiv.style.display="block";
+  var head=document.createElement('div');
+  head.className='picker-head';
+  head.innerHTML='Reconnect to a running terminal, or start a new one.';
+  pickerdiv.appendChild(head);
+  var grid=document.createElement('div');
+  grid.className='picker-grid';
+  pickerdiv.appendChild(grid);
+  (list || []).forEach(function(item) {
+    var card=document.createElement('div');
+    card.className='picker-card';
+    var shot=document.createElement('div');
+    shot.className='picker-shot';
+    shot.title='Click to expand / collapse';
+    card.appendChild(shot);
+    var thumb=new window.Terminal({
+      cols: item.cols || 80,
+      rows: item.rows || 24,
+      allowProposedApi: true,
+      disableStdin: true,
+      cursorBlink: false,
+      scrollback: 1,
+      fontSize: 11,
+      theme: { background: '#0b1220' }
+    });
+    thumb.open(shot);
+    pickerTerms.push(thumb);
+    if (item.snapshot) thumb.write(item.snapshot);
+    scaleThumb(shot, thumb);
+    shot.onclick=function() { toggleFullCard(card, shot, thumb); };
+    var label=document.createElement('div');
+    label.className='picker-label';
+    label.textContent=(item.title || 'terminal')+'  ('+thumb.cols+'x'+thumb.rows+')';
+    card.appendChild(label);
+    var btn=document.createElement('button');
+    btn.className='picker-connect';
+    btn.textContent='Connect';
+    btn.onclick=function() { pickSession(item.reconnectid); };
+    card.appendChild(btn);
+    grid.appendChild(card);
+  });
+  var newbtn=document.createElement('button');
+  newbtn.className='picker-new';
+  newbtn.textContent='Start a new session';
+  newbtn.onclick=function() { startNewSession(); };
+  pickerdiv.appendChild(newbtn);
+}
+function scaleThumb(shot, thumb) {
+  var cell=measureCell(shot, thumb);
+  if (!cell || !cell.width || !cell.height) return;
+  var w=shot.clientWidth || 240, h=shot.clientHeight || 140;
+  var scale=Math.min(w/(thumb.cols*cell.width), h/(thumb.rows*cell.height));
+  if (!isFinite(scale) || scale<=0) return;
+  var el=shot.querySelector('.xterm');
+  if (el) el.style.transform='scale('+scale+')';
+}
+// Click a thumbnail: expand it to fill the screen, click again to collapse.
+function toggleFullCard(card, shot, thumb) {
+  var full=card.classList.toggle('picker-full');
+  var grid=card.parentNode;
+  if (full && grid) grid.classList.add('picker-zoomed');
+  if (!full && grid) grid.classList.remove('picker-zoomed');
+  // Let the layout settle before measuring the (new) shot size.
+  requestAnimationFrame(function() { scaleThumb(shot, thumb); });
+}
+function measureCell(shot, thumb) {
+  var probe=document.createElement('span');
+  probe.style.visibility='hidden';
+  probe.textContent='W';
+  shot.appendChild(probe);
+  var cs=window.getComputedStyle(shot);
+  var cell={width: probe.offsetWidth, height: parseFloat(cs.lineHeight)||16};
+  shot.removeChild(probe);
+  return cell;
+}
+function pickSession(reconnectid) {
+  if (socket && socket.readyState==1) {
+    socket.send('\0' + JSON.stringify({cmd:'pick', reconnect:reconnectid,
+      cols:term.cols, rows:term.rows}));
+  }
+  hidePicker();
+}
+function startNewSession() {
+  if (socket && socket.readyState==1) {
+    socket.send('\0' + JSON.stringify({cmd:'newsess', cols:term.cols, rows:term.rows}));
+  }
+  hidePicker();
+}
 function shouldReconnect() {
   return !sessionEnded && (viewonly || shared || authenticated || !!reconnectToken);
 }
@@ -480,6 +582,12 @@ function onmessage(message) {
           showLoginForm();
           var formstatus=document.getElementById('formstatus');
           formstatus.innerHTML="<font color=red>Your session has expired, please login again</font>";
+          break;;
+        case 'sessions':
+          // On a page refresh the tab already carries its own session in
+          // sessionStorage and reconnects to it; ignore the sso picker then.
+          if (sessionStorage.getItem('wsSession')) break;
+          showSessionPicker(json.list);
           break;;
         case 'authfailed':
           terminaldiv.style.display="none";

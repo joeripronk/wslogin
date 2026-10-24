@@ -826,6 +826,58 @@ function getUuidFromCookies(cookies,cookiename) {
   return filtered.length > 0 ? filtered[0].value : null;
 }
 
+// true when the request carries a local session cookie (uuid) whose cookie
+// file is present, i.e. the client can reconnect to its own session.
+function hasValidSessionCookie(uuidcookie) {
+  if (!('cookie_dir' in config)) return false;
+  if (typeof uuidcookie != 'string' || !/^[0-9a-zA-Z-]+$/.test(uuidcookie)) {
+    return false;
+  }
+  try {
+    fs.statSync(config.cookie_dir + '/cookie_' + uuidcookie + '.json');
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// A rendered snapshot of a session's current screen, for a reconnect picker.
+function serialize_mirror(session) {
+  var mirror = session.mirror;
+  if (!mirror || !mirror.terminal) return null;
+  try {
+    return {
+      cols: mirror.terminal.cols,
+      rows: mirror.terminal.rows,
+      title: mirror.terminal.title || '',
+      s: serialize_terminal(mirror.terminal, mirror.serializeAddon)
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+// The user's terminals that are running but have no owner connection (the
+// owner disconnected): these can be reconnected to.
+function listDisconnected(username) {
+  var list = [];
+  if (!username || !(username in sessions)) return list;
+  for (const key in sessions[username]) {
+    var s = sessions[username][key];
+    if (s.pty && s.pty.main === false) {
+      var snap = serialize_mirror(s);
+      list.push({
+        reconnectid: s.reconnectid,
+        cols: s.pty.cols,
+        rows: s.pty.rows,
+        title: (snap && snap.title) || '',
+        snapshot: snap ? snap.s : ''
+      });
+    }
+  }
+  return list;
+}
+
 var groupcache = {time:0, lines:[]};
 function userInGroup(username, group) {
   var nowms = Date.now();
@@ -906,7 +958,11 @@ wsServer.on('request', function(request) {
   var ssoCred = ssoAuth ? ssoAuth.credentialsOf(getUuidFromCookies(request.cookies,ssoAuth.cookieName)) : false;
   var ssoUser = ssoCred ? ssoCred.user : false;
   connection.peer = (ssoUser && ssoUser != 'root') ? ssoUser : false;
-  if (ssoUser && ssoUser != 'root' && !liveView && !liveShare) {
+  // Only use sso login when there is no valid local session cookie: a client
+  // that can reconnect to its own session must not be auto-logged in via sso,
+  // which would spawn a fresh session and drop the reconnect.
+  if (ssoUser && ssoUser != 'root' && !liveView && !liveShare
+      && !hasValidSessionCookie(uuidcookie)) {
     if (ssoAuth.ssoGroup && !userInGroup(ssoUser, ssoAuth.ssoGroup)) {
       console.log("sso user "+ssoUser+" is not in group "+ssoAuth.ssoGroup);
       connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
@@ -921,15 +977,13 @@ wsServer.on('request', function(request) {
             connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
           } else {
             console.log("sso login for "+ssoUser+" on websocket");
-            connection.username=ssoUser;
-            connection.sessioncookie=create_pty(ssoUser,false,connection.columns,connection.rows,connection);
+            ssoAutoLogin(ssoUser);
           }
         }, {serviceName: ssoAuth.pamService, remoteHost: remote});
       }
     } else {
       console.log("sso login for "+ssoUser+" on websocket (pam verification disabled)");
-      connection.username=ssoUser;
-      connection.sessioncookie=create_pty(ssoUser,false,connection.columns,connection.rows,connection);
+      ssoAutoLogin(ssoUser);
     }
   } else {
     var cmd={cmd:"login"};
@@ -988,6 +1042,10 @@ wsServer.on('request', function(request) {
     connection.username=username;
     if (!forceNew && ( username in sessions)) {
       var list='sessioncookies:\r\n';
+      // When a specific session is requested (reconnect/pick), attach to that
+      // one only; auto-picking the first disconnected session is for the
+      // no-target (auto-reconnect) case.
+      var specific = (sessioncookie !== false);
       for (const [key, value] of Object.entries(sessions[username])) {
         var requested = sessioncookie==key;
         if(sessions[username][key].pty.main && !requested) {
@@ -1005,7 +1063,7 @@ wsServer.on('request', function(request) {
             }
           }
         }
-        if(requested || (!connection.viewonly && !connection.shared && !mainconnection)) {
+        if(requested || (!specific && !connection.viewonly && !connection.shared && !mainconnection)) {
           sessioncookie=key;
           connection.paused=true;
           if(connection.viewonly) {
@@ -1180,6 +1238,34 @@ wsServer.on('request', function(request) {
     console.log("returning cookie "+sessioncookie+" file "+sessions[username][sessioncookie].pty.file);
     return sessioncookie;
 
+  }
+
+  // A reconnect target is gone: offer this user's disconnected terminals as a
+  // picker (with snapshots), or fall back to the login form when there are
+  // none. The client replies with 'pick' (chosen reconnectid) or 'newsess'.
+  function offerDisconnected(username, connection) {
+    var list = listDisconnected(username);
+    if (list.length > 0) {
+      connection.username = username;
+      console.log("offering "+list.length+" disconnected terminal(s) to "+username);
+      connection.sendUTF('\0' + JSON.stringify({cmd:"sessions", list:list}));
+    } else {
+      sendError(connection,"Your session has expired");
+      connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
+    }
+  }
+
+  // sso auto-login on connect: if the user has disconnected terminals, show
+  // the picker so they choose one (or start a new session) instead of being
+  // attached to the first one automatically.
+  function ssoAutoLogin(ssoUser) {
+    if (listDisconnected(ssoUser).length > 0) {
+      offerDisconnected(ssoUser, connection);
+    } else {
+      connection.username = ssoUser;
+      connection.sessioncookie = create_pty(ssoUser, false,
+        connection.columns, connection.rows, connection);
+    }
   }
 
   // Attaches this connection to a running session as a viewer (mode 'view')
@@ -1362,12 +1448,47 @@ wsServer.on('request', function(request) {
                       create_pty(r.username,r.sessioncookie,connection.columns,connection.rows,connection);
                     } else {
                       delete reconnects[m.reconnect];
-                      sendError(connection,"Your session has expired");
-                      connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
+                      // The target is gone. Offer the user's other disconnected
+                      // terminals to reconnect to, or fall back to the login.
+                      offerDisconnected(r.username, connection);
                     }
                   } else {
-                    sendError(connection,"Your session has expired");
+                    offerDisconnected(connection.peer, connection);
+                  }
+                }
+                break;;
+              case 'pick':
+                if (!connection.viewonly && !connection.loggedin
+                    && m.reconnect && m.reconnect in reconnects) {
+                  var pick=reconnects[m.reconnect];
+                  if (pick.username && !pick.stale && pick.username in sessions
+                      && pick.sessioncookie in sessions[pick.username]
+                      && sessions[pick.username][pick.sessioncookie].pty
+                      && sessions[pick.username][pick.sessioncookie].pty.main === false) {
+                    if ('cols' in m && 'rows' in m) {
+                      connection.columns=m.cols;
+                      connection.rows=m.rows;
+                    }
+                    connection.username=pick.username;
+                    connection.sessioncookie=pick.sessioncookie;
+                    console.log("picked disconnected terminal "+pick.sessioncookie+" by "+pick.username);
+                    create_pty(pick.username,pick.sessioncookie,connection.columns,connection.rows,connection);
+                  } else {
                     connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
+                  }
+                }
+                break;;
+              case 'newsess':
+                if (!connection.viewonly && !connection.loggedin) {
+                  if ('cols' in m && 'rows' in m) {
+                    connection.columns=m.cols;
+                    connection.rows=m.rows;
+                  }
+                  var newuser = connection.peer || connection.username;
+                  if (newuser) {
+                    connection.sessioncookie=create_pty(newuser,false,connection.columns,connection.rows,connection,true);
+                  } else {
+                    connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
                   }
                 }
                 break;;

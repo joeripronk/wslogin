@@ -167,3 +167,107 @@ li {
 	display: none;
 	z-index: 8;
 }
+#picker{
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	display: none;
+	z-index: 9;
+	background: #0b1220;
+	color: #dfe7f2;
+	padding: 16px;
+	box-sizing: border-box;
+	overflow: auto;
+}
+.picker-head{
+	font-size: 15px;
+	margin-bottom: 14px;
+	opacity: 0.85;
+}
+.picker-grid{
+	display: flex;
+	flex-wrap: wrap;
+	gap: 14px;
+}
+.picker-card{
+	background: #131c2e;
+	border: 1px solid #26334a;
+	border-radius: 6px;
+	padding: 8px;
+	width: 260px;
+}
+.picker-shot{
+	width: 244px;
+	height: 150px;
+	overflow: hidden;
+	background: #0b1220;
+	border: 1px solid #26334a;
+	border-radius: 4px;
+	font-size: 11px;
+	line-height: 14px;
+	cursor: pointer;
+}
+.picker-shot .xterm{
+	transform-origin: 0 0;
+}
+.picker-card.picker-full{
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	width: auto;
+	height: auto;
+	z-index: 20;
+	border-radius: 0;
+	display: flex;
+	flex-direction: column;
+	padding: 12px;
+	box-sizing: border-box;
+}
+.picker-card.picker-full .picker-shot{
+	flex: 1 1 auto;
+	width: auto;
+	height: auto;
+	min-height: 0;
+}
+.picker-card.picker-full .picker-label{
+	flex: 0 0 auto;
+}
+.picker-card.picker-full .picker-connect{
+	flex: 0 0 auto;
+	align-self: flex-start;
+}
+.picker-grid.picker-zoomed{
+	pointer-events: none;
+}
+.picker-card.picker-full{
+	pointer-events: auto;
+}
+.picker-label{
+	font-size: 12px;
+	margin: 8px 0;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.picker-connect,
+.picker-new{
+	background: #2b6cb0;
+	color: #fff;
+	border: none;
+	border-radius: 4px;
+	padding: 6px 12px;
+	cursor: pointer;
+	font-size: 13px;
+}
+.picker-new{
+	display: block;
+	margin-top: 18px;
+}
+.picker-connect:hover,
+.picker-new:hover{
+	background: #2c7fd6;
+}

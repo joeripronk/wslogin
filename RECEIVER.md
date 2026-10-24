@@ -48,6 +48,8 @@ upload_remove_uploaded=false
 upload_connections=4
 upload_high_water_bytes=1048576
 upload_ca=/etc/wslogin/upload-ca.pem
+upload_debug=false
+upload_append_verbose=false
 ```
 
 - `upload_enabled` defaults to `false`.
@@ -75,6 +77,15 @@ upload_ca=/etc/wslogin/upload-ca.pem
 - `upload_hostkey` is optional and sent verbatim.
 - `upload_ca` is an optional PEM bundle used to verify the server certificate
   (for private CAs). It is not a way to disable verification.
+- `upload_debug` logs every upload and retry to stdout. Defaults to `false`,
+  which logs only rejections and errors.
+- `upload_append_verbose` controls the verbosity of the receiver's state answers
+  used during incremental append. Defaults to `false`: the receiver appends by
+  default and only reports a state for a full match, an empty store, a pointer
+  mismatch, or a stale append. `true` makes it answer every announce with its
+  full state. Append itself is always enabled; this switch only changes how much
+  the receiver talks. It is read on both the uploader and the receiver and must
+  match on both.
 
 ## Receiver configuration
 
@@ -85,6 +96,8 @@ receiver_max_size=67108864
 receiver_require_hostkey=false
 receiver_active_template=active/<hostname>/<username>/<session>.json
 receiver_store_template=archive/<%date YYYY-mm-dd>/<hostname>/<username>/<session>.json
+receiver_debug=false
+upload_append_verbose=false
 ```
 
 - `receiver_port` is the port `receiver.js` listens on. Defaults to
@@ -107,6 +120,13 @@ receiver_store_template=archive/<%date YYYY-mm-dd>/<hostname>/<username>/<sessio
   `dd` (day), `HH`, `MM` (minutes) and `ss`. The date is the session start date from the first log
   record. It must end in `.json`; the default is
   `archive/<hostname>/<username>/<session>.json`.
+- `receiver_debug` logs every state reply and stored upload to stdout. Defaults
+  to `false`, which logs only connections, errors and corrupt copies.
+- `upload_append_verbose` controls how much the receiver talks during
+  incremental append. Defaults to `false`: it appends by default and reports a
+  state only for a full match, an empty store, a pointer mismatch, or a stale
+  append. `true` answers every announce with the full state. Append is always
+  enabled; this switch only changes verbosity and must match the uploader's.
 - TLS is controlled by the shared `[https]` section. When enabled, the server
   serves `wss` (and `ws` too, unless `allow_http` is disabled).
 
@@ -170,7 +190,12 @@ the remaining uploads are spread across connections. Connections are persistent
 and shared between scans.
 
 Uploads are retried without blocking the scan loop. A file whose SHA-256 was
-already uploaded for the same session is not sent again.
+already uploaded for the same session is not sent again. This local knowledge is
+only trusted while the connection to the receiver is up: when the last live
+connection is lost the uploader reconnects, forgets what it thought the receiver
+had and re-announces every present log, so the receiver's true state is
+re-synced (an intact copy is confirmed in a single roundtrip, a missing or
+damaged one is uploaded again).
 
 ## Running
 
@@ -235,6 +260,7 @@ connection is open:
   "kind": "log",
   "size": 123456,
   "sha256": "9f86d0818...",
+  "offset": 100000,
   "startdate": 1761177600,
   "finished": false
 }
@@ -251,42 +277,60 @@ connection is open:
 | `kind`     | yes      | always `log`                                    |
 | `size`     | yes      | file size in bytes                              |
 | `sha256`   | yes      | lowercase hex SHA-256 of the whole file         |
+| `offset`   | no       | file pointer: bytes the server is expected to already have; `0` for a finished log or first snapshot |
 | `startdate`| no       | session start, seconds since the epoch          |
 | `finished` | no       | `false` for an active snapshot, default `true`  |
 
 ### 2. State and integrity check
 
-In response to the announce the server replies with the state of the file it
-currently stores for `hostname/username/session`:
+In response to the announce the server reports the state of the file it stores
+for `hostname/username/session`. Append is the default: when the stored size
+equals the announced `offset` the server appends the tail the uploader streams,
+and it does **not** have to confirm the append. It only reports when things go
+wrong. The uploader asks for the state at most once per file:
 
 ```json
-{"type": "state", "id": 7, "exists": true, "size": 123456, "sha256": "9f86d0818..."}
+{"type": "state", "id": 7, "exists": true, "size": 123456, "sha256": "9f86d0818...", "finished": false, "synced": true}
+{"type": "state", "id": 7, "exists": false}
+{"type": "state", "id": 7, "exists": true, "size": 100000, "sha256": "3a7f...", "finished": false}
 ```
 
-`exists` is `false` when nothing is stored yet, in which case `size` and
-`sha256` may be omitted. The uploader compares the reported state with its own
-`size` and `sha256` and then:
+The server replies with a state in these cases:
 
-- **remote matches** the local file: sends `{"type":"synced","id":7}` with no
-  file data. The server replies `ok`; nothing is transferred.
-- **remote differs and the log is finished**: sends
-  `{"type":"corrupt","id":7}`. The server must move its existing file for that
-  session aside to `.corrupt` and forget the stored hash. The uploader then
-  streams the file as described below and the server stores the fresh copy.
-- **remote differs and the log is active** (`finished:false`): sends
-  `{"type":"replace","id":7}`. The uploader streams the new snapshot and the
-  server replaces the stored file in place; no `.corrupt` copy is kept.
-- **nothing stored**: streams the file directly.
+- **full match** (stored `size` and `sha256` equal the announce, and a
+  `finished:true` announce matches a finished copy): `synced:true`; the stream
+  is complete, no data is transferred and there is no second roundtrip.
+- **nothing stored**: `exists:false`. The uploader streams the whole file.
+- **stored size differs from the announced `offset`**: `exists:true` with the
+  server's real `size`. Because the size does not match the pointer, the
+  uploader falls back to a full upload (a `replace`, or a `corrupt` for a
+  differing finished copy).
+- **stored size equals the announced `offset`** (an active log): the normal
+  append. The server stays **silent** (no state reply); it seeds the stored
+  prefix, appends the tail and verifies the full `sha256` on `end`. A prefix
+  that turns out stale is caught on `end` and reported as a go-wrong size, so
+  the uploader re-sends in full.
 
-This lets the uploader verify the receiver before sending and lets a receiver
-whose copy is damaged ask for a fresh copy. A damaged finished log is kept as
-`<sessioncookie>.corrupt` rather than being overwritten; active snapshots
-simply replace each other.
+`verbose` mode (`upload_append_verbose=true`) makes the server answer every
+announce with its full state (`exists`, `size`, `sha256`, `finished`, and
+`synced` on a match), including a confirmation for the append case. The default
+(`false`) is the terse behavior above: the server only speaks up for a full
+match, an empty store, a pointer mismatch, and a stale append. The switch is
+read on both sides and only controls verbosity; append itself is always enabled.
+
+This lets the uploader verify the receiver with a single state query before
+sending and lets a receiver whose copy is damaged ask for a fresh copy. A
+damaged finished log is kept as `<sessioncookie>.corrupt` rather than being
+overwritten; active snapshots replace each other. The file pointer is dropped
+when the connection to the receiver is re-established, so a resync re-verifies
+the receiver's real size.
 
 ### 3. Data
 
-The complete session log (`<sessioncookie>.json`) is sent as binary frames. Each
-binary frame is prefixed with the 4 byte big endian stream id:
+The session log (`<sessioncookie>.json`) is sent as binary frames. For a full
+upload this is the whole file; for an append it is only the bytes after the
+announced `offset`. Each binary frame is prefixed with the 4 byte big endian
+stream id:
 
 ```text
 +----------------+-----------------------------+
@@ -295,9 +339,11 @@ binary frame is prefixed with the 4 byte big endian stream id:
 ```
 
 The server strips the 4 byte prefix, looks up the stream and writes the data to
-that stream's temporary file. Frames of different streams may be interleaved in
-any order; per stream the order is preserved. The uploader sends 128 KiB per
-frame, so a frame boundary has no meaning.
+that stream's temporary file. For an append it first seeds the temporary file
+with the stored prefix, so the appended tail forms the complete file. Frames of
+different streams may be interleaved in any order; per stream the order is
+preserved. The uploader sends 128 KiB per frame, so a frame boundary has no
+meaning.
 
 The log is a sequence of JSON objects, one per line. Line format (internal, may
 evolve):
@@ -319,9 +365,11 @@ as-is; the playback server reads the header from the file to offer live stream
 and live control links in sudovideo. These URLs grant live access to the
 terminal and must be treated as secrets.
 
-The uploader sends the **whole file** for every snapshot, including active
-sessions. The receiver should treat the upload as a snapshot and replace the
-stored log for `hostname/username/session` atomically.
+The uploader sends the **whole file** for a finished log and for an active
+snapshot whose file pointer does not match the receiver's stored size. When the
+pointer matches, an active snapshot sends only the bytes after it. The receiver
+treats the upload as a snapshot and replaces the stored log for
+`hostname/username/session` atomically.
 
 ### 4. End and confirmation
 
@@ -351,8 +399,10 @@ open after a stream is confirmed and closes it when shutting down.
 
 | Reply                                          | Meaning                                 |
 |------------------------------------------------|-----------------------------------------|
+| `{"type":"state","id":N,...,"synced":true}`    | announce matches; stream is done, no data |
 | `{"type":"state","id":N,...}`                  | reply to an announce, see above         |
-| `{"type":"ok","id":N}`                         | stored / in sync; uploader marks uploaded|
+| `{"type":"ok","id":N}`                         | stored; uploader marks uploaded          |
+| (no reply for a non-verbose append)            | pointer honored; tail is appended       |
 | `{"type":"error","id":N,...,"retryable":false}`| rejected; dropped, no retry             |
 | `{"type":"error","id":N,...}` / dropped socket | that stream is retried with backoff     |
 | `{"type":"error",...}` without `id`            | whole connection failed, all streams retried |
@@ -428,6 +478,7 @@ by reading the 4 byte stream id prefix:
 ```js
 const { WebSocketServer } = require('ws');
 const wss = new WebSocketServer({ port: 9023, maxPayload: 256 * 1024 });
+const verbose = false; // upload_append_verbose: verbose answers, append is always on
 
 wss.on('connection', (ws) => {
   const streams = new Map(); // id -> { meta, received }
@@ -442,20 +493,48 @@ wss.on('connection', (ws) => {
     }
     const message = JSON.parse(data.toString());
     if (message.type === 'upload') {
-      streams.set(message.id, { meta: message, received: 0 });
-      const current = lookup(message); // stored size/sha256 or null
-      ws.send(JSON.stringify(current
-        ? { type: 'state', id: message.id, exists: true,
-            size: current.size, sha256: current.sha256 }
-        : { type: 'state', id: message.id, exists: false }));
+      const offset = Number.isInteger(message.offset) ? message.offset : 0;
+      streams.set(message.id, { meta: message, offset, received: 0,
+        append: false, storedSize: 0 });
+      const current = lookup(message); // stored size/sha256/finished or null
+      const same = current
+        && current.size === message.size
+        && current.sha256 === message.sha256
+        && !(message.finished === true && current.finished !== true);
+      const append = current && !same && current.size === offset && offset > 0
+        && message.finished === false && current.finished === false;
+      if (same) {
+        streams.delete(message.id); // in sync: no data, no second roundtrip
+        ws.send(JSON.stringify({ type: 'state', id: message.id, exists: true,
+          size: current.size, sha256: current.sha256,
+          finished: current.finished, synced: true }));
+      } else if (append) {
+        streams.get(message.id).append = true;
+        streams.get(message.id).storedSize = current.size;
+        if (verbose) { // confirm; the default stays silent and appends on end
+          ws.send(JSON.stringify({ type: 'state', id: message.id, exists: true,
+            size: current.size, sha256: current.sha256,
+            finished: current.finished }));
+        }
+      } else if (current) {
+        ws.send(JSON.stringify({ type: 'state', id: message.id, exists: true,
+          size: current.size, sha256: current.sha256,
+          finished: current.finished }));
+      } else {
+        ws.send(JSON.stringify({ type: 'state', id: message.id,
+          exists: false }));
+      }
     } else if (message.type === 'synced') {
-      ws.send(JSON.stringify({ type: 'ok', id: message.id }));
+      ws.send(JSON.stringify({ type: 'ok', id: message.id })); // legacy
     } else if (message.type === 'corrupt') {
       markCorrupt(message); // rename stored file to .corrupt, clear metadata
+      resetTemp(message.id); // discard any go-wrong tail, restart full
     } else if (message.type === 'replace') {
-      // next data/end replaces the stored snapshot in place
+      resetTemp(message.id); // discard any go-wrong tail, restart full
     } else if (message.type === 'end') {
-      // verify size/sha256, move the temp file in place, store size/sha256
+      // append: seed the stored prefix, append the tail, verify the full
+      // sha256. A short full-mode tail or a stale append is reported as a
+      // go-wrong size and the stream is kept for the following replace.
       ws.send(JSON.stringify({ type: 'ok', id: message.id }));
     }
   });
@@ -472,17 +551,19 @@ wss.on('connection', (ws) => {
 - [ ] Validate `username` and `session` before using them in paths.
 - [ ] Handle `synced` (reply `ok`), `replace` (overwrite) and `corrupt`
       (move stored file to `.corrupt`).
+- [ ] Append by default when the announced `offset` equals the stored size (seed
+      the prefix, append the tail); report a go-wrong size when it differs, when
+      nothing is stored, and when an append prefix is stale, so the uploader
+      re-sends in full. Stay silent for a normal append unless
+      `upload_append_verbose`. Verify the full SHA-256 on `end`.
 - [ ] Atomically replace the stored log (temp file + rename).
 - [ ] Store metadata (including SHA-256) and expose it for inspection.
 - [ ] Configure retention and maximum body size.
 - [ ] Log uploads without leaking hostkeys or session content.
-- [ ] Optional: incremental log upload using `offset` to save bandwidth.
 - [ ] Optional: endpoint to list and download sessions for restore.
 
 ## Future work
 
-- Incremental log uploads: send only bytes after the last acknowledged offset,
-  with `offset` in the request and append semantics on the server.
 - Compression (per-message deflate) for large logs.
 - Signed uploads (HMAC of the announce message and file with `hostkey`) instead
   of sending the hostkey on every connection.

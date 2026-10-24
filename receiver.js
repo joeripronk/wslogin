@@ -50,6 +50,8 @@ var dataDir = path.resolve(__dirname,
   config.receiver_data_dir || 'uploads');
 var maxSize = Math.max(0, configInt('receiver_max_size', DEFAULT_MAX_SIZE));
 var requireHostkey = configBool('receiver_require_hostkey', false);
+var debug = configBool('receiver_debug', false);
+var verbose = configBool('upload_append_verbose', false);
 var storeTemplate = config.receiver_store_template
   ? String(config.receiver_store_template)
   : DEFAULT_STORE_TEMPLATE;
@@ -182,6 +184,12 @@ function validate(message) {
   }
   if (message.finished != null && typeof message.finished != 'boolean') {
     return 'bad finished';
+  }
+  if (message.offset != null
+      && (!Number.isInteger(message.offset)
+        || message.offset < 0
+        || message.offset > message.size)) {
+    return 'bad offset';
   }
   if (message.hostkey != null
       && (typeof message.hostkey != 'string'
@@ -332,6 +340,12 @@ function send(conn, message) {
   }
 }
 
+// High-volume per-stream lines (state replies, stored, in sync) are only shown
+// when receiver_debug is on.
+function debugLog(message) {
+  if (debug) console.log(message);
+}
+
 function fail(conn, stream, reason) {
   var id = stream ? stream.meta.id : null;
   console.log('error for stream ' + id + ': ' + reason);
@@ -371,7 +385,11 @@ function handleAnnounce(conn, message) {
         ? Number(message.startdate) : Date.now() / 1000,
       finished: message.finished === true
     },
+    offset: Number.isInteger(message.offset) && message.offset > 0
+      ? message.offset : 0,
+    storedSize: 0,
     phase: 'announced',
+    mode: null,
     received: 0,
     hash: crypto.createHash('sha256'),
     fd: null,
@@ -394,15 +412,51 @@ function handleAnnounce(conn, message) {
 
   var found = findStored(stream.meta);
   if (found) {
+    stream.storedSize = found.stored.size;
+    // The announce carries the size and hash the uploader wants to send, so a
+    // full match is confirmed in this single reply and no data is transferred.
+    var same = found.stored.size === stream.meta.size
+      && found.stored.sha256 === stream.meta.sha256
+      && !(stream.meta.finished === true && found.finished !== true);
+    if (same) {
+      conn.streams.delete(message.id);
+      send(conn, {type: 'state', id: message.id, exists: true,
+        size: found.stored.size, sha256: found.stored.sha256,
+        finished: found.finished, synced: true});
+      debugLog('state for ' + message.hostname + '/' + message.username + '/'
+        + message.session + ': in sync');
+      return;
+    }
+    // The uploader announced a file pointer (offset): the bytes it believes we
+    // already hold. When our stored size equals it, the uploader sends only the
+    // tail and we append it to the stored prefix. Append is the default and
+    // needs no confirmation: in non-verbose mode we stay silent and only react
+    // on end. A stored size that differs from the pointer is the go-wrong
+    // signal, so we report our real size and the uploader uploads in full.
+    var append = stream.meta.finished === false
+      && found.finished === false
+      && stream.offset > 0
+      && found.stored.size === stream.offset;
+    if (append) {
+      stream.mode = 'append';
+      if (!verbose) {
+        debugLog('state for ' + message.hostname + '/' + message.username + '/'
+          + message.session + ': append at ' + found.stored.size + ' bytes');
+        return;
+      }
+    }
     send(conn, {type: 'state', id: message.id, exists: true,
       size: found.stored.size, sha256: found.stored.sha256,
       finished: found.finished});
-    console.log('state for ' + message.hostname + '/' + message.username + '/'
-      + message.session + ': exists (' + found.stored.size + ' bytes'
-      + (found.finished ? ', finished' : ', active') + ')');
+    var label = append
+      ? 'append at ' + found.stored.size + ' bytes'
+      : 'exists (' + found.stored.size + ' bytes'
+        + (found.finished ? ', finished)' : ', active)');
+    debugLog('state for ' + message.hostname + '/' + message.username + '/'
+      + message.session + ': ' + label);
   } else {
     send(conn, {type: 'state', id: message.id, exists: false});
-    console.log('state for ' + message.hostname + '/' + message.username + '/'
+    debugLog('state for ' + message.hostname + '/' + message.username + '/'
       + message.session + ': empty');
   }
 }
@@ -411,6 +465,25 @@ function openTemp(stream) {
   stream.tmpPath = stream.paths.file + '.tmp.' + process.pid + '.'
     + stream.meta.id;
   stream.fd = fs.openSync(stream.tmpPath, 'w');
+  // An append continues the stored prefix: copy it into the temporary file and
+  // hash it, so the appended tail forms the complete file that is verified
+  // against the announced sha256. The prefix is streamed to keep memory flat.
+  if (stream.mode == 'append') {
+    var inFd = fs.openSync(stream.paths.file, 'r');
+    try {
+      var buffer = Buffer.alloc(64 * 1024);
+      var read;
+      while ((read = fs.readSync(inFd, buffer, 0, buffer.length, null)) > 0) {
+        fs.writeSync(stream.fd, buffer, 0, read);
+        stream.hash.update(buffer.subarray(0, read));
+        stream.received += read;
+      }
+    } catch (error) {
+      try { fs.closeSync(inFd); } catch (ignored) {}
+      throw error;
+    }
+    fs.closeSync(inFd);
+  }
 }
 
 function handleData(conn, stream, data) {
@@ -431,12 +504,28 @@ function handleData(conn, stream, data) {
 }
 
 function handleEnd(conn, stream) {
+  var digest = stream.hash.digest('hex');
+  var append = stream.mode == 'append';
+  // A full-mode tail we could not append (pointer not honored), or an append
+  // whose prefix turned out stale, is reported as go-wrong: we send our real
+  // size and keep the stream so the following replace resets it for a full
+  // upload.
+  if ((append && digest != stream.meta.sha256)
+      || (!append && stream.received < stream.meta.size)) {
+    send(conn, {type: 'state', id: stream.meta.id, exists: true,
+      size: stream.storedSize, sha256: stream.meta.sha256,
+      finished: stream.meta.finished});
+    resetForReplace(stream);
+    debugLog('report size for ' + stream.meta.hostname + '/'
+      + stream.meta.username + '/' + stream.meta.session + ': '
+      + stream.storedSize + ' bytes');
+    return;
+  }
   if (stream.received != stream.meta.size) {
     fail(conn, stream, 'size mismatch, received ' + stream.received
       + ' of ' + stream.meta.size);
     return;
   }
-  var digest = stream.hash.digest('hex');
   if (digest != stream.meta.sha256) {
     fail(conn, stream, 'sha256 mismatch');
     return;
@@ -478,7 +567,7 @@ function handleEnd(conn, stream) {
   }
   conn.streams.delete(stream.meta.id);
   send(conn, {type: 'ok', id: stream.meta.id});
-  console.log('stored ' + stream.meta.hostname + '/' + stream.meta.username
+  debugLog('stored ' + stream.meta.hostname + '/' + stream.meta.username
     + '/' + stream.meta.session + ' (' + stream.meta.size + ' bytes)');
 }
 
@@ -494,8 +583,25 @@ function handleSynced(conn, stream) {
   }
   conn.streams.delete(stream.meta.id);
   send(conn, {type: 'ok', id: stream.meta.id});
-  console.log('in sync ' + stream.meta.hostname + '/' + stream.meta.username
+  debugLog('in sync ' + stream.meta.hostname + '/' + stream.meta.username
     + '/' + stream.meta.session);
+}
+
+// A replace/corrupt after a go-wrong tail: discard the partial temporary file
+// the tail was written to and restart the stream as a clean full upload.
+function resetForReplace(stream) {
+  if (stream.fd != null) {
+    try { fs.closeSync(stream.fd); } catch (error) {}
+    stream.fd = null;
+  }
+  if (stream.tmpPath) {
+    try { fs.rmSync(stream.tmpPath, {force: true}); } catch (error) {}
+    stream.tmpPath = null;
+  }
+  stream.mode = null;
+  stream.received = 0;
+  stream.hash = crypto.createHash('sha256');
+  stream.phase = 'data';
 }
 
 function handleCorrupt(conn, stream) {
@@ -505,7 +611,7 @@ function handleCorrupt(conn, stream) {
     fail(conn, stream, 'cannot mark corrupt: ' + error.message);
     return;
   }
-  stream.phase = 'data';
+  resetForReplace(stream);
 }
 
 function handleText(conn, raw) {
@@ -527,7 +633,7 @@ function handleText(conn, raw) {
   switch (message.type) {
     case 'synced': handleSynced(conn, stream); break;
     case 'corrupt': handleCorrupt(conn, stream); break;
-    case 'replace': stream.phase = 'data'; break;
+    case 'replace': resetForReplace(stream); break;
     case 'end': handleEnd(conn, stream); break;
     default: break;
   }

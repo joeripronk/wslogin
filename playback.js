@@ -157,10 +157,10 @@ function parseRecord(line) {
 }
 
 function applyRecord(terminal, record) {
-  if (!record || typeof record != 'object') return;
+  if (!record || typeof record != 'object') return false;
   if (record.c === 1 && typeof record.d == 'string') {
     terminal.write(record.d);
-    return;
+    return false;
   }
   if (record.c === 0 && typeof record.d == 'string') {
     try {
@@ -169,9 +169,11 @@ function applyRecord(terminal, record) {
           && Number.isInteger(command.cols) && Number.isInteger(command.rows)
           && command.cols > 0 && command.rows > 0) {
         terminal.resize(command.cols, command.rows);
+        return true;
       }
     } catch (error) {}
   }
+  return false;
 }
 
 /**
@@ -610,6 +612,10 @@ function titleDescription(titles, lastTitle) {
     terminal.loadAddon(serialize);
     var lastCheckpointOffset = 0;
     var lastCheckpointTime = null;
+    // The replay terminal starts at the 80x24 default. Serializing a checkpoint
+    // before the session's first resize record wraps wide output at 80 columns
+    // and corrupts the lines, so only checkpoint once the real size is known.
+    var seenResize = false;
     var final = isFinishedFile(file);
     data.checkpoints = [];
     data.startdate = null;
@@ -640,12 +646,12 @@ function titleDescription(titles, lastTitle) {
         data.activityPasswordPrompt = false;
         data.activityPromptTail = '';
       }
-      applyRecord(terminal, record);
+      if (applyRecord(terminal, record)) seenResize = true;
       var dueByTime = Number.isFinite(record.t)
         && (lastCheckpointTime == null
           || (record.t - lastCheckpointTime) * 1000 >= checkpointIntervalMs);
       var dueByBytes = next - lastCheckpointOffset >= checkpointBytes;
-      if (dueByTime || dueByBytes) {
+      if ((dueByTime || dueByBytes) && seenResize) {
         await flushTerminal(terminal);
         var t = Number.isFinite(record.t) ? record.t : data.lastT;
         if (t != null) {
@@ -692,6 +698,9 @@ function titleDescription(titles, lastTitle) {
     var last = checkpoints.length ? checkpoints[checkpoints.length - 1] : null;
     var lastCheckpointOffset = last ? last.offset : restored.offset;
     var lastCheckpointTime = last ? last.t : null;
+    // The restored terminal is already at the session's real size (from the
+    // tail or a checkpoint), so appends can checkpoint right away.
+    var seenResize = true;
     var final = isFinishedFile(file);
     data.offset = restored.offset;
     data.activity = ensureActivity(data.activity);
@@ -724,12 +733,12 @@ function titleDescription(titles, lastTitle) {
           data.activityPasswordPrompt = false;
           data.activityPromptTail = '';
         }
-        applyRecord(terminal, record);
+        if (applyRecord(terminal, record)) seenResize = true;
         var dueByTime = Number.isFinite(record.t)
           && (lastCheckpointTime == null
             || (record.t - lastCheckpointTime) * 1000 >= checkpointIntervalMs);
         var dueByBytes = next - lastCheckpointOffset >= checkpointBytes;
-        if (dueByTime || dueByBytes) {
+        if ((dueByTime || dueByBytes) && seenResize) {
           await flushTerminal(terminal);
           var t = Number.isFinite(record.t) ? record.t : data.lastT;
           if (t != null) {
@@ -1119,9 +1128,11 @@ function titleDescription(titles, lastTitle) {
     return false;
   }
 
-  // Authentication for the API: auth server session cookie (auth.ini),
-  // login page session cookie. No HTTP Basic: the viewer redirects to
-  // the login page on 401.
+  // Authentication for the API: login page session cookie first, then the
+  // auth server session cookie (auth.ini). SSO is only used when there is no
+  // valid session cookie; a successful sso login issues a session cookie so
+  // later requests authenticate via the cookie and not sso again. Resolves to
+  // true (already authed), a Set-Cookie value (sso login, set it), or false.
   function checkAuth(request) {
     if (!authRequired) return Promise.resolve(true);
     if (checkLoginCookie(request)) return Promise.resolve(true);
@@ -1129,7 +1140,11 @@ function titleDescription(titles, lastTitle) {
     return new Promise(function(resolve) {
       try {
         sso.user(request, function(username) {
-          resolve(!!username);
+          if (!username) {
+            resolve(false);
+            return;
+          }
+          resolve(createLoginSession(username, false));
         });
       } catch (error) {
         resolve(false);
@@ -1412,7 +1427,11 @@ function titleDescription(titles, lastTitle) {
       return;
     }
     var authenticated = await checkAuth(request);
-    if (!authenticated) {
+    if (typeof authenticated == 'string') {
+      // sso login succeeded: issue the session cookie so the next request
+      // authenticates via the cookie instead of running sso again.
+      response.setHeader('Set-Cookie', authenticated);
+    } else if (authenticated !== true) {
       rejectAuth(response);
       return;
     }
