@@ -331,7 +331,9 @@ function resume_session(meta) {
 // connection index counter; connections are reachable through the sessions
 // maps, no global list is kept, so closed clients do not accumulate
 var nextIndex = 0;
-// failed login tracking, ip -> {count, first, blocked_until}
+// failed login tracking, ip -> {count, first, blocked_until}. Attempts are
+// counted when they arrive, not when PAM answers, so parallel floods are
+// bound by the same limit; a success clears the counter.
 var logins = {};
 var login_max_attempts = configInt('login_max_attempts', 5);
 var login_window_seconds = configInt('login_window_seconds', 300);
@@ -343,7 +345,7 @@ function loginBlockSeconds(ip) {
   if (left <= 0) { delete logins[ip]; return 0; }
   return left;
 }
-function loginFailed(ip) {
+function loginAttempt(ip) {
   var t = now();
   var a = logins[ip];
   if (!a || t - a.first > login_window_seconds) a = {count:0, first:t};
@@ -351,7 +353,7 @@ function loginFailed(ip) {
   if (login_max_attempts > 0 && a.count > login_max_attempts) {
     a.blocked_until = t + login_block_seconds;
     console.log("login blocked for "+ip+" for "+login_block_seconds
-      +"s after "+a.count+" failed attempts");
+      +"s after "+a.count+" login attempts");
   }
   logins[ip] = a;
 }
@@ -1096,11 +1098,11 @@ var wsServer = new webSocketServer({
   httpServer: httpsServer ? (allow_http ? [httpServer, httpsServer] : httpsServer) : httpServer,
   autoAcceptConnections: false
 });
-// Origins allowed to run websocket clients, from config.origin
+// Origins allowed to run websocket clients, from config.allowed_origin
 // (comma separated). A missing Origin header (non-browser clients) is
 // always allowed; with no configured allowlist all origins are allowed.
-var allowed_origins = 'origin' in config
-  ? String(config.origin).split(',').map(function(entry) { return entry.trim(); })
+var allowed_origins = 'allowed_origin' in config
+  ? String(config.allowed_origin).split(',').map(function(entry) { return entry.trim(); })
       .filter(function(entry) { return entry.length > 0; })
   : [];
 if (allowed_origins.length === 0) {
@@ -1130,6 +1132,24 @@ function hasValidSessionCookie(uuidcookie) {
   try {
     fs.statSync(config.cookie_dir + '/cookie_' + uuidcookie + '.json');
     return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// The username a local session cookie belongs to: cookie files are written
+// by client.js inside the session shell, so the file owner is the session
+// user. false for an unusable cookie.
+function cookieUsername(uuidcookie) {
+  if (!('cookie_dir' in config)) return false;
+  if (typeof uuidcookie != 'string' || !/^[0-9a-zA-Z-]+$/.test(uuidcookie)) {
+    return false;
+  }
+  try {
+    var stat = fs.statSync(config.cookie_dir + '/cookie_' + uuidcookie + '.json');
+    if (!('uid' in stat)) return false;
+    var name = userid.username(stat.uid);
+    return (name && name != 'root') ? name : false;
   } catch (error) {
     return false;
   }
@@ -1647,10 +1667,14 @@ wsServer.on('request', function(request) {
                 if (!connection.viewonly) {
                   if (m.reconnect && m.reconnect in reconnects) {
                     var r=reconnects[m.reconnect];
-                    // bind the token to the authenticated peer: a stolen
-                    // reconnect token cannot take over another user's session
-                    if (connection.peer && r.username && connection.peer != r.username) {
-                      console.log("reconnect "+m.reconnect+" rejected: peer "+connection.peer+" is not "+r.username);
+                    // bind the reconnect token to the owning identity: an
+                    // authenticated peer must match the session owner, and a
+                    // client presenting a local session cookie must own that
+                    // cookie; a client with neither identity is accepted on
+                    // token possession alone
+                    var owner = connection.peer || cookieUsername(uuidcookie);
+                    if (owner && r.username && owner != r.username) {
+                      console.log("reconnect "+m.reconnect+" rejected: peer "+owner+" is not "+r.username);
                       connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
                       break;
                     }
@@ -1683,8 +1707,9 @@ wsServer.on('request', function(request) {
                 if (!connection.viewonly && !connection.loggedin
                     && m.reconnect && m.reconnect in reconnects) {
                   var pick=reconnects[m.reconnect];
+                  var pickOwner = connection.peer || cookieUsername(uuidcookie);
                   if (pick.username && !pick.stale && pick.username in sessions
-                      && (!connection.peer || connection.peer == pick.username)
+                      && (!pickOwner || pickOwner == pick.username)
                       && pick.sessioncookie in sessions[pick.username]
                       && sessions[pick.username][pick.sessioncookie].pty
                       && sessions[pick.username][pick.sessioncookie].pty.main === false) {
@@ -1757,9 +1782,9 @@ wsServer.on('request', function(request) {
                       connection.sendUTF('\0' + JSON.stringify({cmd:"authfailed"}));
                       break;
                     }
+                    loginAttempt(clientIp);
                     pam.authenticate(m.username, m.password, function(err) {
                       if(err) {
-                        loginFailed(clientIp);
                         sendError(connection,err);
                         var cmd={cmd:"authfailed"};
                         connection.sendUTF('\0' + JSON.stringify(cmd));
