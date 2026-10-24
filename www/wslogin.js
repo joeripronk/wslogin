@@ -255,7 +255,7 @@ term.onData(function (data) {
 window.addEventListener(
   'mouseup',
   (e) => {
-    if (e.which==1 && middle_button_helper) {
+    if (e.which==1 && (middle_button_helper || e.shiftKey)) {
       if (term.hasSelection() && term.getSelection().length>1) {
         copyToClipboard(term.getSelection());
         term.focus();
@@ -318,15 +318,16 @@ function sendMouse(e,b) {
   // mouseup handler copies the selection, like in a plain shell
   if (e.shiftKey) return;
   var cell=mouseCell(e);
-  if (!cell) return;
-  if (b==1 && e.button==0) dragStart=cell;
+  if (b==1 && e.button==0) dragStart=cell||false;
   if (b==2 && e.button==0 && dragStart) {
-    if (cell.x!=dragStart.x || cell.y!=dragStart.y) {
-      var t=dragText(dragStart,cell);
-      if (t.length>1) copyToClipboard(t);
-    }
+    var start=dragStart;
     dragStart=false;
+    if (cell && (cell.x!=start.x || cell.y!=start.y)) {
+      var t=dragText(start,cell);
+      if (t.length>0) { copyToClipboard(t); term.clearSelection(); }
+    }
   }
+  if (!cell) return;
   var now=Date.now();
   if (b==0) {
     if (cell.x==lastMouseSent.x&&cell.y==lastMouseSent.y) return;
