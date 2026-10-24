@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>login:</title>
+<link rel="icon" href="./favicon.png">
+<link rel="stylesheet" href="./style.css">
+<link rel="stylesheet" href="./login.css">
+<style>
+body.login-body {
+  --login-border: var(--border);
+  --login-input-border: var(--border);
+  --login-input-bg: var(--bg);
+  --login-text: var(--text);
+  --login-button-bg: var(--accent);
+  --login-button-text: #06121d;
+  --login-footer-bg: var(--panel-2);
+  --login-error: var(--danger);
+}
+</style>
+</head>
+<body class="login-body">
+  <div id="loginpage">
+    <h1>Session playback</h1>
+    <div id="loginform"></div>
+  </div>
+<script src="./login.js"></script>
+<script>
+(function() {
+  var params = new URLSearchParams(location.search);
+  var next = params.get('next') || '/';
+  if (next.charAt(0) != '/' || next.substring(0, 2) == '//') next = '/';
+  LoginForm.mount(document.getElementById('loginform'),
+    function(username, password, remember) {
+      fetch('/api/playback/login', {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({username: username, password: password,
+          remember: remember})
+      }).then(function(response) {
+        if (response.ok) {
+          location.replace(next);
+          return null;
+        }
+        return response.json().catch(function() { return {}; });
+      }).then(function(data) {
+        if (data === null) return;
+        LoginForm.fail(data && data.error ? data.error
+          : 'Authentication failed');
+      }).catch(function() {
+        LoginForm.fail('Login failed');
+      });
+    });
+  LoginForm.status('please login');
+  LoginForm.focus();
+})();
+</script>
+</body>
+</html>

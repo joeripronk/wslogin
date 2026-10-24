@@ -49,7 +49,7 @@ if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
 fi
 
 echo "Installing dependencies"
-(cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund)
+(cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund --legacy-peer-deps)
 
 if [[ -r "${AUTH_CONF:-/etc/apache2/auth.conf}" ]]; then
   AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" \

@@ -2,6 +2,8 @@ var viewonly=false;
 var shared=false;
 var shareid=false;
 var viewid=false;
+var personalized=false;
+var scaling=true;
 var snackshowtimeout=false;
 var snackhidetimeout=false;
 var middle_button_helper= getOS()!='Linux'
@@ -34,6 +36,13 @@ function getOS() {
 
 function copyToClipboard(text) {
   showsnack("copied "+text+" to the clipboard");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(function() { legacyCopy(text); });
+    return true;
+  }
+  return legacyCopy(text);
+}
+function legacyCopy(text) {
   if (window.clipboardData && window.clipboardData.setData) {
     // IE specific code path to prevent textarea being shown while dialog is visible.
     return clipboardData.setData("Text", text); 
@@ -61,10 +70,19 @@ function updatemenu() {
   //  if (shareid) text+="<li><a href='"+window.location.href+"#share="+shareid+"' target=_new>shared link</a></li>";
   if (viewid) text+="<li><div onclick=\"copyToClipboard('"+ window.location.href+"#view="+viewid+"')\">copy viewonly link</div></li>";
   if (shareid) text+="<li><div onclick=\"copyToClipboard('"+ window.location.href+"#share="+shareid+"')\">copy shared link</div></li>";
+  var personalAttr = personalized ? "onclick=\"createPersonalLink('view')\"" : "class=disabled";
+  var personalShareAttr = personalized ? "onclick=\"createPersonalLink('share')\"" : "class=disabled";
+  if (viewid) text+="<li><div "+personalAttr+">personalized viewonly link</div></li>";
+  if (shareid) text+="<li><div "+personalShareAttr+">personalized shared link</div></li>";
+  if (viewonly||shared) text+="<li><div onclick=\"toggleScaling()\">"+(scaling?"no scaling":"scale to window")+"</div></li>";
   text+="<li>Close menu</li>";
   text+="</ul>";
   menudiv.innerHTML=text;
   document.getElementById("fullscreen").oncontextmenu = function(e) {showmenu(e)};
+}
+function clearFormstatus() {
+  var formstatus=document.getElementById('formstatus');
+  if (formstatus) formstatus.innerHTML="";
 }
 function showsnack(text) {
   var x = document.getElementById("snackbar");
@@ -100,6 +118,36 @@ function setShareid(id){
   shareid=id;
   updatemenu();
 }
+function toggleScaling() {
+  scaling=!scaling;
+  applyScaling();
+  updatemenu();
+  showsnack(scaling?"Scaling to window":"Scaling disabled");
+}
+function applyScaling() {
+  if (!term.element) return;
+  if (!(viewonly||shared) || !scaling) {
+    term.element.style.transform="";
+    term.element.style.transformOrigin="";
+    return;
+  }
+  var availw=terminaldiv.clientWidth, availh=terminaldiv.clientHeight;
+  var elw=term.element.offsetWidth, elh=term.element.offsetHeight;
+  if (!(availw>0)||!(availh>0)||!(elw>0)||!(elh>0)) return;
+  var s=Math.min(availw/elw,availh/elh);
+  if (!isFinite(s)||s<=0) return;
+  term.element.style.transformOrigin="0 0";
+  term.element.style.transform="scale("+s+")";
+}
+function createPersonalLink(mode){
+  if (!authenticated || viewonly || shared) return;
+  if (!socket || socket.readyState!=1) return;
+  var user = prompt("Username for the personalized "+mode+" link:");
+  if (user===null) return;
+  user = user.trim();
+  if (!user) { showsnack("No username given"); return; }
+  socket.send('\0' + JSON.stringify({cmd:'grant', grant:mode, user:user}));
+}
 function showhidemenu() {
   if (menudiv.style.display=="block") {
     menudiv.style.display="none";
@@ -119,18 +167,8 @@ if (window.location.hash.substr(1,5) == 'view=') {
 if (window.location.hash.substr(1,6) == 'share=') {
   shared=true;
 }
+if (viewonly || shared) updatemenu();
 var authenticated=false;
-var options = {
-  scrollback: 10000,
-  cursorBlink: true,
-  fontSize: 14,
-  lineHeight: 1,
-  theme: {
-    background: '#2d0922',
-    foreground: '#fbf9f4'
-  },
-  convertEol: false
-};
 var connected = false;
 var terminaldiv=document.getElementById('terminal');
 window.addEventListener("beforeunload", function(e){
@@ -241,6 +279,12 @@ var loginform = document.getElementById('loginform');
 term.open(document.getElementById('terminal'));
 //      term.loadAddon(attachAddon); 
 term.loadAddon(fitAddon);
+// The DOM renderer lays out glyphs in CSS line boxes, whose leading shows
+// up as small gaps between rows. The canvas renderer draws glyphs at exact
+// row positions and is seamless in all browsers.
+if (window.CanvasAddon) {
+  try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (e) {}
+}
 var lastMouseSent={x:-1,y:-1,t:0};
 function mouseCell(e) {
   if (!term.element) return null;
@@ -276,7 +320,9 @@ function resizeScreen () {
     // Viewonly and shared clients mirror the size of the session they
     // watch. They must not resize the pty (that would garble the screen
     // of the owner) and must not resize the local terminal (that would
-    // garble their own screen).
+    // garble their own screen). They scale the rendered grid to fit
+    // the window instead (see applyScaling / the menu toggle).
+    applyScaling();
     return;
   }
   var dims=fitAddon.proposeDimensions();
@@ -322,29 +368,26 @@ function setReconnectToken(token) {
     else sessionStorage.removeItem('wslogin.reconnect');
   } catch(e) {}
 }
-function showLoginForm() {
-  var formstatus=document.getElementById('formstatus');
-  var usernameinput=document.getElementById('username');
+var loginform = document.getElementById('loginform');
+var loginMounted = false;
+function wsloginSubmit(username, password, remember) {
+  terminaldiv.style.display="block";
+  resizeScreen();
   terminaldiv.style.display="none";
-  formstatus.innerHTML="please login";
+  if (!socket || socket.readyState!=1) return false;
+  cmd={cmd:'login',username:username,password:password,rememberme:remember,cols:term.cols,rows:term.rows}
+  socket.send('\0' + JSON.stringify(cmd));
+  return true;
+}
+function showLoginForm() {
+  terminaldiv.style.display="none";
   loginform.style.display="block";
-  usernameinput.focus();
-  loginform.onsubmit=function (event) {
-    event.preventDefault();
-    // TODO: properly disable double submit
-    //  loginform.onsubmit=function (event) { event.preventDefault(); return false; };
-    var username=document.getElementById('username');
-    var password=document.getElementById('password');
-    terminaldiv.style.display="block";
-    resizeScreen();
-    terminaldiv.style.display="none";
-    if (!socket || socket.readyState!=1) return false;
-    cmd={cmd:'login',username:username.value,password:password.value,rememberme:rememberme.value,cols:term.cols,rows:term.rows}
-    socket.send('\0' + JSON.stringify(cmd));
-    var formstatus=document.getElementById('formstatus');
-    formstatus.innerHTML="Authenticating";
-    return false;
-  };
+  if (!loginMounted) {
+    LoginForm.mount(loginform, wsloginSubmit);
+    loginMounted = true;
+  }
+  LoginForm.status("please login");
+  LoginForm.focus();
 }
 function shouldReconnect() {
   return !sessionEnded && (viewonly || shared || authenticated || !!reconnectToken);
@@ -384,15 +427,18 @@ function onopen(connection) {
   connected=true;
   //console.log('connection opened');
   resizeScreen();
+  // Report our window size right away. On sso auto-login the server
+  // spawns the pty as soon as pam verification finishes, and this
+  // command usually arrives first, so the pty starts at the right size.
+  if (socket && socket.readyState==1) socket.send('\0' + JSON.stringify({cmd:'size',cols:term.cols,rows:term.rows}));
   window.addEventListener('resize', scheduleResize, false);
 }
 function connect() {
   if (socket && (socket.readyState==0 || socket.readyState==1)) return;
-  if (window.location.protocol == 'https:') {
-    socket = new WebSocket('wss://'+window.location.host+window.location.pathname+'pty');
-  } else {
-    socket = new WebSocket('ws://'+window.location.host+window.location.pathname+'pty');
-  }
+  var proto = window.location.protocol == 'https:' ? 'wss://' : 'ws://';
+  var live = viewonly ? '?view=' + window.location.hash.substr(6)
+           : (shared ? '?share=' + window.location.hash.substr(7) : '');
+  socket = new WebSocket(proto + window.location.host + window.location.pathname + 'pty' + live);
   socket.onopen=onopen;
   socket.onclose=onclose;
   socket.onerror=function(){};
@@ -447,23 +493,23 @@ function onmessage(message) {
           if (!viewonly) authenticated=true;
           document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
-          var formstatus=document.getElementById('formstatus');
-          formstatus.innerHTML="";
+          clearFormstatus();
           loginform.style.display="none";
           term.focus();
           setTimeout(function () {term.scrollToBottom();},200);
+          if (viewonly||shared) applyScaling();
           break;;
         case 'reconnected':
           sessionEnded=false;
           reconnectAttempts=0;
           authenticated=true;
           if ('reconnect' in json) setReconnectToken(json.reconnect);
+          personalized = json.personalized === true;
           if ('viewid' in json) setViewid(json.viewid);
           if ('shareid' in json) setShareid(json.shareid);
           document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
-          var formstatus=document.getElementById('formstatus');
-          formstatus.innerHTML="";
+          clearFormstatus();
           loginform.style.display="none";
           terminaldiv.style.display="block";
           term.refresh(0,term.rows-1);
@@ -476,14 +522,18 @@ function onmessage(message) {
           reconnectAttempts=0;
           authenticated=true;
           if ('reconnect' in json) setReconnectToken(json.reconnect);
+          personalized = json.personalized === true;
           if ('viewid' in json) setViewid(json.viewid);
           if ('shareid' in json) setShareid(json.shareid);
           document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
           term.reset();
+          // term.reset() resets the canvas renderer's measured cell size to
+          // the default geometry, which would make the next fit propose
+          // wrong dimensions; force it to remeasure for the current size.
+          term.resize(term.cols, term.rows);
           term.refresh(0,term.rows-1);
-          var formstatus=document.getElementById('formstatus');
-          formstatus.innerHTML="";
+          clearFormstatus();
           loginform.style.display="none";
           term.focus();
           resizeScreen();
@@ -500,6 +550,10 @@ function onmessage(message) {
           break;;
         case "error":
           showsnack(json.error);
+          break;;
+        case 'grantlink':
+          copyToClipboard(json.url);
+          showsnack("Personalized "+json.mode+" link copied to clipboard");
           break;;
         default: alert(data);
       }

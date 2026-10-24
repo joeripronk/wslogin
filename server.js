@@ -18,7 +18,7 @@ const { loadSslOptions, allowPlaintext } = require('./ssl');
 const { render: renderTemplate, placeholders: templatePlaceholders,
   match: matchTemplate, isSafeRelative } = require('./template');
 const { createPlayback } = require('./playback');
-const { createSsoAuth } = require('./auth');
+const { createSsoAuth, parseCookieHeader } = require('./auth');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
@@ -61,6 +61,35 @@ if (checkpoint_interval_seconds==0 && checkpoint_bytes==0) {
 }
 console.log("checkpoints: enabled="+checkpoint_enabled
   +" interval="+checkpoint_interval_seconds+"s bytes="+checkpoint_bytes);
+
+// Addresses whose X-Forwarded-For header we trust to carry the real client
+// address (reverse proxies, load balancers). Defaults to loopback.
+var trusted_ips = String('trusted_ips' in config ? config.trusted_ips : '127.0.0.1,::1')
+  .split(',')
+  .map(function(entry) { return normalizeIp(entry.trim()); })
+  .filter(function(entry) { return entry.length > 0; });
+console.log("trusted_ips="+trusted_ips.join(','));
+
+function normalizeIp(ip) {
+  if (!ip) return '';
+  ip = String(ip).trim();
+  if (ip.toLowerCase().startsWith('::ffff:')) ip = ip.slice(7);
+  return ip;
+}
+function ipIsTrusted(ip) {
+  return trusted_ips.indexOf(normalizeIp(ip)) !== -1;
+}
+// The real peer address: the X-Forwarded-For client when the socket comes
+// from a trusted proxy, otherwise the socket address itself.
+function clientIpOf(request) {
+  var remote = normalizeIp(request.remoteAddress);
+  var headers = request.headers || {};
+  if (ipIsTrusted(remote) && headers['x-forwarded-for']) {
+    var forwarded = String(headers['x-forwarded-for']).split(',')[0].trim();
+    if (forwarded) return normalizeIp(forwarded);
+  }
+  return remote;
+}
 
 function redactConfig(cfg) {
   var copy = JSON.parse(JSON.stringify(cfg));
@@ -265,6 +294,9 @@ try {
       return !!(sessions[username] && sessions[username][session]
         && sessions[username][session].pty);
     },
+    sso: {user: function(request, callback) {
+      ssoPlaybackUser(request, callback);
+    }},
     authenticate: function(username, password, callback) {
       pam.authenticate(username, password, function(error) {
         callback(error);
@@ -553,6 +585,9 @@ function sendInfo(c,msg) {
   console.log("sending info " + msg);
   c.sendUTF('\0'+JSON.stringify(cmd));
 }
+function peerLabel(connection) {
+  return connection.peer || connection.ip || 'someone';
+}
 
 /**
  * HTTP server
@@ -594,6 +629,53 @@ function serve_www(request, response, relative) {
 var ssoAuth = createSsoAuth();
 if (ssoAuth) {
   console.log("sso login enabled for cookie "+ssoAuth.cookieName);
+}
+var personalizedLinks = !!(ssoAuth && ssoAuth.linkEnabled);
+console.log("personalized links: "+(personalizedLinks?"enabled":"disabled (no linkshare_passphrase)"));
+// The username of a request with a valid auth server session cookie
+// (auth.ini) for the playback API, false when it has no usable sso
+// session. Same checks as the websocket sso login: group, root and PAM
+// verification of the password stored in the auth server session.
+function ssoPlaybackUser(request, callback) {
+  if (!ssoAuth) {
+    callback(false);
+    return;
+  }
+  var cookies = parseCookieHeader(request.headers.cookie);
+  var value = cookies[ssoAuth.cookieName];
+  if (!value) {
+    callback(false);
+    return;
+  }
+  var cred = ssoAuth.credentialsOf(value);
+  if (!cred || !cred.user || cred.user == 'root') {
+    callback(false);
+    return;
+  }
+  if (ssoAuth.ssoGroup && !userInGroup(cred.user, ssoAuth.ssoGroup)) {
+    console.log("sso user "+cred.user+" is not in group "+ssoAuth.ssoGroup);
+    callback(false);
+    return;
+  }
+  if (!ssoAuth.verifyPassword) {
+    console.log("sso login for "+cred.user+" on playback (pam verification disabled)");
+    callback(cred.user);
+    return;
+  }
+  if (!cred.password) {
+    console.log("sso session of "+cred.user+" has no stored password, pam verification impossible");
+    callback(false);
+    return;
+  }
+  pam.authenticate(cred.user, cred.password, function(error) {
+    if (error) {
+      console.log("pam verification failed for sso user "+cred.user+": "+error);
+      callback(false);
+      return;
+    }
+    console.log("sso login for "+cred.user+" on playback");
+    callback(cred.user);
+  }, {serviceName: ssoAuth.pamService});
 }
 function httpHandler(request, response) {
   var url;
@@ -794,11 +876,10 @@ wsServer.on('request', function(request) {
   if (request.origin==undefined) {
     request.origin=config.origin
   }
-  var xff=request;
-  //	['x-forwarded-for'];
+  var clientIp = clientIpOf(request);
 
   console.log('Connection['+ remote+'] from origin '
-    + request.origin );
+    + request.origin + (clientIp!=normalizeIp(remote) ? ' client '+clientIp : ''));
 
 
   // accept connection - you should check 'request.origin' to
@@ -814,12 +895,18 @@ wsServer.on('request', function(request) {
   connection.sendbuffer=[];
   connection.viewonly=false;
   connection.shared=false;
+  connection.ip=clientIp;
+  connection.peer=false;
   // we need to know client index to remove them on 'close' event
   connection.write = connection.send;
   connection.read = connection.socket.read;
+  var liveQuery = (request.resourceURL && request.resourceURL.query) || {};
+  var liveView = typeof liveQuery.view === 'string' ? liveQuery.view : null;
+  var liveShare = typeof liveQuery.share === 'string' ? liveQuery.share : null;
   var ssoCred = ssoAuth ? ssoAuth.credentialsOf(getUuidFromCookies(request.cookies,ssoAuth.cookieName)) : false;
   var ssoUser = ssoCred ? ssoCred.user : false;
-  if (ssoUser && ssoUser != 'root') {
+  connection.peer = (ssoUser && ssoUser != 'root') ? ssoUser : false;
+  if (ssoUser && ssoUser != 'root' && !liveView && !liveShare) {
     if (ssoAuth.ssoGroup && !userInGroup(ssoUser, ssoAuth.ssoGroup)) {
       console.log("sso user "+ssoUser+" is not in group "+ssoAuth.ssoGroup);
       connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
@@ -868,23 +955,22 @@ wsServer.on('request', function(request) {
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log("send replaydone to "+sessioncookie);
     } else {
-      var cmd={cmd:"reconnected",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid};
+      var cmd={cmd:"reconnected",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid,personalized:personalizedLinks};
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log("send reconnected to "+sessioncookie);
-      // force a redrwa, to fix term properties at cursor for tmux and others
+      // force a redraw, to fix term properties at cursor for tmux and others
       // currently terminal properties of the last drawn character are active
       // e.g. the green bar of tmux
-      if (rows>1 && cols >1 && (serial.cols!=cols || serial.rows != rows)) {
-        console.log("resizing reconnected to "+sessioncookie+' to '+cols+'x'+rows);
-        sessions[username][sessioncookie].pty.resize(cols,rows);
-      } else {
-        sessions[username][sessioncookie].pty.resize(serial.cols+1,serial.rows);
-        console.log("resizing "+sessioncookie+' to '+(serial.cols+1)+'x'+(serial.rows+1));
-        setTimeout(function() {
-             sessions[username][sessioncookie].pty.resize(serial.cols, serial.rows);
-             console.log("resizing back to "+sessioncookie+' to '+(serial.cols)+'x'+(serial.rows));
-          }, 30);
-       }
+      // The reconnected client is replayed at the session geometry first.
+      // The client fits its terminal to the screen and only then sends a
+      // resize if its geometry differs from the session geometry, so the
+      // stale size from the reconnect request is never applied to the pty.
+      sessions[username][sessioncookie].pty.resize(serial.cols+1,serial.rows);
+      console.log("resizing "+sessioncookie+' to '+(serial.cols+1)+'x'+(serial.rows+1));
+      setTimeout(function() {
+           sessions[username][sessioncookie].pty.resize(serial.cols, serial.rows);
+           console.log("resizing back to "+sessioncookie+' to '+(serial.cols)+'x'+(serial.rows));
+        }, 30);
     }
     while(connection.sendbuffer.length>0) {
       buf=connection.sendbuffer.shift();
@@ -924,11 +1010,11 @@ wsServer.on('request', function(request) {
           connection.paused=true;
           if(connection.viewonly) {
             console.log("view started for "+username+" "+sessioncookie);
-            sendInfo(sessions[username][sessioncookie].pty.main,"someone is viewing your session");
+            sendInfo(sessions[username][sessioncookie].pty.main,peerLabel(connection)+" is viewing your session");
 
           } else if(connection.shared) {
             console.log("sharing started for "+username+" "+sessioncookie);
-            sendInfo(sessions[username][sessioncookie].pty.main,"someone is sharing your session");
+            sendInfo(sessions[username][sessioncookie].pty.main,peerLabel(connection)+" is sharing your session");
           } else {
             sendInfo(connection,"Reconnected to your session");
             if (!requested) {
@@ -995,6 +1081,11 @@ wsServer.on('request', function(request) {
       log={t:now(),d:JSON.stringify(cmd),c:0}
       var written=append_session_log(session,log);
       queue_mirror(session,{type:'resize',cols:connection.columns,rows:connection.rows,offset:written.offset,bytes:written.bytes});
+      // Tell the client the real pty size. On sso auto-login the pty is
+      // created with the server defaults before the client reports its
+      // window, and the client only sends a resize when its own size
+      // changes; without this echo the pty would stay at the defaults.
+      connection.sendUTF('\0' + JSON.stringify(cmd));
       // connection.sendUTF('\1'+list);
       sessions[username][sessioncookie].pty.on('data', function(data) {
         var senddata=false;
@@ -1081,7 +1172,7 @@ wsServer.on('request', function(request) {
           delete sessions[connection.username];
         }     
       });
-      var cmd={cmd:"authenticated",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid};
+      var cmd={cmd:"authenticated",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid,personalized:personalizedLinks};
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log(username + " authenticated!");
     }
@@ -1089,6 +1180,52 @@ wsServer.on('request', function(request) {
     console.log("returning cookie "+sessioncookie+" file "+sessions[username][sessioncookie].pty.file);
     return sessioncookie;
 
+  }
+
+  // Attaches this connection to a running session as a viewer (mode 'view')
+  // or sharer (mode 'share'). id is either a static viewid/shareid, which
+  // only works for an authenticated peer, or a personalized link token
+  // encrypted with the linkshare_passphrase, which is its own credential.
+  function openLiveLink(mode, id) {
+    var table = mode === 'view' ? views : shares;
+    var expired = mode === 'view' ? "Your view url has expired" : "Your share url has expired";
+    if (typeof id !== 'string') { sendError(connection, expired); return; }
+    // a connection is bound to one role: a main session owner cannot attach
+    // as a viewer/sharer, and a viewer/sharer cannot switch to the other role
+    if (connection.loggedin || (connection.viewonly && mode !== 'view')
+        || (connection.shared && mode !== 'share')) {
+      sendError(connection, "This connection cannot use this "+mode+" link");
+      return;
+    }
+    if (id in table) {
+      if (!connection.peer) {
+        sendError(connection, "You must be logged in to use this "+mode+" link");
+        console.log("static "+mode+" link "+id+" rejected, peer not authenticated");
+        return;
+      }
+      var entry = table[id];
+      connection.viewonly = (mode === 'view');
+      connection.shared = (mode === 'share');
+      connection.username = entry.username;
+      connection.sessioncookie = entry.sessioncookie;
+      console.log(mode+" "+id+" started for "+connection.username+" "+connection.sessioncookie);
+      create_pty(entry.username, entry.sessioncookie, false, false, connection);
+      return;
+    }
+    var token = ssoAuth ? ssoAuth.readLink(id) : null;
+    if (token && token.m === mode && token.u in sessions
+        && token.s in sessions[token.u] && sessions[token.u][token.s].pty) {
+      connection.viewonly = (mode === 'view');
+      connection.shared = (mode === 'share');
+      connection.peer = token.t;
+      connection.username = token.u;
+      connection.sessioncookie = token.s;
+      console.log("personalized "+mode+" link for "+token.t+" started for "+token.u+" "+token.s);
+      create_pty(token.u, token.s, false, false, connection);
+      return;
+    }
+    sendError(connection, expired);
+    console.log(mode+" link does not exist (anymore)");
   }
 
   var index = clients.push(connection) - 1;
@@ -1109,6 +1246,23 @@ wsServer.on('request', function(request) {
             var log={t:now(),d:buf2,c:0};
             //console.log('write: '+JSON.stringify(log));
             switch (m.cmd) {
+              case 'size':
+                // Client-reported window size, sent on connect before the
+                // sso auto-login spawns the pty so it starts at the right
+                // size. If a pty exists already, treat it as a resize.
+                if (!connection.viewonly && Number.isInteger(m.cols) && Number.isInteger(m.rows)
+                    && m.cols > 0 && m.rows > 0) {
+                  connection.columns = m.cols;
+                  connection.rows = m.rows;
+                  if (connection.sessioncookie!=false) {
+                    var sizelog={t:now(),d:JSON.stringify({cmd:"resize",cols:m.cols,rows:m.rows}),c:0};
+                    var sizeSession=sessions[connection.username][connection.sessioncookie];
+                    sizeSession.pty.resize(m.cols,m.rows);
+                    var sizewritten=append_session_log(sizeSession,sizelog);
+                    queue_mirror(sizeSession,{type:'resize',cols:m.cols,rows:m.rows,offset:sizewritten.offset,bytes:sizewritten.bytes});
+                  }
+                }
+                break;;
               case 'resize':
                 if (!connection.viewonly) {
                   connection.columns = m.cols;
@@ -1144,28 +1298,47 @@ wsServer.on('request', function(request) {
 
                 break;;
               case 'view':
-                if (m.view in views) {
-                  connection.viewonly=true;
-                  connection.username=views[m.view].username;
-                  connection.sessioncookie=views[m.view].sessioncookie;
-                  console.log("view "+m.view+" started for "+connection.username+" "+connection.sessioncookie);
-                  create_pty(views[m.view].username,views[m.view].sessioncookie,false,false,connection);
-                } else {
-                  sendError(connection,"Your view url has expired");
-                  console.log("View "+m.viewid+" does not exist (anymore)");
-                }
+                openLiveLink('view', m.view);
                 break;;
 
               case 'share':
-                if (m.share in shares) {
-                  connection.shared=true;
-                  connection.username=shares[m.share].username;
-                  connection.sessioncookie=shares[m.share].sessioncookie;
-                  console.log("share started for "+connection.username+" "+connection.sessioncookie);
-                  create_pty(shares[m.share].username,shares[m.share].sessioncookie,false,false,connection);
-                } else {
-                  sendError(connection,"Your share url has expired");
-                  console.log("Share "+m.share+" does not exist (anymore)");
+                openLiveLink('share', m.share);
+                break;;
+
+              case 'grant':
+                if (connection.loggedin && !connection.viewonly && !connection.shared
+                    && connection.sessioncookie && connection.username in sessions
+                    && connection.sessioncookie in sessions[connection.username]
+                    && sessions[connection.username][connection.sessioncookie].pty) {
+                  var grantMode = m.grant === 'share' ? 'share' : (m.grant === 'view' ? 'view' : null);
+                  var grantUser = typeof m.user === 'string' ? m.user.trim() : '';
+                  var validName = grantUser.length <= 254 && /^[0-9a-zA-Z._-]+$/.test(grantUser);
+                  var validEmail = grantUser.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(grantUser);
+                  if (!grantMode) {
+                    sendError(connection, "Grant must be 'view' or 'share'");
+                  } else if (!grantUser || grantUser === 'root' || !(validName || validEmail)) {
+                    sendError(connection, "A valid username or email address is required for a personalized link");
+                  } else if (!ssoAuth || !ssoAuth.linkEnabled) {
+                    sendError(connection, "Personalized links are not configured");
+                  } else {
+                    var link = ssoAuth.createLink({
+                      m: grantMode,
+                      s: connection.sessioncookie,
+                      u: connection.username,
+                      t: grantUser,
+                      e: Date.now() + 7 * 24 * 3600 * 1000
+                    });
+                    if (!link) {
+                      sendError(connection, "Personalized links are not configured");
+                    } else {
+                      var grantHash = grantMode === 'view' ? 'view=' : 'share=';
+                      connection.sendUTF('\0' + JSON.stringify({
+                        cmd: 'grantlink', mode: grantMode,
+                        url: request.origin + '/#' + grantHash + encodeURIComponent(link)
+                      }));
+                      console.log("personalized "+grantMode+" link created for "+grantUser+" by "+connection.username);
+                    }
+                  }
                 }
                 break;;
 

@@ -3,36 +3,17 @@
   <head>
     <meta charset="utf-8"/>
     <meta http-equiv="Content-type" content="text/html;charset=UTF-8"/>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Ubuntu+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
     <link rel="icon" href="favicon.png">
     <link rel="stylesheet" href="xterm.css" />
     <link rel="stylesheet" href="wslogin.css" />
+    <link rel="stylesheet" href="login.css" />
     <script src="xterm.js"></script>
     <script src="xterm-addon-fit.js"></script>
+    <script src="xterm-addon-canvas.js"></script>
     <title>login:</title>
   </head>
   <body>
-    <div id="loginform">
-      <form method=post onsubmit='return false;'>
-        <div class="formcontainer">
-          <label for="uname"><b>Username</b></label>
-          <input type="text" placeholder="Enter Username" id="username" name="uname" required>
-
-          <label for="psw"><b>Password</b></label>
-          <input type="password" placeholder="Enter Password" id="password" name="psw" required>
-          </label>
-          <button type="submit">Login</button>
-          <label>
-            <input id="rememberme" type="checkbox" checked="checked" name="remember"> Remember me
-          </label>
-        </div>
-        <div class="container" style="background-color:#f1f1f1">
-          <span id="formstatus" class="psw"></span>
-        </div>
-      </form> 
-    </div>
+    <div id="loginform"></div>
     <div id="fullmenu" onclick="showhidemenu()"></div>
     <div id="fullscreen" onclick="goFullScreen()">  <svg style="width:24px;height:24px" viewBox="0 0 24 24">
         <path fill="#fff" d="M5,5H10V7H7V10H5V5M14,5H19V10H17V7H14V5M17,14H19V19H14V17H17V14M10,17V19H5V14H7V17H10Z" />
@@ -44,5 +25,6 @@
         </svg></div>
         <div id="snackbar"></div>
   </body>
+  <script src="login.js"></script>
   <script src="wslogin.js"></script>
 </html>

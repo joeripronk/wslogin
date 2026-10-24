@@ -117,12 +117,27 @@ function setConnection(text, kind) {
   els.connection.className = 'connection' + (kind ? ' ' + kind : '');
 }
 
+function requireLogin() {
+  var next = location.pathname + location.search + location.hash;
+  location.href = './login?next=' + encodeURIComponent(next);
+}
+
+var SESSIONS_STALE_MS = 5000;
+var lastSessionsLoad = 0;
+
+function refreshSessionsIfStale() {
+  if (Date.now() - lastSessionsLoad < SESSIONS_STALE_MS) return;
+  loadSessions();
+}
+
 function setSidebarVisible(visible) {
+  var wasHidden = els.layout.classList.contains('sidebar-hidden');
   els.layout.classList.toggle('sidebar-hidden', !visible);
   els.layout.classList.remove('sidebar-hover');
   els.sidebar.setAttribute('aria-hidden', visible ? 'false' : 'true');
   hoverArmed = true;
   scheduleFit();
+  if (visible && wasHidden) refreshSessionsIfStale();
 }
 
 var hoverCloseTimer = false;
@@ -135,8 +150,10 @@ function openSidebarHover() {
     clearTimeout(hoverCloseTimer);
     hoverCloseTimer = false;
   }
+  var wasClosed = !els.layout.classList.contains('sidebar-hover');
   els.layout.classList.add('sidebar-hover');
   els.sidebar.setAttribute('aria-hidden', 'false');
+  if (wasClosed) refreshSessionsIfStale();
 }
 
 function closeSidebarHover() {
@@ -387,7 +404,7 @@ function newTerminal(cols, rows) {
     cursorInactiveStyle: 'block',
     fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
     fontSize: 14,
-    lineHeight: 1.05,
+    lineHeight: 1,
     scrollback: 10000,
     theme: {
       background: '#090b0e',
@@ -417,6 +434,12 @@ function newTerminal(cols, rows) {
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
   terminal.open(els.terminalHost);
+  // The DOM renderer lays out glyphs in CSS line boxes, whose leading shows
+  // up as small gaps between rows. The canvas renderer draws glyphs at exact
+  // row positions and is seamless in all browsers.
+  if (window.CanvasAddon) {
+    try { terminal.loadAddon(new CanvasAddon.CanvasAddon()); } catch (error) {}
+  }
   mouseOverlay = document.createElement('div');
   mouseOverlay.className = 'mouse-cursor hidden';
   mouseOverlay.setAttribute('aria-hidden', 'true');
@@ -432,7 +455,9 @@ function newTerminal(cols, rows) {
   state.termCols = Math.max(2, cols || 80);
   state.termRows = Math.max(2, rows || 24);
   terminal.resize(state.termCols, state.termRows);
-  requestAnimationFrame(scaleTerminal);
+  requestAnimationFrame(function() {
+    requestAnimationFrame(scaleTerminal);
+  });
 }
 
 var measureCanvas = null;
@@ -449,7 +474,7 @@ function cellMetrics(fontSize) {
   var textMetrics = ctx.measureText('M');
   var ascent = textMetrics.fontBoundingBoxAscent || fontSize * 1.15;
   var descent = textMetrics.fontBoundingBoxDescent || fontSize * 0.3;
-  return { width: width + 0.5, height: (ascent + descent) * 1.05 + 0.5 };
+  return { width: width + 0.5, height: (ascent + descent) + 0.5 };
 }
 
 function scaleTerminal() {
@@ -1012,6 +1037,7 @@ function stopSession() {
   els.sidebar.setAttribute('aria-hidden', 'false');
   hoverArmed = true;
   scheduleFit();
+  refreshSessionsIfStale();
 }
 
 function tick(timestamp) {
@@ -1230,7 +1256,8 @@ function startLive(mode, id, origin) {
   var socket;
   try {
     var base = String(origin).replace(/\/+$/, '');
-    socket = new WebSocket(base.replace(/^http/, 'ws') + '/pty');
+    var query = (mode === 'share' ? 'share=' : 'view=') + encodeURIComponent(id);
+    socket = new WebSocket(base.replace(/^http/, 'ws') + '/pty?' + query);
   } catch (error) {
     setLoading('Invalid live endpoint');
     return;
@@ -1377,8 +1404,8 @@ async function openStream(meta, target, autoplay) {
     if (streamId !== state.streamId) return;
     if (response.status === 401) {
       setLoading('');
-      setStatus('Authentication required. Reload the page to sign in.', 'error');
       setConnection('Authentication required', 'error');
+      requireLogin();
       return;
     }
     if (!response.ok) {
@@ -1526,6 +1553,7 @@ async function loadPlaybackConfig() {
 }
 
 async function loadSessions() {
+  lastSessionsLoad = Date.now();
   setConnection('Loading', '');
   try {
     var response = await fetch(API + '/sessions', {
@@ -1534,7 +1562,8 @@ async function loadSessions() {
     });
     if (response.status === 401) {
       setConnection('Authentication required', 'error');
-      els.listStatus.textContent = 'Reload the page to sign in.';
+      els.listStatus.textContent = 'Signing in';
+      requireLogin();
       return;
     }
     if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -1543,7 +1572,6 @@ async function loadSessions() {
     setConnection('Connected', 'ok');
     els.listStatus.textContent = state.sessions.length
       + (state.sessions.length === 1 ? ' session' : ' sessions');
-    reconcileCurrent();
     renderSessions();
     openFromHash();
   } catch (error) {
@@ -1551,25 +1579,6 @@ async function loadSessions() {
     els.listStatus.textContent = 'Could not load sessions';
     setStatus('Could not load sessions: ' + error.message, 'error');
   }
-}
-
-function reconcileCurrent() {
-  if (!state.current || !state.active) return;
-  var meta = state.sessions.find(function(item) {
-    return item.username === state.current.username
-      && item.session === state.current.session
-      && (!state.current.hostname || !item.hostname
-        || item.hostname === state.current.hostname);
-  });
-  if (meta && meta.active) return;
-  state.active = false;
-  state.current.active = false;
-  if (state.live) {
-    state.live = false;
-    setStatus('Session disconnected', 'error');
-  }
-  updateSessionHeader(state.current);
-  updateControls();
 }
 
 function openFromHash() {
@@ -1877,4 +1886,3 @@ updateControls();
 openLiveFromHash();
 window.addEventListener('hashchange', function() { openLiveFromHash(); });
 loadPlaybackConfig().then(loadSessions, loadSessions);
-setInterval(loadSessions, 30000);

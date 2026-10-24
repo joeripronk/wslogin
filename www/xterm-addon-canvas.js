@@ -1,0 +1,1 @@
+t/xterm-addon-canvas.js

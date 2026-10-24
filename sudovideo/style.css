@@ -823,3 +823,55 @@ button:disabled {
     display: none;
   }
 }
+
+/* login page: layout for the shared login form (login.css, login.js),
+   used as fallback when no valid auth server session cookie (auth.ini)
+   is presented. */
+body.login-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+
+#loginpage {
+  width: min(380px, 92vw);
+}
+
+#loginpage h1 {
+  margin: 0 0 16px;
+  font-size: 18px;
+  font-weight: 600;
+  text-align: center;
+}
+
+#loginform form {
+  background: var(--panel);
+  border-radius: var(--radius);
+  margin: 0;
+}
+
+#loginform .formcontainer {
+  padding: 20px 20px 12px;
+}
+
+#loginform label {
+  display: block;
+}
+
+#loginform input[type=text]:focus,
+#loginform input[type=password]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+#loginform button {
+  border-radius: 7px;
+  font-weight: 600;
+}
+
+#loginform .container {
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--radius) var(--radius);
+  min-height: 20px;
+}

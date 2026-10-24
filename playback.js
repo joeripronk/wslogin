@@ -17,12 +17,12 @@ const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 const { render: renderTemplate, placeholders: templatePlaceholders,
   match: matchTemplate, isSafeRelative } = require('./template');
+const { parseCookieHeader } = require('./auth');
 
 const CACHE_VERSION = 4;
 const DEFAULT_CHECKPOINT_INTERVAL_MS = 60000;
 const DEFAULT_CHECKPOINT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_CHECKPOINTS = 500;
-const DEFAULT_ACTIVE_SECONDS = 60;
 const DEFAULT_IDLE_SKIP_SECONDS = 10;
 const ACTIVITY_BUCKET_SECONDS = 1;
 const ACTIVITY_BINS = 600;
@@ -30,10 +30,15 @@ const ANSI_CSI_RE = /\x1b\[[0-?]*[ -\/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const OSC_TITLE_RE = /\x1b\][012];([^\x07]*?)(?:\x07|\x1b\\)/g;
 const PASSWORD_PROMPT_RE = /(?:password|passphrase|passwort|wachtwoord)[^\r\n:]{0,80}:\s*$/i;
-const AUTH_CACHE_MS = 5 * 60 * 1000;
 const FOLLOW_POLL_MS = 100;
 const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const USERNAME_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$/;
+const LOGIN_COOKIE = 'wslogin_playback';
+const LOGIN_SESSION_MS = 12 * 60 * 60 * 1000;
+const LOGIN_REMEMBER_MS = 30 * 24 * 60 * 60 * 1000;
+const LOGIN_MAX_SESSIONS = 1000;
+const LOGIN_MAX_BODY = 8 * 1024;
+const LOGIN_TOKEN_RE = /^[0-9a-f]{64}$/;
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -241,8 +246,6 @@ function createPlayback(config, options) {
     'playback_checkpoint_bytes', DEFAULT_CHECKPOINT_BYTES));
   var maxCheckpoints = Math.max(4, configInt(config,
     'playback_max_checkpoints', DEFAULT_MAX_CHECKPOINTS));
-  var activeSeconds = Math.max(1, configInt(config,
-    'playback_active_seconds', DEFAULT_ACTIVE_SECONDS));
   var idleSkipSeconds = Math.max(0, configInt(config,
     'playback_idle_skip_seconds', DEFAULT_IDLE_SKIP_SECONDS));
   var idleSkipEnabled = idleSkipSeconds > 0
@@ -267,7 +270,9 @@ function createPlayback(config, options) {
   var authRequired = configBool(config, 'playback_auth', true);
   var authService = config.playback_auth_service
     ? String(config.playback_auth_service) : 'sshd';
+  var cookieSecure = configBool(config, 'playback_cookie_secure', true);
   var authenticate = options.authenticate || null;
+  var sso = options.sso || null;
   var isActive = options.isActive || null;
 
   var templateNames = templatePlaceholders(sessionTemplate);
@@ -316,8 +321,8 @@ function createPlayback(config, options) {
   }
 
   var cacheStates = new Map();
-  var authCache = new Map();
   var metaCache = new Map();
+  var loginSessions = new Map();
 
   function log(message) {
     console.log('[playback] ' + message);
@@ -1039,10 +1044,11 @@ function titleDescription(titles, lastTitle) {
       ? metadata.startdate : await readStartDate(entry.file);
     var enddate = metadata && metadata.lastT != null
       ? metadata.lastT : await readLastDate(entry.file);
+    // No staleness check: a session that is not finished is listed as
+    // active (exact on server.js hosts through isActive). Disconnections
+    // are discovered by the tailer when the event stream is processed.
     var active = entry.finished ? false
-      : (entry.source == 'local' && isActive
-        ? !!isActive(entry.username, entry.session)
-        : Date.now() - stat.mtimeMs < activeSeconds * 1000);
+      : (isActive ? !!isActive(entry.username, entry.session) : true);
     var titleInfo = metadata && metadata.titleSeconds
       ? {titles: metadata.titleSeconds, lastTitle: metadata.currentTitle}
       : await scanTitles(entry.file);
@@ -1103,35 +1109,27 @@ function titleDescription(titles, lastTitle) {
     return result;
   }
 
+  function checkLoginCookie(request) {
+    var cookies = parseCookieHeader(request.headers.cookie);
+    var token = cookies[LOGIN_COOKIE];
+    if (!token || !LOGIN_TOKEN_RE.test(token)) return false;
+    var hit = loginSessions.get(token);
+    if (hit && hit.expires > Date.now()) return true;
+    if (hit) loginSessions.delete(token);
+    return false;
+  }
+
+  // Authentication for the API: auth server session cookie (auth.ini),
+  // login page session cookie. No HTTP Basic: the viewer redirects to
+  // the login page on 401.
   function checkAuth(request) {
     if (!authRequired) return Promise.resolve(true);
-    var header = request.headers.authorization || '';
-    if (!header.startsWith('Basic ')) return Promise.resolve(false);
-    var decoded;
-    try {
-      decoded = Buffer.from(header.slice(6).trim(), 'base64')
-        .toString('utf-8');
-    } catch (error) {
-      return Promise.resolve(false);
-    }
-    var separator = decoded.indexOf(':');
-    if (separator < 0) return Promise.resolve(false);
-    var username = decoded.slice(0, separator);
-    var password = decoded.slice(separator + 1);
-    var key = crypto.createHash('sha256')
-      .update(username + '\0' + password).digest('hex');
-    var hit = authCache.get(key);
-    if (hit && hit.expires > Date.now()) return Promise.resolve(true);
-    if (!authenticate) return Promise.resolve(false);
+    if (checkLoginCookie(request)) return Promise.resolve(true);
+    if (!sso) return Promise.resolve(false);
     return new Promise(function(resolve) {
       try {
-        authenticate(username, password, function(error) {
-          if (error) {
-            resolve(false);
-            return;
-          }
-          authCache.set(key, {expires: Date.now() + AUTH_CACHE_MS});
-          resolve(true);
+        sso.user(request, function(username) {
+          resolve(!!username);
         });
       } catch (error) {
         resolve(false);
@@ -1139,11 +1137,94 @@ function titleDescription(titles, lastTitle) {
     });
   }
 
+  function createLoginSession(username, remember) {
+    var token = crypto.randomBytes(32).toString('hex');
+    var expires = Date.now() + (remember ? LOGIN_REMEMBER_MS : LOGIN_SESSION_MS);
+    loginSessions.set(token, {username: username, expires: expires});
+    if (loginSessions.size > LOGIN_MAX_SESSIONS) {
+      var nowms = Date.now();
+      loginSessions.forEach(function(value, key) {
+        if (value.expires <= nowms) loginSessions.delete(key);
+      });
+      while (loginSessions.size >= LOGIN_MAX_SESSIONS) {
+        var oldest = loginSessions.keys().next().value;
+        loginSessions.delete(oldest);
+      }
+    }
+    var cookie = LOGIN_COOKIE + '=' + token
+      + '; Path=/; HttpOnly; SameSite=Lax'
+      + '; Max-Age=' + Math.max(1, Math.floor((expires - Date.now()) / 1000));
+    if (cookieSecure) cookie += '; Secure';
+    return cookie;
+  }
+
+  async function handleLogin(request, response) {
+    if (!authenticate) {
+      sendJson(response, 503, {error: 'login is not available'});
+      return;
+    }
+    var body = '';
+    var size = 0;
+    var overflow = false;
+    request.on('data', function(chunk) {
+      size += chunk.length;
+      if (size > LOGIN_MAX_BODY) {
+        overflow = true;
+        request.destroy();
+        return;
+      }
+      body += chunk;
+    });
+    await new Promise(function(resolve) {
+      function done() {
+        request.removeListener('end', done);
+        request.removeListener('close', done);
+        resolve();
+      }
+      request.on('end', done);
+      request.on('close', done);
+    });
+    if (response.writableEnded) return;
+    if (overflow) {
+      sendJson(response, 400, {error: 'bad request'});
+      return;
+    }
+    var username = '';
+    var password = '';
+    var remember = false;
+    try {
+      var data = JSON.parse(body);
+      username = String(data.username || '');
+      password = String(data.password || '');
+      remember = data.remember === true;
+    } catch (error) {
+      sendJson(response, 400, {error: 'bad request'});
+      return;
+    }
+    if (!USERNAME_RE.test(username)) {
+      sendJson(response, 401, {error: 'authentication failed'});
+      return;
+    }
+    try {
+      authenticate(username, password, function(error) {
+        if (response.writableEnded) return;
+        if (error) {
+          log('login failed for ' + username);
+          sendJson(response, 401, {error: 'authentication failed'});
+          return;
+        }
+        log('login for ' + username);
+        response.setHeader('Set-Cookie', createLoginSession(username, remember));
+        sendJson(response, 200, {ok: true, username: username});
+      });
+    } catch (error) {
+      sendJson(response, 500, {error: 'authentication failed'});
+    }
+  }
+
   function rejectAuth(response) {
     response.statusCode = 401;
-    response.setHeader('WWW-Authenticate',
-      'Basic realm="wslogin playback"');
-    response.end('authentication required');
+    sendJson(response, 401, {error: 'authentication required'});
   }
 
   async function writeLine(response, value) {
@@ -1304,11 +1385,16 @@ function titleDescription(titles, lastTitle) {
       return;
     }
     var pathname = url.pathname;
+    if (pathname == '/api/playback/login' && request.method == 'POST') {
+      await handleLogin(request, response);
+      return;
+    }
     if (pathname == '/api/playback' || pathname == '/api/playback/') {
       sendJson(response, 200, {
         enabled: true,
-        endpoints: ['sessions', 'session', 'events', 'download'],
+        endpoints: ['sessions', 'session', 'events', 'download', 'login'],
         auth: authRequired,
+        sso: !!sso,
         idle_skip_enabled: idleSkipEnabled,
         idle_skip_seconds: idleSkipSeconds,
         idle_video: idleVideo,

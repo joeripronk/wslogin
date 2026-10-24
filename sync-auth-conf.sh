@@ -54,7 +54,7 @@ echo "Syncing cookie '$name'${domain:+ (domain $domain)} from $AUTH_CONF to $AUT
 local_opts="$(mktemp)"
 trap 'rm -f "$parsed" "$local_opts"' EXIT
 if [[ -r "$AUTH_INI" ]]; then
-  awk '/^(verify_password|pam_service|sso_group)=/' "$AUTH_INI" > "$local_opts"
+  awk '/^(verify_password|pam_service|sso_group|linkshare_passphrase)=/' "$AUTH_INI" > "$local_opts"
 fi
 
 umask 077

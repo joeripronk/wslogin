@@ -26,9 +26,15 @@ if [[ "${EUID}" -ne 0 ]]; then
   exec sudo -- "$SCRIPT_PATH" "$@"
 fi
 
-for file in playback-server.js playback.js template.js playback.example.ini; do
+for file in playback-server.js playback.js template.js auth.js playback.example.ini; do
   if [[ ! -f "$SOURCE_DIR/$file" ]]; then
     echo "error: $SOURCE_DIR/$file is missing" >&2
+    exit 1
+  fi
+done
+for file in login.js login.css; do
+  if [[ ! -f "$SOURCE_DIR/www/$file" ]]; then
+    echo "error: $SOURCE_DIR/www/$file is missing" >&2
     exit 1
   fi
 done
@@ -65,13 +71,16 @@ fi
 
 echo "Installing playback files in $APP_DIR"
 if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
-  for file in playback-server.js playback.js template.js; do
+  for file in playback-server.js playback.js template.js auth.js; do
     install -o root -g root -m 0644 "$SOURCE_DIR/$file" "$APP_DIR/$file"
   done
   if [[ -d "$SOURCE_DIR/sudovideo" ]]; then
     echo "Installing sudovideo files in $APP_DIR/sudovideo"
     install -d -o root -g root -m 0755 "$APP_DIR/sudovideo"
     install -o root -g root -m 0644 "$SOURCE_DIR/sudovideo/"* "$APP_DIR/sudovideo/"
+    # shared login form of the wslogin page, reused by the playback login page
+    install -o root -g root -m 0644 "$SOURCE_DIR/www/login.js" "$APP_DIR/sudovideo/login.js"
+    install -o root -g root -m 0644 "$SOURCE_DIR/www/login.css" "$APP_DIR/sudovideo/login.css"
   fi
 fi
 

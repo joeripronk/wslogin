@@ -157,6 +157,63 @@ function parseCookieHeader(header) {
   return cookies;
 }
 
+// Personalized view/share links are self-contained encrypted tokens, keyed
+// with the linkshare_passphrase from auth.ini (never the Apache
+// mod_session passphrase). Format: base64url( salt(16) | iv(16) |
+// AES-256-CBC | HMAC-SHA256(32) ). Keys are PBKDF2-HMAC-SHA256(pass, salt,
+// 10000, 64) split into an encryption key and a MAC key.
+function b64urlEncode(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(str) {
+  str = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  return Buffer.from(str, 'base64');
+}
+function createLinkToken(payload, passphrase) {
+  var salt = crypto.randomBytes(16);
+  var keys = crypto.pbkdf2Sync(Buffer.from(passphrase, 'utf8'), salt, 10000, 64, 'sha256');
+  var encKey = keys.subarray(0, 32);
+  var macKey = keys.subarray(32, 64);
+  var iv = crypto.randomBytes(16);
+  var cipher = crypto.createCipheriv('aes-256-cbc', encKey, iv);
+  var cipherText = Buffer.concat([
+    cipher.update(Buffer.from(JSON.stringify(payload), 'utf8'), 'utf8'),
+    cipher.final()
+  ]);
+  var body = Buffer.concat([salt, iv, cipherText]);
+  var mac = crypto.createHmac('sha256', macKey).update(body).digest();
+  return b64urlEncode(Buffer.concat([body, mac]));
+}
+function readLinkToken(token, passphrases) {
+  var data;
+  try { data = b64urlDecode(String(token)); } catch (error) { return null; }
+  if (data.length < 16 + 16 + 16 + 32) return null;
+  var salt = data.subarray(0, 16);
+  var body = data.subarray(0, data.length - 32);
+  var mac = data.subarray(data.length - 32);
+  var iv = data.subarray(16, 32);
+  var cipherText = data.subarray(32, data.length - 32);
+  if (cipherText.length % 16 != 0) return null;
+  for (var i = 0; i < passphrases.length; i++) {
+    var keys = crypto.pbkdf2Sync(Buffer.from(passphrases[i], 'utf8'), salt, 10000, 64, 'sha256');
+    var macKey = keys.subarray(32, 64);
+    var expected = crypto.createHmac('sha256', macKey).update(body).digest();
+    if (!crypto.timingSafeEqual(expected, mac)) continue;
+    try {
+      var decipher = crypto.createDecipheriv('aes-256-cbc', keys.subarray(0, 32), iv);
+      var plain = Buffer.concat([decipher.update(cipherText), decipher.final()]).toString('utf8');
+      var payload = JSON.parse(plain);
+      if (!payload || typeof payload.e != 'number' || payload.e < Date.now()) return null;
+      return payload;
+    } catch (error) {
+      continue;
+    }
+  }
+  return null;
+}
+
+
 function loadAuthConfig(authPath) {
   var parsed = ini.parse(fs.readFileSync(authPath, 'utf-8'));
   var cookieName = parsed.cookie_name ? String(parsed.cookie_name).trim() : '';
@@ -169,9 +226,12 @@ function loadAuthConfig(authPath) {
     : !/^(false|off|no|0)$/i.test(String(parsed.verify_password).trim());
   var pamService = parsed.pam_service ? String(parsed.pam_service).trim() : 'wslogin';
   var ssoGroup = parsed.sso_group ? String(parsed.sso_group).trim() : '';
+  var linkPassphrases = parsed.linkshare_passphrase == null ? []
+    : (Array.isArray(parsed.linkshare_passphrase) ? parsed.linkshare_passphrase : [parsed.linkshare_passphrase])
+      .map(function (pass) { return String(pass); });
   return { cookieName: cookieName, domain: domain, passphrases: passphrases,
            verifyPassword: verifyPassword, pamService: pamService,
-           ssoGroup: ssoGroup };
+           ssoGroup: ssoGroup, linkPassphrases: linkPassphrases };
 }
 
 function createSsoAuth(authPath) {
@@ -225,8 +285,22 @@ function createSsoAuth(authPath) {
       if (!conf.domain) return false;
       host = String(host).split('@').pop().split(':')[0].toLowerCase();
       return host == conf.domain || host.endsWith('.'+conf.domain);
+    },
+    // Personalized view/share links, encrypted with linkshare_passphrase.
+    linkEnabled: conf.linkPassphrases.length > 0,
+    // an encrypted, self-contained link token for the given payload, null
+    // when no linkshare_passphrase is configured.
+    createLink: function (payload) {
+      if (conf.linkPassphrases.length == 0) return null;
+      return createLinkToken(payload, conf.linkPassphrases[0]);
+    },
+    // the decoded payload of a link token, null when it is invalid, forged
+    // or expired.
+    readLink: function (token) {
+      if (conf.linkPassphrases.length == 0) return null;
+      return readLinkToken(token, conf.linkPassphrases);
     }
   };
 }
 
-module.exports = { createSsoAuth };
+module.exports = { createSsoAuth, parseCookieHeader };
