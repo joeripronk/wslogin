@@ -241,6 +241,7 @@ var term = new window.Terminal({
   cursorBlink: true,
   scrollback: 10000,
   convertEol: false,
+  allowProposedFeatures: true,
   fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
   fontSize: 14
 });
@@ -286,6 +287,19 @@ if (window.CanvasAddon) {
   try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (e) {}
 }
 var lastMouseSent={x:-1,y:-1,t:0};
+var dragStart=false;
+function dragText(a,b) {
+  var buf=term.buffer.active;
+  var y1=Math.min(a.y,b.y), y2=Math.max(a.y,b.y);
+  var x1=Math.min(a.x,b.x), x2=Math.max(a.x,b.x);
+  var out=[];
+  for (var y=y1; y<=y2; y++) {
+    var line=buf.getLine(buf.baseY+y-1);
+    if (!line) continue;
+    out.push(line.translateToString(true).slice(x1-1,x2));
+  }
+  return out.join('\n').replace(/\s+$/,'');
+}
 function mouseCell(e) {
   if (!term.element) return null;
   var screen=term.element.querySelector('.xterm-screen');
@@ -300,8 +314,19 @@ function mouseCell(e) {
 function sendMouse(e,b) {
   if (!authenticated||viewonly||shared) return;
   if (!socket||socket.readyState!=1) return;
+  // shift bypasses app mouse capture: let xterm.js select locally and the
+  // mouseup handler copies the selection, like in a plain shell
+  if (e.shiftKey) return;
   var cell=mouseCell(e);
   if (!cell) return;
+  if (b==1 && e.button==0) dragStart=cell;
+  if (b==2 && e.button==0 && dragStart) {
+    if (cell.x!=dragStart.x || cell.y!=dragStart.y) {
+      var t=dragText(dragStart,cell);
+      if (t.length>1) copyToClipboard(t);
+    }
+    dragStart=false;
+  }
   var now=Date.now();
   if (b==0) {
     if (cell.x==lastMouseSent.x&&cell.y==lastMouseSent.y) return;
