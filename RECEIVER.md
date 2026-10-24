@@ -356,10 +356,13 @@ evolve):
 `3` mouse pointer, `4` session header, `5` tailer. `t` is a Unix timestamp and
 `d` the payload. The first line of every log is the header record (`c:4`); its
 payload carries `viewid`, `shareid`, `viewurl` and `shareurl`, the viewonly and
-shared links of the wslogin host. The last line of a finished log is the
-tailer record (`c:5`); its payload carries `size` and `sha256` of the log
-without the tailer itself plus the session `endtime`, so a finished log is
-self-verifying. `wslogin` appends the tailer when a session ends and, at
+shared links of the wslogin host. When sessions run under tmux (`session_tmux`)
+it also carries reconnect meta: `username`, `sessioncookie`, `reconnectid`,
+`cols`, `rows`, `starttime` and the `tmux` server socket, which the server reads
+at startup to re-attach live sessions after a restart. The last line of a
+finished log is the tailer record (`c:5`); its payload carries `size` and
+`sha256` of the log without the tailer itself plus the session `endtime`, so a
+finished log is self-verifying. `wslogin` appends the tailer when a session ends and, at
 startup, fixes finished logs that predate it. The receiver stores the log
 as-is; the playback server reads the header from the file to offer live stream
 and live control links in sudovideo. These URLs grant live access to the
