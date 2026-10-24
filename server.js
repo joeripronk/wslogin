@@ -145,12 +145,27 @@ function session_checkpoint_path(username, sessioncookie) {
   var file = session_log_path(username, sessioncookie);
   return file.slice(0, -'.json'.length) + '.checkpoint.json';
 }
-// Per-session tmux server socket, kept next to the session log. The shell
-// lives in this tmux server, independent of the wslogin process, so a wslogin
-// restart can find it again and re-attach.
+// Per-session tmux server socket, kept in the user's home so the user's tmux
+// server can create it. The shell lives in this tmux server, independent of
+// the wslogin process, so a wslogin restart can find it again and re-attach.
+function lookupUser(username) {
+  try {
+    var lines = fs.readFileSync('/etc/passwd', 'utf8').split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var f = lines[i].split(':');
+      if (f[0] === username) {
+        return { home: f[5] || ('/home/' + username), shell: f[6] || '/bin/bash',
+          uid: parseInt(f[2], 10) };
+      }
+    }
+  } catch (error) {}
+  return null;
+}
 function session_tmux_path(username, sessioncookie) {
-  var file = session_log_path(username, sessioncookie);
-  return file.slice(0, -'.json'.length) + '.tmux';
+  var u = lookupUser(username);
+  var base = u ? path.join(u.home, '.wslogin')
+               : path.dirname(session_log_path(username, sessioncookie));
+  return path.join(base, sessioncookie + '.tmux');
 }
 var tmux_conf = path.join(__dirname, 'tmux.conf');
 // The tailer is the last record of a finished log (c=5). Its payload records
@@ -282,7 +297,7 @@ function resume_session(meta) {
   views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
   shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
   var shellenv = { USER: username, VIEWID: meta.viewid, VIEWURL: meta.viewurl, SUDO_USER: username };
-  session.pty = attach_tmux(username, sessioncookie, cols, rows, shellenv);
+  session.pty = attach_tmux(username, sessioncookie, cols, rows, shellenv, meta.tmux);
   session.pty.file = fopen(logfile, 'a+');
   session.pty.main = false;
   wire_session(username, sessioncookie);
@@ -526,21 +541,27 @@ function create_mirror(cols, rows) {
   };
 }
 
-// Start a detached per-session tmux server running the user's shell. The shell
-// is a child of this tmux server (not of wslogin), so it survives a wslogin
-// restart. Returns true when the session is up.
+// Start a detached per-session tmux server, running as the user, with the
+// user's shell as its only pane. The shell is a direct child of the user's
+// tmux server (no lingering sudo), and survives a wslogin restart. Returns
+// true when the session is up.
 function start_tmux_session(username, sessioncookie, cols, rows, env) {
+  var u = lookupUser(username);
+  if (!u) { console.error("no passwd entry for "+username); return false; }
   var sock = session_tmux_path(username, sessioncookie);
-  try {
-    fs.mkdirSync(path.dirname(sock), { recursive: true });
-  } catch (error) {
-    console.error("mkdir tmux dir "+sock+": "+error.message);
-  }
-  var args = ['-S', sock];
+  var dir = path.dirname(sock);
+  spawnSync('sudo', ['-u', username, 'mkdir', '-p', dir]);
+  spawnSync('sudo', ['-u', username, 'chmod', '700', dir]);
+  var shell = u.shell || '/bin/bash';
+  var args = ['-u', username, 'env',
+    'USER=' + username, 'LOGNAME=' + username, 'HOME=' + u.home,
+    'SHELL=' + shell, 'PATH=/usr/local/bin:/usr/bin:/bin',
+    'VIEWID=' + ((env && env.VIEWID) || ''), 'VIEWURL=' + ((env && env.VIEWURL) || ''),
+    'tmux', '-S', sock];
   if (fs.existsSync(tmux_conf)) args.push('-f', tmux_conf);
   args.push('new-session', '-d', '-s', 'main',
-    '-x', String(cols), '-y', String(rows), 'sudo', '-u', username, '-i');
-  var out = spawnSync('tmux', args, { env: env });
+    '-x', String(cols), '-y', String(rows), shell);
+  var out = spawnSync('sudo', args, { cwd: u.home });
   if (out.status !== 0) {
     console.error("tmux new-session failed for "+username+" "+sessioncookie
       +": "+out.stderr);
@@ -549,13 +570,16 @@ function start_tmux_session(username, sessioncookie, cols, rows, env) {
   return tmux_alive(sock);
 }
 
-function attach_tmux(username, sessioncookie, cols, rows, env) {
-  var sock = session_tmux_path(username, sessioncookie);
+// wslogin (root) attaches to the user's tmux server; root may connect to the
+// user-owned socket. The attach client is the live view, tied to a connection.
+function attach_tmux(username, sessioncookie, cols, rows, env, sock) {
+  if (!sock) sock = session_tmux_path(username, sessioncookie);
+  var u = lookupUser(username);
   return pty.spawn('tmux', ['-S', sock, 'attach', '-t', 'main'], {
     name: 'xterm',
     cols: cols,
     rows: rows,
-    cwd: '/',
+    cwd: (u && u.home) || '/',
     env: env
   });
 }
@@ -568,7 +592,7 @@ function tmux_alive(sock) {
 
 function kill_tmux_session(username, sessioncookie) {
   var sock = session_tmux_path(username, sessioncookie);
-  spawnSync('tmux', ['-S', sock, 'kill-server']);
+  spawnSync('sudo', ['-u', username, 'tmux', '-S', sock, 'kill-server']);
   try { fs.unlinkSync(sock); } catch (error) {}
 }
 
