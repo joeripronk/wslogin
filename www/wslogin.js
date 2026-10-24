@@ -507,6 +507,9 @@ function onmessage(message) {
     case '\1':
       term.write(data);
       break;;
+    case '\2':
+      // mouse pointer report from another client, ignored on this page
+      break;;
     default:
       alert(message.data);
   }

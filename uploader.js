@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { performance } = require('perf_hooks');
 const { WebSocket } = require('ws');
 const { match: matchTemplate } = require('./template');
 
@@ -20,6 +19,7 @@ const CHECKPOINT_LOG_SUFFIX = '.checkpoint.json';
 const FINISHED_SUFFIX = '.done';
 const UPLOADED_SUFFIX = '.uploaded';
 const MAX_UPLOADED_TRACKED = 10000;
+const MIN_ACTIVE_SNAPSHOT_MS = 250;
 
 function configBool(config, name, fallback) {
   if (!(name in config)) return fallback;
@@ -98,6 +98,8 @@ async function readStartDate(file) {
   }
 }
 
+// Session meta (viewid/share links) travels inside the log as its header
+// record; the whole file is uploaded, so nothing extra is announced.
 /**
  * Multiplexes uploads over one or more WebSocket connections. Several streams
  * (files) can be interleaved on a single connection. When a connection cannot
@@ -613,7 +615,7 @@ function createUploader(config, options) {
     for (var i = 0; i < waiters.length; i++) waiters[i]();
   }
 
-  function uploaded(job) {
+  function callUploaded(job) {
     if (!job.onUploaded) return;
     try {
       job.onUploaded(job.file);
@@ -638,7 +640,7 @@ function createUploader(config, options) {
       }
       info.startdate = await readStartDate(job.file);
       if (state.uploaded.get(key) === info.sha256) {
-        uploaded(job);
+        callUploaded(job);
         success = true;
         return;
       }
@@ -652,10 +654,11 @@ function createUploader(config, options) {
           }
           log('uploaded ' + job.kind + ' for ' + job.username + '/'
             + job.sessioncookie + ' (' + info.size + ' bytes)');
-          uploaded(job);
+          callUploaded(job);
           success = true;
           return;
         } catch (error) {
+          if (state.stopped) return; // shutting down, fail quietly
           if (error.retryable === false) {
             log('upload rejected for ' + job.kind + ' ' + job.username + '/'
               + job.sessioncookie + ': ' + error.message);
@@ -722,6 +725,10 @@ function createUploader(config, options) {
     },
     close: function() {
       state.stopped = true;
+      // Queued jobs are dropped; idle must not block on them. Their onDone
+      // callbacks are not called and run() keeps its busy keys set.
+      state.queue.length = 0;
+      notifyIdle();
       if (transport) transport.close();
     }
   };
@@ -762,6 +769,7 @@ async function listSessionFiles(sessionDir, template) {
         ? rel.slice(0, -FINISHED_SUFFIX.length) : rel;
       if (!activeRel.endsWith(LOG_SUFFIX)) continue;
       if (activeRel.endsWith(CHECKPOINT_LOG_SUFFIX)) continue;
+      if (activeRel.endsWith('.meta.json')) continue;
       var values = matchTemplate(template, activeRel, ['username', 'session']);
       if (!values) continue;
       entries.push({
@@ -796,14 +804,11 @@ async function run(config, options) {
   var interval = Math.max(1, configInt(config, 'upload_interval_seconds', 60));
   var uploadActive = configBool(config, 'upload_active_enabled', true);
   var removeUploaded = configBool(config, 'upload_remove_uploaded', false);
-  var activeInterval = Math.max(1,
-    configInt(config, 'upload_active_interval_seconds', 1));
-  var debounceMs = Math.max(50,
-    configInt(config, 'upload_watch_debounce_ms', 500));
   var seen = new Map();
-  var lastActive = new Map();
   var busy = new Set();
   var pending = new Map();
+  var lastActiveScheduled = new Map();
+  var retryTimers = new Map();
   var stopping = false;
   var timer = null;
   var scanTimer = null;
@@ -853,6 +858,35 @@ async function run(config, options) {
   function scheduleUpload(entry) {
     if (stopping) return;
     var key = sessionKey(entry);
+    var wait = 0;
+    if (!entry.finished) {
+      // Floor the snapshot rate of chatty sessions so a continuous stream of
+      // filesystem events does not turn into a continuous full-file upload.
+      // The entry is kept in pending and retried when the floor expires, so
+      // no change is ever dropped.
+      var last = lastActiveScheduled.get(key) || 0;
+      var nowms = Date.now();
+      if (nowms - last < MIN_ACTIVE_SNAPSHOT_MS) {
+        wait = MIN_ACTIVE_SNAPSHOT_MS - (nowms - last);
+      }
+    }
+    if (wait > 0) {
+      pending.set(key, entry);
+      if (!retryTimers.has(key)) {
+        var timer = setTimeout(function() {
+          retryTimers.delete(key);
+          var next = pending.get(key);
+          if (next) {
+            pending.delete(key);
+            scheduleUpload(next);
+          }
+        }, wait);
+        if (timer.unref) timer.unref();
+        retryTimers.set(key, timer);
+      }
+      return;
+    }
+    if (!entry.finished) lastActiveScheduled.set(key, Date.now());
     if (busy.has(key)) {
       pending.set(key, entry);
       return;
@@ -889,9 +923,11 @@ async function run(config, options) {
         return;
       }
       var present = new Set();
+      var presentKeys = new Set();
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i];
         present.add(entry.file);
+        presentKeys.add(sessionKey(entry));
         var stat;
         try {
           stat = await fs.promises.stat(entry.file);
@@ -900,20 +936,15 @@ async function run(config, options) {
         }
         var stamp = stat.size + ':' + stat.mtimeMs;
         if (seen.get(entry.file) == stamp) continue;
-        if (!entry.finished) {
-          if (!uploadActive) continue;
-          var last = lastActive.get(entry.file) || 0;
-          if (performance.now() - last < activeInterval * 1000) continue;
-          lastActive.set(entry.file, performance.now());
-        }
+        if (!entry.finished && !uploadActive) continue;
         seen.set(entry.file, stamp);
         scheduleUpload(entry);
       }
       seen.forEach(function(value, file) {
         if (!present.has(file)) seen.delete(file);
       });
-      lastActive.forEach(function(value, file) {
-        if (!present.has(file)) lastActive.delete(file);
+      lastActiveScheduled.forEach(function(value, key) {
+        if (!presentKeys.has(key)) lastActiveScheduled.delete(key);
       });
     } finally {
       scanning = false;
@@ -925,8 +956,9 @@ async function run(config, options) {
   }
 
   // Coalesce a burst of filesystem events into one scan. Events that arrive
-  // while a scan is already scheduled are ignored, so a session producing
-  // output continuously is still scanned at a bounded rate.
+  // while a scan is running are picked up by a follow-up scan, so a snapshot
+  // is taken as soon as the log is ready (data has arrived) and the previous
+  // upload of that session has finished.
   function requestScan(delay) {
     if (stopping || scanTimer) return;
     scanTimer = setTimeout(function() {
@@ -948,7 +980,7 @@ async function run(config, options) {
     if (stopping || watcher) return;
     try {
       watcher = fs.watch(sessionDir, {recursive: true}, function() {
-        requestScan(debounceMs);
+        requestScan(0);
       });
       watcher.on('error', function(error) {
         console.error('[uploader] file monitor failed: ' + error.message);
@@ -985,6 +1017,8 @@ async function run(config, options) {
     if (scanTimer) clearTimeout(scanTimer);
     closeWatcher();
     pending.clear();
+    retryTimers.forEach(function(timer) { clearTimeout(timer); });
+    retryTimers.clear();
     // Close the transport first so in-flight uploads fail fast instead of
     // waiting for their stream timeouts.
     uploader.close();

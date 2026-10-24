@@ -8,6 +8,7 @@ const net = require('net');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const readline = require('readline');
 const pty = require('node-pty');
 const { Terminal } =  require ("@xterm/headless");
@@ -108,11 +109,77 @@ function session_checkpoint_path(username, sessioncookie) {
   var file = session_log_path(username, sessioncookie);
   return file.slice(0, -'.json'.length) + '.checkpoint.json';
 }
+// The tailer is the last record of a finished log (c=5). Its payload records
+// the file size and SHA-256 of the log without the tailer itself plus the
+// session end time, so a finished log can be verified without trusting the
+// surrounding transport.
+function file_sha256(file, size) {
+  var hash = crypto.createHash('sha256');
+  var fd = fs.openSync(file, 'r');
+  try {
+    var buffer = Buffer.alloc(256*1024);
+    var offset = 0;
+    while (offset < size) {
+      var read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size-offset), offset);
+      if (read <= 0) break;
+      hash.update(buffer.subarray(0, read));
+      offset += read;
+    }
+  } finally { fs.closeSync(fd); }
+  return hash.digest('hex');
+}
+function last_record_time(file, size) {
+  var length = Math.min(size, 256*1024);
+  var fd = fs.openSync(file, 'r');
+  try {
+    var buffer = Buffer.alloc(length);
+    var read = fs.readSync(fd, buffer, 0, length, size-length);
+    var lines = buffer.toString('utf-8', 0, read).replace(/\n+$/,'').split('\n');
+    for (var i=lines.length-1; i>=0; i--) {
+      try {
+        var record = JSON.parse(lines[i]);
+        if (record.c !== 5 && Number.isFinite(record.t) && record.t > 0) return record.t;
+      } catch (error) {}
+    }
+  } finally { fs.closeSync(fd); }
+  return null;
+}
+function has_tailer(file) {
+  var stat;
+  try { stat = fs.statSync(file); } catch (error) { return false; }
+  if (stat.size === 0) return false;
+  var length = Math.min(stat.size, 256*1024);
+  var fd;
+  try { fd = fs.openSync(file, 'r'); } catch (error) { return false; }
+  try {
+    var buffer = Buffer.alloc(length);
+    var read = fs.readSync(fd, buffer, 0, length, stat.size-length);
+    var lines = buffer.toString('utf-8', 0, read).replace(/\n+$/,'').split('\n');
+    try {
+      var record = JSON.parse(lines[lines.length-1]);
+      return record.c === 5;
+    } catch (error) { return false; }
+  } finally { fs.closeSync(fd); }
+}
+function write_tailer(file) {
+  var stat = fs.statSync(file);
+  if (stat.size === 0) return;
+  var endtime = last_record_time(file, stat.size);
+  if (endtime == null) endtime = stat.mtimeMs/1000;
+  var tail = {t:endtime, c:5, d:JSON.stringify({
+    size:stat.size,
+    sha256:file_sha256(file, stat.size),
+    endtime:endtime
+  })};
+  fs.appendFileSync(file, JSON.stringify(tail)+'\n');
+  console.log("added tailer to "+file);
+}
 // Renaming the log of an ended session signals uploader.js that the session is
 // complete and can be uploaded. Checkpoints are not uploaded.
 function finish_path(file) {
   try {
     if (fs.existsSync(file)) {
+      if (!has_tailer(file)) write_tailer(file);
       fs.renameSync(file, file+'.done');
       console.log("marked "+file+" as finished");
     }
@@ -130,6 +197,7 @@ function finish_session(username, sessioncookie) {
 }
 // A log that still exists without the .done suffix at startup belongs to a
 // session that was interrupted by a crash, so mark it finished for uploader.js.
+// Finished logs that predate the tailer record get one appended.
 function finish_interrupted_sessions() {
   if (!fs.existsSync(session_dir)) return;
   function walk(dir, relative) {
@@ -148,8 +216,28 @@ function finish_interrupted_sessions() {
         continue;
       }
       if (!entry.isFile()) continue;
+      var finished = null;
+      if (entry.name.endsWith('.done')) finished = -'.done'.length;
+      else if (entry.name.endsWith('.uploaded')) finished = -'.uploaded'.length;
+      if (finished !== null) {
+        var baseRel = rel.slice(0, finished);
+        if (!baseRel.endsWith('.json')
+            || baseRel.endsWith('.checkpoint.json')
+            || baseRel.endsWith('.meta.json')) continue;
+        if (!matchTemplate(session_template, baseRel, ['username', 'session'])) {
+          continue;
+        }
+        var file = path.join(dir, entry.name);
+        try {
+          if (!has_tailer(file)) write_tailer(file);
+        } catch (error) {
+          console.error("error tailing "+file+": "+error.message);
+        }
+        continue;
+      }
       if (!entry.name.endsWith('.json')
-          || entry.name.endsWith('.checkpoint.json')) continue;
+          || entry.name.endsWith('.checkpoint.json')
+          || entry.name.endsWith('.meta.json')) continue;
       if (!matchTemplate(session_template, rel, ['username', 'session'])) {
         continue;
       }
@@ -819,6 +907,8 @@ wsServer.on('request', function(request) {
       views[viewid]={sessioncookie:sessioncookie,username:username}
       shares[shareid]={sessioncookie:sessioncookie,username:username}
       console.log("created pty "+sessioncookie+" "+connection.columns+"x"+connection.rows+" for "+index);
+      var metalog={t:now(),d:JSON.stringify({viewid:viewid,shareid:shareid,viewurl:request.origin+'/#view='+viewid,shareurl:request.origin+'/#share='+shareid}),c:4};
+      append_session_log(session,metalog);
       cmd={"cmd":"resize","cols":connection.columns,"rows":connection.rows}
       log={t:now(),d:JSON.stringify(cmd),c:0}
       var written=append_session_log(session,log);
@@ -977,7 +1067,7 @@ wsServer.on('request', function(request) {
                   connection.username=views[m.view].username;
                   connection.sessioncookie=views[m.view].sessioncookie;
                   console.log("view "+m.view+" started for "+connection.username+" "+connection.sessioncookie);
-                  create_pty(views[m.view].username,views[m.view].sessioncookie,connection);
+                  create_pty(views[m.view].username,views[m.view].sessioncookie,false,false,connection);
                 } else {
                   sendError(connection,"Your view url has expired");
                   console.log("View "+m.viewid+" does not exist (anymore)");
@@ -1108,8 +1198,18 @@ wsServer.on('request', function(request) {
                 if (Number.isInteger(m.x)&&Number.isInteger(m.y)
                     &&Number.isInteger(m.b)&&m.b>=0&&m.b<=2) {
                   connection.lastmouse=nowms;
+                  var session=connection.sessioncookie;
                   var log={t:now(),d:mouse,c:3};
-                  append_session_log(sessions[connection.username][connection.sessioncookie],log);
+                  append_session_log(sessions[connection.username][session],log);
+                  // Forward to all connections of the session so live viewers
+                  // can render the pointer.
+                  for (const [key, conn] of Object.entries(sessions[connection.username][session]['connections'])) {
+                    if (conn.paused) {
+                      conn.sendbuffer.push('\2'+mouse);
+                    } else {
+                      conn.sendUTF('\2'+mouse);
+                    }
+                  }
                 }
               } catch(error) {}
             }

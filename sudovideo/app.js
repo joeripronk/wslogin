@@ -12,6 +12,9 @@ var state = {
   speed: 1,
   playing: false,
   live: false,
+  liveMode: null,
+  liveTarget: null,
+  liveMeta: null,
   streamDone: false,
   streamId: 0,
   abort: null,
@@ -24,6 +27,8 @@ var state = {
   termRows: 24,
   dragging: false,
   lastFrame: 0,
+  liveBase: 0,
+  liveReal: 0,
   lastUi: 0,
   matches: [],
   matchIndex: -1,
@@ -80,6 +85,8 @@ var els = {
   searchPrev: byId('search-prev'),
   searchNext: byId('search-next'),
   download: byId('download'),
+  liveView: byId('live-view'),
+  liveShare: byId('live-share'),
   frame: byId('terminal-frame'),
   terminalHost: byId('terminal'),
   empty: byId('empty-state'),
@@ -190,7 +197,7 @@ function armHeadIdle() {
   headIdleTimer = setTimeout(function() {
     if (state.headPinned || headHover
         || (document.activeElement && els.head.contains(document.activeElement))) {
-      armHeadIdle();
+armHeadIdle();
       return;
     }
     els.layout.classList.add('head-hidden');
@@ -206,6 +213,75 @@ els.headTab.addEventListener('mouseenter', function() {
 });
 
 els.headTab.addEventListener('click', showHead);
+
+function setHeadTab(text) {
+  els.headTab.textContent = text || '';
+  els.headTab.classList.toggle('hidden', !text);
+}
+
+function updateLiveButtons() {
+  var meta = state.current || state.liveMeta;
+  var viewOk = false;
+  var shareOk = false;
+  if (meta) {
+    var liveView = typeof meta.viewid === 'string'
+      && typeof meta.viewurl === 'string';
+    var liveShare = typeof meta.shareid === 'string'
+      && typeof meta.shareurl === 'string';
+    if (state.liveMode === 'view') {
+      viewOk = true;
+      shareOk = liveShare;
+    } else if (state.liveMode === 'share') {
+      viewOk = liveView;
+      shareOk = true;
+    } else {
+      viewOk = liveView && state.active === true;
+      shareOk = liveShare && state.active === true;
+    }
+  }
+  var viewHref = viewOk ? liveHref(meta, 'view') : null;
+  var shareHref = shareOk ? liveHref(meta, 'share') : null;
+  if (state.liveMode === 'view') viewHref = '#';
+  if (state.liveMode === 'share') shareHref = '#';
+  if (viewHref) {
+    els.liveView.href = viewHref;
+    els.liveView.classList.remove('hidden');
+  } else {
+    els.liveView.classList.add('hidden');
+  }
+  if (shareHref) {
+    els.liveShare.href = shareHref;
+    els.liveShare.classList.remove('hidden');
+  } else {
+    els.liveShare.classList.add('hidden');
+  }
+  els.liveView.classList.toggle('on', state.liveMode === 'view');
+  els.liveShare.classList.toggle('on', state.liveMode === 'share');
+}
+
+function exitLive() {
+  var meta = state.liveMeta;
+  stopLive();
+  updateControls();
+  if (meta && meta.username && meta.session) {
+    openStream(meta, Number(meta.enddate) || undefined, true);
+  } else {
+    els.layout.classList.add('browsing');
+    els.empty.classList.remove('hidden');
+  }
+}
+
+function liveLinkClick(mode) {
+  return function(event) {
+    if (state.liveMode === mode) {
+      event.preventDefault();
+      exitLive();
+    }
+  };
+}
+
+els.liveView.addEventListener('click', liveLinkClick('view'));
+els.liveShare.addEventListener('click', liveLinkClick('share'));
 
 els.head.addEventListener('mouseleave', function() {
   headHover = false;
@@ -351,7 +427,7 @@ function newTerminal(cols, rows) {
   terminal.element.appendChild(ghostOverlay);
   resetMouseTracking();
   terminal.onTitleChange(function(title) {
-    els.headTab.textContent = title || '';
+    setHeadTab(title);
   });
   state.termCols = Math.max(2, cols || 80);
   state.termRows = Math.max(2, rows || 24);
@@ -377,7 +453,7 @@ function cellMetrics(fontSize) {
 }
 
 function scaleTerminal() {
-  if (!terminal || !state.current) return;
+  if (!terminal || (!state.current && !state.liveMode)) return;
   var cols = Math.max(2, state.termCols);
   var rows = Math.max(2, state.termRows);
   if (terminal.options.fontSize !== 14) terminal.options.fontSize = 14;
@@ -462,8 +538,10 @@ function showMouseCursor(col, row) {
   col = Math.min(Math.max(col, 0), terminal.cols - 1);
   row = Math.min(Math.max(row, 0), terminal.rows - 1);
   var grid = gridMetrics();
-  mouseOverlay.style.left = Math.floor(grid.offsetX + col * grid.cell.width) + 'px';
-  mouseOverlay.style.top = Math.floor(grid.offsetY + row * grid.cell.height) + 'px';
+  mouseOverlay.style.left =
+    Math.floor(grid.offsetX + (col + 0.5) * grid.cell.width) + 'px';
+  mouseOverlay.style.top =
+    Math.floor(grid.offsetY + (row + 0.5) * grid.cell.height) + 'px';
   mouseOverlay.classList.remove('hidden');
 }
 
@@ -663,10 +741,27 @@ function updateControls() {
   els.live.classList.toggle('hidden', !state.active);
   els.live.classList.toggle('on', state.live);
   els.live.textContent = state.live ? 'Live' : 'Go live';
+  updateLiveButtons();
 }
 
 function requestTick() {
   requestAnimationFrame(tick);
+}
+
+function anchorLive() {
+  state.liveBase = state.time;
+  state.liveReal = Date.now() / 1000;
+}
+
+// Live display clock: advances in real time, never ahead of the newest
+// event and never more than one second behind it.
+function liveTarget() {
+  var wall = Date.now() / 1000;
+  state.liveBase += wall - state.liveReal;
+  state.liveReal = wall;
+  if (state.liveBase > state.end) state.liveBase = state.end;
+  if (state.liveBase < state.end - 1) state.liveBase = state.end - 1;
+  return state.liveBase;
 }
 
 function beginPlayback() {
@@ -680,6 +775,7 @@ function beginPlayback() {
   if (state.active && state.time >= state.end - 0.25) {
     state.live = true;
     state.time = state.end;
+    anchorLive();
   }
   updateControls();
   requestTick();
@@ -865,6 +961,7 @@ function togglePlayback() {
 }
 
 function stopSession() {
+  stopLive();
   state.streamId++;
   if (state.abort) state.abort.abort();
   cancelIdleSkip();
@@ -893,9 +990,13 @@ function stopSession() {
   setLoading('');
   els.title.textContent = 'Select a session';
   els.meta.textContent = '';
-  els.headTab.textContent = '';
+  setHeadTab('');
   els.download.classList.add('hidden');
   els.download.href = '#';
+  els.liveView.classList.add('hidden');
+  els.liveView.href = '#';
+  els.liveShare.classList.add('hidden');
+  els.liveShare.href = '#';
   els.time.textContent = '--:-- / --:--';
   els.seek.max = '0';
   els.seek.value = '0';
@@ -919,6 +1020,7 @@ function tick(timestamp) {
   var delta = Math.min(1, (timestamp - state.lastFrame) / 1000);
   state.lastFrame = timestamp;
   var target = state.time + delta * state.speed;
+  if (state.live) target = liveTarget();
 
   while (state.queueIndex < state.queue.length
       && state.queue[state.queueIndex].t <= target + 0.000001) {
@@ -950,6 +1052,7 @@ function tick(timestamp) {
       && state.time >= state.end - 0.25) {
     state.time = state.end;
     state.live = true;
+    anchorLive();
   }
 
   if (state.streamDone) {
@@ -964,7 +1067,7 @@ function tick(timestamp) {
     }
   }
 
-  if (state.live) state.time = state.end;
+  if (state.live) state.time = Math.min(state.time, state.end);
 
   if (timestamp - state.lastUi > 80) {
     state.lastUi = timestamp;
@@ -984,6 +1087,8 @@ function handleMessage(message, streamId) {
     resetMouseTracking();
     terminal.resize(state.termCols, state.termRows);
     if (message.serialized) terminal.write(message.serialized);
+    terminal.options.title = typeof message.title === 'string'
+      ? message.title : '';
     state.activity = message.activity || null;
     requestAnimationFrame(scaleTerminal);
     requestAnimationFrame(drawActivity);
@@ -1014,7 +1119,10 @@ function handleMessage(message, streamId) {
   if (message.type === 'renamed') {
     state.active = false;
     state.streamDone = true;
-    if (state.current) state.current.active = false;
+    if (state.current) {
+      state.current.active = false;
+      updateSessionHeader(state.current);
+    }
     setStatus('Session ended and was moved to the archive', '');
     updateControls();
     renderSessions();
@@ -1039,7 +1147,8 @@ function handleMessage(message, streamId) {
   }
   if (!Number.isFinite(event.t)) event.t = state.time;
 
-  if (state.live || event.t <= state.seekTarget + 0.000001) {
+  if (event.t <= state.seekTarget + 0.000001
+      || (state.live && event.t <= state.time)) {
     applyEvent(event);
     state.time = Math.max(state.time, event.t);
   } else {
@@ -1078,7 +1187,141 @@ async function consumeStream(response, streamId) {
   }
 }
 
+var liveSocket = null;
+var liveInputDisposable = null;
+
+function stopLive() {
+  if (liveInputDisposable) {
+    try { liveInputDisposable.dispose(); } catch (error) {}
+    liveInputDisposable = null;
+  }
+  if (liveSocket) {
+    var socket = liveSocket;
+    liveSocket = null;
+    socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+    try { socket.close(); } catch (error) {}
+  }
+  state.liveMode = null;
+  state.liveTarget = null;
+  state.liveMeta = null;
+}
+
+// Connects to a running wslogin host with a viewonly (view) or shared
+// (share) link from the session log header. The view streams the live
+// terminal; the share also forwards typed input.
+function startLive(mode, id, origin) {
+  stopLive();
+  cancelIdleSkip();
+  state.streamId++;
+  if (state.abort) state.abort.abort();
+  state.abort = null;
+  state.playing = false;
+  state.live = false;
+  state.current = null;
+  state.active = false;
+  state.termCols = 80;
+  state.termRows = 24;
+  if (els.layout.classList.contains('browsing')) setSidebarVisible(false);
+  els.layout.classList.remove('browsing');
+  els.empty.classList.add('hidden');
+  drawActivity();
+  newTerminal(80, 24);
+  setLoading('Connecting');
+  var socket;
+  try {
+    var base = String(origin).replace(/\/+$/, '');
+    socket = new WebSocket(base.replace(/^http/, 'ws') + '/pty');
+  } catch (error) {
+    setLoading('Invalid live endpoint');
+    return;
+  }
+  liveSocket = socket;
+  state.liveMode = mode;
+  socket.onmessage = function(ev) {
+    var data = String(ev.data);
+    var kind = data.charAt(0);
+    var body = data.slice(1);
+    if (kind === '\x00') {
+      var json;
+      try { json = JSON.parse(body); } catch (error) { return; }
+      if (json.cmd === 'login') {
+        socket.send('\x00' + JSON.stringify(mode === 'share'
+          ? {cmd: 'share', share: id}
+          : {cmd: 'view', view: id}));
+      } else if (json.cmd === 'resize') {
+        if (terminal && json.cols > 0 && json.rows > 0) {
+          state.termCols = json.cols;
+          state.termRows = json.rows;
+          terminal.resize(json.cols, json.rows);
+          scheduleFit();
+        }
+      } else if (json.cmd === 'b64') {
+        if (terminal) terminal.write(atob(json.data));
+      } else if (json.cmd === 'replaydone' || json.cmd === 'reconnected') {
+        setLoading('');
+        markLoaded();
+        if (terminal) {
+          terminal.focus();
+          scheduleFit();
+        }
+        if (mode === 'share' && terminal && !liveInputDisposable) {
+          liveInputDisposable = terminal.onData(function(input) {
+            if (liveSocket && liveSocket.readyState === 1) {
+              liveSocket.send('\x01' + input);
+            }
+          });
+        }
+        setStatus(mode === 'share'
+          ? 'Live control, typing sends to the session' : 'Live view', 'ok');
+      } else if (json.cmd === 'info' || json.cmd === 'warn') {
+        setStatus(json.info || json.warn || '', '');
+      } else if (json.cmd === 'error') {
+        setLoading(json.error || 'Live session failed');
+        setStatus(json.error || 'Live session failed', 'error');
+      }
+    } else if (kind === '\x01') {
+      if (terminal) terminal.write(body);
+    } else if (kind === '\x02') {
+      applyEvent({c: 3, d: body, t: null});
+    }
+  };
+  socket.onclose = function() {
+    if (liveSocket === socket) {
+      liveSocket = null;
+      state.liveMode = null;
+      setLoading('Live connection closed');
+      setStatus('Live connection closed', 'error');
+    }
+  };
+  socket.onerror = function() {};
+}
+
+function openLiveFromHash() {
+  var params = new URLSearchParams(location.hash.slice(1));
+  var view = params.get('view');
+  var share = params.get('share');
+  if (!view && !share) return false;
+  var origin = params.get('ws') || location.origin;
+  var target = (view ? 'view' : 'share') + ':' + (view || share) + '@' + origin;
+  if (state.liveTarget === target) return true;
+  startLive(view ? 'view' : 'share', view || share, origin);
+  state.liveTarget = target;
+  var u = params.get('u');
+  var s = params.get('s');
+  var h = params.get('h');
+  var meta = (state.sessions || []).find(function(item) {
+    return item.username === u && item.session === s
+      && (!h || !item.hostname || item.hostname === h);
+  });
+  state.liveMeta = meta || (view
+    ? {viewid: view, viewurl: origin + '/#view=' + view}
+    : {shareid: share, shareurl: origin + '/#share=' + share});
+  updateLiveButtons();
+  return true;
+}
+
 async function openStream(meta, target, autoplay) {
+  stopLive();
   cancelIdleSkip();
   if (els.layout.classList.contains('browsing')) setSidebarVisible(false);
   els.layout.classList.remove('browsing');
@@ -1171,7 +1414,7 @@ async function openStream(meta, target, autoplay) {
 function updateSessionHeader(meta) {
   els.title.textContent = meta.username
     + (meta.hostname ? ' @ ' + meta.hostname : '');
-  els.headTab.textContent = els.title.textContent;
+  setHeadTab(els.title.textContent);
   var parts = [];
   parts.push(formatDate(meta.startdate));
   if (Number.isFinite(meta.enddate) && meta.enddate >= meta.startdate) {
@@ -1184,6 +1427,31 @@ function updateSessionHeader(meta) {
   els.download.href = API + '/download?u=' + encodeURIComponent(meta.username)
     + '&s=' + encodeURIComponent(meta.session)
     + (meta.hostname ? '&h=' + encodeURIComponent(meta.hostname) : '');
+}
+
+function liveHref(meta, mode) {
+  var url = mode === 'view' ? meta.viewurl : meta.shareurl;
+  var id = mode === 'view' ? meta.viewid : meta.shareid;
+  if (typeof url !== 'string') return null;
+  var origin;
+  try {
+    origin = new URL(url).origin;
+  } catch (error) {
+    return null;
+  }
+  if (typeof id !== 'string') return url;
+  var hash = '#' + mode + '=' + encodeURIComponent(id)
+    + '&ws=' + encodeURIComponent(origin);
+  if (typeof meta.username === 'string') {
+    hash += '&u=' + encodeURIComponent(meta.username);
+  }
+  if (typeof meta.session === 'string') {
+    hash += '&s=' + encodeURIComponent(meta.session);
+  }
+  if (typeof meta.hostname === 'string') {
+    hash += '&h=' + encodeURIComponent(meta.hostname);
+  }
+  return location.pathname + location.search + hash;
 }
 
 function seekTo(target, autoplay) {
@@ -1275,6 +1543,7 @@ async function loadSessions() {
     setConnection('Connected', 'ok');
     els.listStatus.textContent = state.sessions.length
       + (state.sessions.length === 1 ? ' session' : ' sessions');
+    reconcileCurrent();
     renderSessions();
     openFromHash();
   } catch (error) {
@@ -1284,7 +1553,27 @@ async function loadSessions() {
   }
 }
 
+function reconcileCurrent() {
+  if (!state.current || !state.active) return;
+  var meta = state.sessions.find(function(item) {
+    return item.username === state.current.username
+      && item.session === state.current.session
+      && (!state.current.hostname || !item.hostname
+        || item.hostname === state.current.hostname);
+  });
+  if (meta && meta.active) return;
+  state.active = false;
+  state.current.active = false;
+  if (state.live) {
+    state.live = false;
+    setStatus('Session disconnected', 'error');
+  }
+  updateSessionHeader(state.current);
+  updateControls();
+}
+
 function openFromHash() {
+  if (openLiveFromHash()) return;
   if (state.current) return;
   var params = new URLSearchParams(location.hash.slice(1));
   var username = params.get('u');
@@ -1301,9 +1590,10 @@ function openFromHash() {
 }
 
 function createSessionItem(meta) {
-  var button = document.createElement('button');
-  button.type = 'button';
+  var button = document.createElement('div');
   button.className = 'session-item';
+  button.setAttribute('role', 'button');
+  button.tabIndex = 0;
   if (state.current && state.current.username === meta.username
       && state.current.session === meta.session) {
     button.classList.add('selected');
@@ -1345,6 +1635,31 @@ function createSessionItem(meta) {
     setSidebarVisible(false);
     openSession(meta);
   });
+  button.addEventListener('keydown', function(event) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      setSidebarVisible(false);
+      openSession(meta);
+    }
+  });
+  if (meta.active === true && (meta.viewid || meta.viewurl)) {
+    var live = document.createElement('div');
+    live.className = 'session-live';
+    [['view', 'View', meta.viewid || meta.viewurl],
+      ['share', 'Control', meta.shareid || meta.shareurl]].forEach(function(item) {
+      var href = liveHref(meta, item[0]);
+      if (!href) return;
+      var link = document.createElement('a');
+      link.className = 'live-link';
+      link.textContent = item[1];
+      link.href = href;
+      link.addEventListener('click', function(event) {
+        event.stopPropagation();
+      });
+      live.appendChild(link);
+    });
+    if (live.childNodes.length > 0) button.appendChild(live);
+  }
   return button;
 }
 
@@ -1559,5 +1874,7 @@ resizeObserver.observe(els.frame);
 new ResizeObserver(function() { drawActivity(); }).observe(els.activity);
 
 updateControls();
+openLiveFromHash();
+window.addEventListener('hashchange', function() { openLiveFromHash(); });
 loadPlaybackConfig().then(loadSessions, loadSessions);
 setInterval(loadSessions, 30000);

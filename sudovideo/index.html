@@ -24,6 +24,10 @@
       <div class="viewer-title">
         <h1 id="session-title">Select a session</h1>
         <div class="session-meta" id="session-meta"></div>
+        <div class="live-links">
+          <a class="icon-button hidden" id="live-view" href="#">Live stream</a>
+          <a class="icon-button hidden" id="live-share" href="#">Live control</a>
+        </div>
       </div>
       <div class="viewer-actions">
         <label class="pin" title="Keep the header visible"><input type="checkbox" id="pin-head">Pin</label>
@@ -38,7 +42,7 @@
       </div>
     </div>
     <div class="terminal-frame" id="terminal-frame">
-      <div class="head-tab" id="head-tab" title="Show header"></div>
+      <div class="head-tab hidden" id="head-tab" title="Show header"></div>
       <div class="terminal-host" id="terminal"></div>
       <div class="empty-state" id="empty-state">
         <div class="empty-title">No session selected</div>

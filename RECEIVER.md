@@ -44,8 +44,6 @@ upload_hostname=shell.example.com
 upload_hostkey=
 upload_interval_seconds=60
 upload_active_enabled=true
-upload_active_interval_seconds=1
-upload_watch_debounce_ms=500
 upload_remove_uploaded=false
 upload_connections=4
 upload_high_water_bytes=1048576
@@ -59,16 +57,12 @@ upload_ca=/etc/wslogin/upload-ca.pem
   normally detected by a recursive file monitor, so this only recovers from
   missed filesystem events. Defaults to `60`.
 - `upload_active_enabled` uploads snapshots of sessions that are still running.
-  Defaults to `true`; finished logs are always uploaded.
-- `upload_active_interval_seconds` is the minimum time between snapshots of the
-  same active session. Defaults to `1`, so writes are uploaded almost
-  immediately. Uploads of one session are serialized, and changes that arrive
-  during an upload are coalesced into the next snapshot so an older snapshot
-  can never overwrite a newer one on the receiver.
-- `upload_watch_debounce_ms` is how long the uploader waits after a filesystem
-  event before taking a snapshot, coalescing a burst of writes. Defaults to
-  `500`. Setting it too low uploads many tiny snapshots; raising
-  `upload_active_interval_seconds` bounds the rate further.
+  Defaults to `true`; finished logs are always uploaded. Snapshots are
+  event-driven: a recursive file monitor triggers a scan as soon as a log
+  changes, uploads of one session are serialized, and changes that arrive
+  during an upload are coalesced into the next snapshot, so a session is
+  uploaded as soon as new output is ready and the previous upload has finished
+  and an older snapshot can never overwrite a newer one on the receiver.
 - `upload_remove_uploaded` removes a finished session log and its checkpoint
   after it has been uploaded successfully instead of renaming the log to
   `.uploaded`. Defaults to `false`. Active logs are never removed.
@@ -136,8 +130,8 @@ printf '%s\n' "$(printf '%s' '<hostkey>' | sha256sum | cut -d' ' -f1)" \
 ```
 
 While a session is running the uploader monitors the `.json` log and uploads a
-new snapshot shortly after it changes (at most once per
-`upload_active_interval_seconds`). The receiver stores these snapshots in the
+new snapshot as soon as it changes and the previous upload of that session has
+finished. The receiver stores these snapshots in the
 `receiver_active_template` layout. Snapshots are consistent prefixes: the size
 is fixed before hashing and sending, so bytes appended during the transfer are
 picked up by the next snapshot. Active logs are not renamed.
@@ -313,7 +307,17 @@ evolve):
 ```
 
 `c` is the record type: `0` command, `1` terminal output, `2` user input,
-`3` exit status. `t` is a Unix timestamp and `d` the payload.
+`3` mouse pointer, `4` session header, `5` tailer. `t` is a Unix timestamp and
+`d` the payload. The first line of every log is the header record (`c:4`); its
+payload carries `viewid`, `shareid`, `viewurl` and `shareurl`, the viewonly and
+shared links of the wslogin host. The last line of a finished log is the
+tailer record (`c:5`); its payload carries `size` and `sha256` of the log
+without the tailer itself plus the session `endtime`, so a finished log is
+self-verifying. `wslogin` appends the tailer when a session ends and, at
+startup, fixes finished logs that predate it. The receiver stores the log
+as-is; the playback server reads the header from the file to offer live stream
+and live control links in sudovideo. These URLs grant live access to the
+terminal and must be treated as secrets.
 
 The uploader sends the **whole file** for every snapshot, including active
 sessions. The receiver should treat the upload as a snapshot and replace the

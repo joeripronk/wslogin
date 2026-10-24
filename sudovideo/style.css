@@ -213,6 +213,25 @@ button:disabled {
   border-color: #2d4a63;
 }
 
+.session-live {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.live-link {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--accent, #5aa9e6);
+  text-decoration: none;
+}
+
+.live-link:hover {
+  border-color: var(--accent, #5aa9e6);
+}
+
 .session-line {
   display: flex;
   align-items: center;
@@ -409,10 +428,24 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.head-tab:empty {
+.head-tab.hidden {
   display: none;
+}
+
+.live-links {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.icon-button.on {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .terminal-host .xterm {

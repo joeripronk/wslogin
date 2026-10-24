@@ -18,7 +18,7 @@ const { SerializeAddon } = require('@xterm/addon-serialize');
 const { render: renderTemplate, placeholders: templatePlaceholders,
   match: matchTemplate, isSafeRelative } = require('./template');
 
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 const DEFAULT_CHECKPOINT_INTERVAL_MS = 60000;
 const DEFAULT_CHECKPOINT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_CHECKPOINTS = 500;
@@ -31,7 +31,7 @@ const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const OSC_TITLE_RE = /\x1b\][012];([^\x07]*?)(?:\x07|\x1b\\)/g;
 const PASSWORD_PROMPT_RE = /(?:password|passphrase|passwort|wachtwoord)[^\r\n:]{0,80}:\s*$/i;
 const AUTH_CACHE_MS = 5 * 60 * 1000;
-const FOLLOW_POLL_MS = 300;
+const FOLLOW_POLL_MS = 100;
 const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const USERNAME_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$/;
 
@@ -649,6 +649,7 @@ function titleDescription(titles, lastTitle) {
             offset: next,
             cols: terminal.cols,
             rows: terminal.rows,
+            title: data.currentTitle,
             serialized: serialize.serialize()
           });
           lastCheckpointOffset = next;
@@ -671,6 +672,7 @@ function titleDescription(titles, lastTitle) {
       t: data.lastT,
       cols: terminal.cols,
       rows: terminal.rows,
+      title: data.currentTitle,
       serialized: serialize.serialize()
     };
     return data;
@@ -731,6 +733,7 @@ function titleDescription(titles, lastTitle) {
               offset: next,
               cols: terminal.cols,
               rows: terminal.rows,
+              title: data.currentTitle,
               serialized: serialize.serialize()
             });
             lastCheckpointOffset = next;
@@ -753,6 +756,7 @@ function titleDescription(titles, lastTitle) {
       t: data.lastT,
       cols: terminal.cols,
       rows: terminal.rows,
+      title: data.currentTitle,
       serialized: serialize.serialize()
     };
     return data;
@@ -792,6 +796,29 @@ function titleDescription(titles, lastTitle) {
 
   function isFinishedFile(file) {
     return file.endsWith('.done') || file.endsWith('.uploaded');
+  }
+
+  // The first line of a session log is a header record (c=4) whose payload
+  // carries the viewonly and share links of the session.
+  async function readSessionMeta(file) {
+    var handle = null;
+    try {
+      handle = await fs.promises.open(file, 'r');
+      var buffer = Buffer.alloc(8192);
+      var result = await handle.read(buffer, 0, buffer.length, 0);
+      var line = buffer.toString('utf-8', 0, result.bytesRead).split('\n')[0];
+      var record = JSON.parse(line);
+      if (record && record.c === 4) {
+        var meta = JSON.parse(record.d);
+        if (meta && typeof meta == 'object') return meta;
+      }
+    } catch (error) {
+    } finally {
+      if (handle) {
+        try { await handle.close(); } catch (error) {}
+      }
+    }
+    return {};
   }
 
   function isSafeSessionName(username, session) {
@@ -1019,6 +1046,7 @@ function titleDescription(titles, lastTitle) {
     var titleInfo = metadata && metadata.titleSeconds
       ? {titles: metadata.titleSeconds, lastTitle: metadata.currentTitle}
       : await scanTitles(entry.file);
+    var extra = await readSessionMeta(entry.file);
     var value = {
       username: entry.username,
       session: entry.session,
@@ -1036,7 +1064,15 @@ function titleDescription(titles, lastTitle) {
         ? normalizeActivity(metadata.activity, startdate, enddate) : null,
       description: titleDescription(titleInfo.titles, titleInfo.lastTitle),
       active: active,
-      finished: entry.finished
+      finished: entry.finished,
+      viewid: entry.finished ? null
+        : (typeof extra.viewid == 'string' ? extra.viewid : null),
+      shareid: entry.finished ? null
+        : (typeof extra.shareid == 'string' ? extra.shareid : null),
+      viewurl: entry.finished ? null
+        : (typeof extra.viewurl == 'string' ? extra.viewurl : null),
+      shareurl: entry.finished ? null
+        : (typeof extra.shareurl == 'string' ? extra.shareurl : null)
     };
     metaCache.set(entry.file, {key: key, value: value});
     return value;
@@ -1147,6 +1183,7 @@ function titleDescription(titles, lastTitle) {
         offset: checkpoint.offset,
         cols: checkpoint.cols,
         rows: checkpoint.rows,
+        title: checkpoint.title,
         serialized: checkpoint.serialized,
         activity: metadata.activity
       });
