@@ -1,0 +1,14 @@
+# PAM stack for wslogin sso login (copy to /etc/pam.d/wslogin).
+#
+# wslogin verifies the user with the session cookie of the auth server
+# and passes the password stored in that session (the one entered at
+# the auth server) to pam_authenticate, so the password is verified
+# against the system password database like any normal login.
+#
+# The wslogin-sso group gate is enforced by wslogin itself (sso_group
+# in /etc/wslogin/auth.ini).
+
+auth        required pam_unix.so
+account     required pam_unix.so
+password    required pam_unix.so
+session     required pam_permit.so

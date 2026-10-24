@@ -51,6 +51,16 @@ fi
 echo "Installing dependencies"
 (cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund)
 
+if [[ -r "${AUTH_CONF:-/etc/apache2/auth.conf}" ]]; then
+  AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" \
+    "$APP_DIR/sync-auth-conf.sh"
+fi
+
+if [[ ! -e /etc/pam.d/wslogin ]]; then
+  echo "Installing /etc/pam.d/wslogin from wslogin.pam.example"
+  cp "$APP_DIR/wslogin.pam.example" /etc/pam.d/wslogin
+fi
+
 if systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
   echo "Restarting ${SERVICE}.service"
   systemctl daemon-reload

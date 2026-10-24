@@ -18,6 +18,7 @@ const { loadSslOptions, allowPlaintext } = require('./ssl');
 const { render: renderTemplate, placeholders: templatePlaceholders,
   match: matchTemplate, isSafeRelative } = require('./template');
 const { createPlayback } = require('./playback');
+const { createSsoAuth } = require('./auth');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
@@ -590,6 +591,10 @@ function serve_www(request, response, relative) {
     fs.createReadStream(localpath).pipe(response);
   });
 }
+var ssoAuth = createSsoAuth();
+if (ssoAuth) {
+  console.log("sso login enabled for cookie "+ssoAuth.cookieName);
+}
 function httpHandler(request, response) {
   var url;
   try {
@@ -626,6 +631,21 @@ function httpHandler(request, response) {
   var relative = url.pathname.substring(1);
   if(relative == '') {
     relative = 'index.html';
+  }
+  if (ssoAuth && (relative == 'index.html' || relative == 'i.html')) {
+    var ssoUser = ssoAuth.username(request);
+    if (ssoUser && (!ssoAuth.ssoGroup || userInGroup(ssoUser, ssoAuth.ssoGroup))) {
+      var destHost = url.searchParams.get('d');
+      var destPath = url.searchParams.get('u') || '/';
+      if (destHost && ssoAuth.inDomain(destHost)
+          && destPath.startsWith('/') && !destPath.startsWith('//')) {
+        console.log("sso login for "+ssoUser+" to "+destHost+destPath);
+        response.statusCode = 302;
+        response.setHeader('Location', 'https://'+destHost+destPath);
+        response.end('');
+        return;
+      }
+    }
   }
   serve_www(request, response, relative);
 }
@@ -724,6 +744,39 @@ function getUuidFromCookies(cookies,cookiename) {
   return filtered.length > 0 ? filtered[0].value : null;
 }
 
+var groupcache = {time:0, lines:[]};
+function userInGroup(username, group) {
+  var nowms = Date.now();
+  if (nowms - groupcache.time > 10000) {
+    try {
+      groupcache.lines = fs.readFileSync('/etc/group', 'utf8').split('\n');
+      groupcache.time = nowms;
+    } catch (error) {
+      console.error("cannot read /etc/group: "+error.message);
+      return false;
+    }
+  }
+  var gid = null;
+  for (var i = 0; i < groupcache.lines.length; i++) {
+    var fields = groupcache.lines[i].split(':');
+    if (fields[0] == group) {
+      gid = parseInt(fields[2], 10);
+      if (fields[3].split(',').includes(username)) return true;
+    }
+  }
+  if (gid == null || !Number.isFinite(gid)) return false;
+  try {
+    var users = fs.readFileSync('/etc/passwd', 'utf8').split('\n');
+    for (var j = 0; j < users.length; j++) {
+      var pw = users[j].split(':');
+      if (pw[0] == username && parseInt(pw[3], 10) == gid) return true;
+    }
+  } catch (error) {
+    console.error("cannot read /etc/passwd: "+error.message);
+  }
+  return false;
+}
+
 
 // This callback function is called every time someone
 // tries to connect to the WebSocket server
@@ -764,8 +817,37 @@ wsServer.on('request', function(request) {
   // we need to know client index to remove them on 'close' event
   connection.write = connection.send;
   connection.read = connection.socket.read;
-  var cmd={cmd:"login"};
-  connection.sendUTF('\0' + JSON.stringify(cmd));
+  var ssoCred = ssoAuth ? ssoAuth.credentialsOf(getUuidFromCookies(request.cookies,ssoAuth.cookieName)) : false;
+  var ssoUser = ssoCred ? ssoCred.user : false;
+  if (ssoUser && ssoUser != 'root') {
+    if (ssoAuth.ssoGroup && !userInGroup(ssoUser, ssoAuth.ssoGroup)) {
+      console.log("sso user "+ssoUser+" is not in group "+ssoAuth.ssoGroup);
+      connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
+    } else if (ssoAuth.verifyPassword) {
+      if (!ssoCred.password) {
+        console.log("sso session of "+ssoUser+" has no stored password, pam verification impossible");
+        connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
+      } else {
+        pam.authenticate(ssoUser, ssoCred.password, function(err) {
+          if (err) {
+            console.log("pam verification failed for sso user "+ssoUser+": "+err);
+            connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
+          } else {
+            console.log("sso login for "+ssoUser+" on websocket");
+            connection.username=ssoUser;
+            connection.sessioncookie=create_pty(ssoUser,false,connection.columns,connection.rows,connection);
+          }
+        }, {serviceName: ssoAuth.pamService, remoteHost: remote});
+      }
+    } else {
+      console.log("sso login for "+ssoUser+" on websocket (pam verification disabled)");
+      connection.username=ssoUser;
+      connection.sessioncookie=create_pty(ssoUser,false,connection.columns,connection.rows,connection);
+    }
+  } else {
+    var cmd={cmd:"login"};
+    connection.sendUTF('\0' + JSON.stringify(cmd));
+  }
   /*
     if (uuidcookie==undefined) {
       uuidcookie=uuid_v4();
@@ -1162,7 +1244,7 @@ wsServer.on('request', function(request) {
                         connection.username=m.username;
                         connection.sessioncookie=create_pty(m.username,false,connection.columns,connection.rows,connection);
                       }
-                    }, {serviceName: 'sshd', remoteHost: remote});
+                    }, {serviceName: config.pam_service || 'sshd', remoteHost: remote});
                   } else {
                     connection.sendUTF('\1session denied\n\r');
                     connection.close();
