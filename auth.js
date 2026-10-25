@@ -250,6 +250,8 @@ function createSsoAuth(authPath) {
   }
   return {
     cookieName: conf.cookieName,
+    // the configured cookie domain, null when the cookie is host-less.
+    domain: conf.domain || null,
     verifyPassword: conf.verifyPassword,
     pamService: conf.pamService,
     ssoGroup: conf.ssoGroup,

@@ -119,6 +119,11 @@ if [[ -r "${AUTH_CONF:-/etc/apache2/auth.conf}" ]]; then
   AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" "$APP_DIR/sync-auth-conf.sh"
 fi
 
+# command-line client: symlink so node resolves its requires from $APP_DIR
+echo "Installing wslogin command in /usr/local/bin"
+chmod 0755 "$APP_DIR/wslogin-cli.js"
+ln -sf "$APP_DIR/wslogin-cli.js" /usr/local/bin/wslogin
+
 if [[ ! -e /etc/pam.d/wslogin ]]; then
   echo "Installing /etc/pam.d/wslogin from wslogin.pam.example"
   cp "$APP_DIR/wslogin.pam.example" /etc/pam.d/wslogin

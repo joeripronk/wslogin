@@ -409,6 +409,37 @@ function read_session_header(file) {
   return null;
 }
 
+// The session's current reconnect token, persisted outside the session
+// log: the log (and its header) is uploaded to receivers, and the token
+// is a credential. The sidecar file is server-owned, never uploaded
+// (the uploader only picks up .json files), and lets browser and cli
+// clients reconnect across a wslogin restart.
+function save_reconnect_token(username, sessioncookie) {
+  var session = sessions[username] && sessions[username][sessioncookie];
+  if (!session || !session.reconnectid) return;
+  try {
+    fs.writeFileSync(session_log_path(username, sessioncookie) + '.reconnect',
+      session.reconnectid, {mode: 0o600});
+  } catch (error) {}
+}
+
+function read_reconnect_token(username, sessioncookie) {
+  try {
+    var token = fs.readFileSync(session_log_path(username, sessioncookie)
+      + '.reconnect', 'utf-8').trim();
+    return /^[0-9a-zA-Z-]+$/.test(token) ? token : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function delete_reconnect_token(username, sessioncookie) {
+  try {
+    fs.rmSync(session_log_path(username, sessioncookie) + '.reconnect',
+      {force: true});
+  } catch (error) {}
+}
+
 // Rebuild a live session from its header meta after a wslogin restart. The
 // tmux server (and the shell in it) survived; re-attach and restore the map
 // entries so the user can reconnect.
@@ -416,8 +447,10 @@ function resume_session(meta) {
   var username = meta.username, sessioncookie = meta.sessioncookie;
   var cols = meta.cols || 80, rows = meta.rows || 24;
   // reconnectid is deliberately not stored in the session log header (the
-  // header is uploaded with the log); a resumed session gets a fresh token.
-  var reconnectid = meta.reconnectid || uuid_v4();
+  // header is uploaded with the log); the current token is kept in the
+  // local sidecar file so reconnect tokens survive a restart
+  var reconnectid = read_reconnect_token(username, sessioncookie)
+    || meta.reconnectid || uuid_v4();
   sessions[username] = sessions[username] || {};
   sessions[username][sessioncookie] = {
     viewid: meta.viewid, shareid: meta.shareid,
@@ -430,6 +463,7 @@ function resume_session(meta) {
   try { session.logBytes = fs.statSync(logfile).size; } catch (error) { session.logBytes = 0; }
   session.mirror = create_mirror(cols, rows);
   reconnects[reconnectid] = {username: username, sessioncookie: sessioncookie};
+  save_reconnect_token(username, sessioncookie);
   views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
   shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
   var shellenv = { USER: username, VIEWID: meta.viewid, VIEWURL: meta.viewurl, SUDO_USER: username, LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
@@ -443,6 +477,9 @@ function resume_session(meta) {
       if (session.mirror) {
         session.mirror.terminal.resize(serial.cols, serial.rows);
         session.mirror.terminal.write(serial.s);
+        // restore the window title the session had before the restart
+        var title = extract_title(serial.s);
+        if (title) session.mirror.title = title;
       }
     }).catch(function() {});
   }
@@ -455,7 +492,9 @@ var nextIndex = 0;
 // failed login tracking, ip -> {count, first, blocked_until}. Attempts are
 // counted when they arrive, not when PAM answers, so parallel floods are
 // bound by the same limit; a success clears the counter.
-var logins = {};
+// null-prototype maps: ids and ips are attacker-controlled keys, a plain
+// {} would let '__proto__' and friends pass `in` checks.
+var logins = Object.create(null);
 var login_max_attempts = configInt('login_max_attempts', 5);
 var login_window_seconds = configInt('login_window_seconds', 300);
 var login_block_seconds = configInt('login_block_seconds', 900);
@@ -478,10 +517,10 @@ function loginAttempt(ip) {
   }
   logins[ip] = a;
 }
-var sessions = {};
-var views = {};
-var shares = {};
-var reconnects = {};
+var sessions = Object.create(null);
+var views = Object.create(null);
+var shares = Object.create(null);
+var reconnects = Object.create(null);
 
 // A log that still exists without the .done suffix at startup belongs to a
 // session that was interrupted by a crash, so mark it finished for uploader.js.
@@ -674,6 +713,8 @@ async function create_replayed_terminal (file, checkpointfile) {
             const c=JSON.parse(json.d);
             if (c.cmd=="resize") {
               terminal.resize(c.cols,c.rows);
+            } else if (c.cmd=="b64") {
+              terminal.write(Buffer.from(c.data,'base64'));
             }
           } else if (json.c==1) {
             terminal.write(json.d);
@@ -801,6 +842,7 @@ function attach_tmux(username, sessioncookie, cols, rows, env, sock) {
     cols: cols,
     rows: rows,
     cwd: '/',
+    encoding: null,
     env: env
   });
 }
@@ -873,8 +915,23 @@ function pump_mirror(session) {
   }
 }
 
+// The window title a terminal last set with OSC 0/2. The headless mirror
+// terminal ignores title sequences, so it is tracked from the raw stream.
+function extract_title(s) {
+  var last = '';
+  var re = /\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  var m;
+  s = String(s);
+  while ((m = re.exec(s)) !== null) last = m[1];
+  return last;
+}
+
 function queue_mirror(session, op) {
   if (!session.mirror) return;
+  if (op.type === 'data' && session.mirror) {
+    var title = extract_title(op.data);
+    if (title) session.mirror.title = title;
+  }
   session.mirror.queue.push(op);
   pump_mirror(session);
 }
@@ -886,15 +943,22 @@ function wire_session(username, sessioncookie) {
   var ptyproc = session.pty;
   ptyproc.on('data', function(data) {
     var senddata=false;
-    if (JSON.stringify(data)) {
-      var log={t:now(),d:data,c:1};
+    // node-pty emits raw Buffers (encoding: null). A utf8 round-trip that
+    // yields the same bytes proves the chunk is valid utf8; invalid bytes
+    // (8-bit apps, binary noise) go through the base64 channel instead of
+    // being corrupted into U+FFFD by the utf8 coercion.
+    var text=data.toString('utf8');
+    if (Buffer.compare(Buffer.from(text,'utf8'), data) === 0) {
+      var log={t:now(),d:text,c:1};
       var written=append_session_log(session,log);
-      queue_mirror(session,{type:'data',data:data,offset:written.offset,bytes:written.bytes});
-      senddata='\1'+ data;
+      queue_mirror(session,{type:'data',data:text,offset:written.offset,bytes:written.bytes});
+      senddata='\1'+ text;
     } else {
-      cmd={cmd:'b64',data:btoa(data)}
+      var cmd={cmd:'b64',data:data.toString('base64')};
       var log={t:now(),d:JSON.stringify(cmd),c:0};
-      append_session_log(session,log);
+      var written=append_session_log(session,log);
+      // keep the checkpoint mirror in sync: xterm accepts raw Buffers
+      queue_mirror(session,{type:'data',data:data.slice(),offset:written.offset,bytes:written.bytes});
       senddata='\0'+ JSON.stringify(cmd);
     }
     for (const [key, conn] of Object.entries(session['connections'])) {
@@ -948,6 +1012,7 @@ function wire_session(username, sessioncookie) {
     finish_session(username, sessioncookie);
     delete views[session.viewid];
     delete reconnects[session.reconnectid];
+    delete_reconnect_token(username, sessioncookie);
     delete shares[session.shareid];
     kill_tmux_session(username, sessioncookie);
     delete sessions[username][sessioncookie];
@@ -1383,7 +1448,7 @@ function serialize_mirror(session) {
     return {
       cols: mirror.terminal.cols,
       rows: mirror.terminal.rows,
-      title: mirror.terminal.title || '',
+      title: (mirror.title || mirror.terminal.title) || '',
       s: serialize_terminal(mirror.terminal, mirror.serializeAddon)
     };
   } catch (error) {
@@ -1575,12 +1640,18 @@ wsServer.on('request', function(request) {
       var rpty = sessions[username][sessioncookie].pty;
       if (rpty) {
       try {
-        rpty.resize(serial.cols+1,serial.rows);
+        rpty.resize(serial.cols+1,serial.rows+1);
         console.log("resizing "+sessioncookie+' to '+(serial.cols+1)+'x'+(serial.rows+1));
         setTimeout(function() {
           try {
-            rpty.resize(serial.cols, serial.rows);
-            console.log("resizing back to "+sessioncookie+' to '+(serial.cols)+'x'+(serial.rows));
+            // resize back to the client's current size: a browser fits
+            // its element to the replay geometry and resends its own
+            // size in the meantime, a terminal client (wslogin cli)
+            // never fits the session geometry and must win
+            var tcols = connection.columns || serial.cols;
+            var trows = connection.rows || serial.rows;
+            rpty.resize(tcols, trows);
+            console.log("resizing back to "+sessioncookie+' to '+tcols+'x'+trows);
           } catch (error) {
             console.log("resize back failed: "+error.message);
           }
@@ -1636,10 +1707,12 @@ wsServer.on('request', function(request) {
           connection.paused=true;
           if (!sessions[username][sessioncookie].pty) {
             // detached session (owner disconnected, tmux server alive):
-            // spawn a fresh attach client before wiring the connection
+            // spawn a fresh attach client before wiring the connection,
+            // at the reconnecting client's geometry (the stored session
+            // geometry is only a fallback for pre-login reconnects)
             reattach_session(username, sessioncookie,
-              sessions[username][sessioncookie].cols || connection.columns,
-              sessions[username][sessioncookie].rows || connection.rows);
+              connection.columns || sessions[username][sessioncookie].cols,
+              connection.rows || sessions[username][sessioncookie].rows);
           }
           if(connection.viewonly) {
             console.log("view started for "+username+" "+sessioncookie);
@@ -1661,18 +1734,16 @@ wsServer.on('request', function(request) {
                 reconnects[oldreconnectid]={username:username,stale:true,time:now()};
                 console.log("rotated reconnect token for "+sessioncookie);
               }
+              save_reconnect_token(username, sessioncookie);
             }
             sessions[username][sessioncookie].pty.main=connection;
             notifyPickers(username);
           } 
+          // replay_pty is async and drains connection.sendbuffer itself,
+          // after the replayed screen is sent; draining here would deliver
+          // live output buffered during the replay before that screen and
+          // the client would render the older replay on top of it.
           replay_pty(username,sessioncookie,cols,rows,connection);
-          while(connection.sendbuffer.length>0) {
-            buf=connection.sendbuffer.shift();
-            if (buf!=false) {
-              console.log("sending late buffered to "+index);
-              connection.sendUTF(buf);
-            }
-          }
           console.log("done sending replay for "+sessioncookie);
           break;
         }
@@ -1689,6 +1760,7 @@ wsServer.on('request', function(request) {
       //  if (!(sessioncookie in sessions[username])) {
       sessions[username][sessioncookie]={viewid:viewid,shareid:shareid,reconnectid:reconnectid,connections:{}};
       reconnects[reconnectid]={username:username,sessioncookie:sessioncookie};
+      save_reconnect_token(username, sessioncookie);
       //  }
       var session=sessions[username][sessioncookie];
       session.sessioncookie=sessioncookie;
@@ -1705,6 +1777,7 @@ wsServer.on('request', function(request) {
           cols: connection.columns,
           rows: connection.rows,
           cwd: '/',
+          encoding: null,
           env: shellenv
         });
       }
@@ -1762,7 +1835,17 @@ wsServer.on('request', function(request) {
   // attached to the first one automatically.
   function ssoAutoLogin(ssoUser) {
     if (listDisconnected(ssoUser).length > 0) {
-      offerDisconnected(ssoUser, connection);
+      // Let the client authenticate itself first: browser tabs keep a
+      // reconnect token in sessionStorage and answer the login prompt
+      // with it, which reattaches their exact session. Only offer the
+      // picker to connections that did not present anything (new tabs).
+      connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
+      var pickerConn = connection;
+      setTimeout(function() {
+        if (pickerConn.closeReasonCode !== -1) return;
+        if (pickerConn.username || pickerConn.sessioncookie !== false) return;
+        offerDisconnected(ssoUser, pickerConn);
+      }, 1000);
     } else {
       connection.username = ssoUser;
       connection.sessioncookie = create_pty(ssoUser, false,
@@ -2014,52 +2097,74 @@ wsServer.on('request', function(request) {
                     connection.columns=m.cols;
                     connection.rows=m.rows;
                   }
-                  if ('cookie' in m && m.cookie.match('^[0-9a-zA-Z-]+$')) {
-                    if ('cookie_dir' in config) {
-                      const cookiefile=config.cookie_dir+"/cookie_"+m.cookie+".json";
-                      // stat asynchronously: a cookie is removed on use, a
-                      // synchronous statSync on a raced/deleted cookie file
-                      // would throw and crash the server
-                      fs.stat(cookiefile, function(staterr, stat) {
-                        if (staterr) {
-                          connection.sendUTF('\1broken session '+staterr);
-                          connection.close();
-                          return;
-                        }
-                        fs.rm(cookiefile, function (err) {
-                          if (err) {
-                            connection.sendUTF('\1broken session '+err);
-                            connection.close();
-                          } else {
-                            if ('uid' in stat) {
-                              const uname=userid.username(stat.uid); 
-                              if (uname!=undefined && uname!='root' ) {
-                                connection.username=uname; 
-                                console.log("got username "+connection.username+" from cookie "+m.cookie);
-                                connection.sessioncookie=create_pty(connection.username,false,false,false,connection);
-                              } else {
-                                connection.close();
-                              }
-                            } else {
-                              connection.sendUTF('\1who are you?\n\r');
-                              connection.close();
-                            }
-                          }
-                        })
-                      })
-                    } else {
-                      connection.sendUTF('\1local sessions disabled\n\r');
-                      connection.close();
-                    }
-                  } else if ('username' in m && 'password' in m) {
+                   if ('cookie' in m && m.cookie.match('^[0-9a-zA-Z-]+$')) {
+                     if ('cookie_dir' in config) {
+                       const cookiefile=config.cookie_dir+"/cookie_"+m.cookie+".json";
+                       // lstat asynchronously: a cookie is removed on use, a
+                       // synchronous statSync on a raced/deleted cookie file
+                       // would throw and crash the server. lstat (not stat)
+                       // so a symlink in the world-writable cookie dir
+                       // cannot borrow another user's file ownership.
+                       fs.lstat(cookiefile, function(staterr, stat) {
+                         if (staterr) {
+                           connection.sendUTF('\1broken session '+staterr);
+                           connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
+                           connection.close();
+                           return;
+                         }
+                         if (!('uid' in stat)) {
+                           connection.sendUTF('\1who are you?\n\r');
+                           connection.close();
+                           return;
+                         }
+                         const uname=userid.username(stat.uid);
+                         if (uname==undefined || uname=='root') {
+                           connection.close();
+                           return;
+                         }
+                         // a cookie older than the max age requires a full
+                         // login again; the file is removed best-effort
+                         var maxAgeDays = configInt('cookie_max_age_days', 7);
+                         if (maxAgeDays > 0 && Date.now() - stat.mtimeMs > maxAgeDays*86400*1000) {
+                           fs.rm(cookiefile, {force:true}, function(){});
+                           connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
+                           return;
+                         }
+                         connection.username=uname;
+                         console.log("got username "+connection.username+" from cookie "+m.cookie);
+                         // the cookie is single-use: removed best-effort (a
+                         // sticky dir lets only the owner delete, and the
+                         // client rotates its cookie file on every login)
+                         fs.rm(cookiefile, {force:true}, function(){});
+                         if (m.picker) {
+                           connection.peer=uname;
+                           offerDisconnected(uname, connection);
+                         } else {
+                           connection.sessioncookie=create_pty(connection.username,false,connection.columns,connection.rows,connection);
+                         }
+                       })
+                     } else {
+                       connection.sendUTF('\1local sessions disabled\n\r');
+                       connection.close();
+                     }
+                   } else if ('username' in m && 'password' in m) {
                     var blocked = loginBlockSeconds(clientIp);
                     if (blocked > 0) {
                       sendError(connection, "too many failed logins, try again in "+Math.ceil(blocked)+"s");
                       connection.sendUTF('\0' + JSON.stringify({cmd:"authfailed"}));
                       break;
                     }
-                    loginAttempt(clientIp);
-                    pam.authenticate(m.username, m.password, function(err) {
+                     loginAttempt(clientIp);
+                     // root is refused on every other login path (cookie,
+                     // sso, wslogin-run); wslogin-run would refuse the spawn
+                     // anyway, reject it here for a clear, consistent error
+                     if (m.username == 'root') {
+                       console.log("root login rejected");
+                       sendError(connection, "root login is not allowed");
+                       connection.sendUTF('\0' + JSON.stringify({cmd:"authfailed"}));
+                       break;
+                     }
+                     pam.authenticate(m.username, m.password, function(err) {
                       if(err) {
                         sendError(connection,err);
                         var cmd={cmd:"authfailed"};
@@ -2068,7 +2173,15 @@ wsServer.on('request', function(request) {
                       } else {
                         delete logins[clientIp];
                         connection.username=m.username;
-                        connection.sessioncookie=create_pty(m.username,false,connection.columns,connection.rows,connection);
+                        // picker=true: authenticate only, then offer this
+                        // user's disconnected terminals (wslogin-cli flow).
+                        // The peer identity lets 'pick' accept the session.
+                        if (m.picker) {
+                          connection.peer=m.username;
+                          offerDisconnected(m.username, connection);
+                        } else {
+                          connection.sessioncookie=create_pty(m.username,false,connection.columns,connection.rows,connection);
+                        }
                       }
                     }, {serviceName: config.pam_service || 'sshd', remoteHost: remote});
                   } else {
@@ -2089,7 +2202,11 @@ wsServer.on('request', function(request) {
           if (connection.sessioncookie!=false && !connection.viewonly) {
             var input=message.utf8Data.substr(1);
             var log={t:now(),d:input,c:2};
-            var isession=sessions[connection.username][connection.sessioncookie];
+            // the session may have ended (and its maps deleted) while this
+            // keystroke was in flight: guard the lookup, an uncaught
+            // TypeError in this callback would crash the whole server
+            var usermap=sessions[connection.username];
+            var isession=usermap && usermap[connection.sessioncookie];
             if (isession && isession.pty) {
               append_session_log(isession,log);
               isession.pty.write(message.utf8Data.substr(1));

@@ -5,3 +5,6 @@ ssl/
 server.pid
 receiver.pid
 wslogin-run
+sessions/
+cookies/
+uploads/

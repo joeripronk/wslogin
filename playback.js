@@ -325,6 +325,15 @@ function createPlayback(config, options) {
   var cacheStates = new Map();
   var metaCache = new Map();
   var loginSessions = new Map();
+  // purge expired login sessions periodically: createLoginSession only
+  // prunes when the map is over the limit, so below the limit expired
+  // entries would accumulate indefinitely
+  setInterval(function() {
+    var nowms = Date.now();
+    loginSessions.forEach(function(value, key) {
+      if (value.expires <= nowms) loginSessions.delete(key);
+    });
+  }, 60000).unref();
 
   function log(message) {
     console.log('[playback] ' + message);

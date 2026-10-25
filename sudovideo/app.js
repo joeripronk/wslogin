@@ -1173,8 +1173,10 @@ function handleMessage(message, streamId) {
   }
   if (!Number.isFinite(event.t)) event.t = state.time;
 
-  if (event.t <= state.seekTarget + 0.000001
-      || (state.live && event.t <= state.time)) {
+  // Live streams the file directly like the wslogin pty endpoint: every
+  // event that arrives is applied to the terminal right away, no queue,
+  // no clock, no speed factor.
+  if (event.t <= state.seekTarget + 0.000001 || state.live) {
     applyEvent(event);
     state.time = Math.max(state.time, event.t);
   } else {
@@ -1660,6 +1662,11 @@ function renderShot(shot, data) {
     theme: {background: '#090b0e', foreground: '#d8dee8'}
   });
   term.open(shot);
+  // The DOM renderer's text at thumbnail scale rasterizes to sub-pixel
+  // strokes that read as blank; the canvas renderer scales down legibly.
+  if (window.CanvasAddon) {
+    try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (error) {}
+  }
   thumbTerms.push(term);
   shot.__term = term;
   if (data.serialized) {

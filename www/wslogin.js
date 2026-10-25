@@ -579,8 +579,12 @@ function onmessage(message) {
       var json = JSON.parse(data);
       switch(json.cmd) {
         case 'b64':
-          // non utf 
-          term.write(atob(json.data));
+          // non utf8: write the raw bytes, not a latin1 string that xterm
+          // would re-encode as utf8
+          var bin=atob(json.data);
+          var bytes=new Uint8Array(bin.length);
+          for (var i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+          term.write(bytes);
           break;;
         case 'resize':
           if (term.cols!=json.cols || term.rows!=json.rows) {
