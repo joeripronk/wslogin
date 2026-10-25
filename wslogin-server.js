@@ -1843,6 +1843,9 @@ wsServer.on('request', function(request) {
       var pickerConn = connection;
       setTimeout(function() {
         if (pickerConn.closeReasonCode !== -1) return;
+        // auth is async (pam, cookie lstat): a slow backend finishes after
+        // this timer, so a pending login counts as answered
+        if (pickerConn.authpending) return;
         if (pickerConn.username || pickerConn.sessioncookie !== false) return;
         offerDisconnected(ssoUser, pickerConn);
       }, 1000);
@@ -2105,7 +2108,9 @@ wsServer.on('request', function(request) {
                        // would throw and crash the server. lstat (not stat)
                        // so a symlink in the world-writable cookie dir
                        // cannot borrow another user's file ownership.
+                       connection.authpending = true;
                        fs.lstat(cookiefile, function(staterr, stat) {
+                         connection.authpending = false;
                          if (staterr) {
                            connection.sendUTF('\1broken session '+staterr);
                            connection.sendUTF('\0' + JSON.stringify({cmd:"login"}));
@@ -2164,7 +2169,9 @@ wsServer.on('request', function(request) {
                        connection.sendUTF('\0' + JSON.stringify({cmd:"authfailed"}));
                        break;
                      }
+                     connection.authpending = true;
                      pam.authenticate(m.username, m.password, function(err) {
+                        connection.authpending = false;
                       if(err) {
                         sendError(connection,err);
                         var cmd={cmd:"authfailed"};
