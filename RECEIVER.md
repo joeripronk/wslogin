@@ -197,6 +197,14 @@ had and re-announces every present log, so the receiver's true state is
 re-synced (an intact copy is confirmed in a single roundtrip, a missing or
 damaged one is uploaded again).
 
+The same resync closes the loop in the other direction: every completed scan
+ends with a full `list` of the local sessions and the uploader signals `gone`
+for sessions a scan no longer finds, so the receiver archives active snapshots
+of sessions that are gone on the sender as deleted sessions (see Protocol §5).
+Finished archives stay untouched. Hosts that announce at least one session
+resync fully; a host whose sessions all vanished while it was offline is only
+cleaned once it announces sessions again (§5).
+
 ## Running
 
 The uploader is a standalone executable:
@@ -397,6 +405,43 @@ or an error:
 
 `retryable` defaults to `true` when omitted. The client keeps the connection
 open after a stream is confirmed and closes it when shutting down.
+
+### 5. Prune (gone and list)
+
+Active snapshots are strays once the session log no longer exists on the
+uploader host (cleaned up, removed after upload, deleted while the host was
+offline). Two id-less JSON control messages keep the receiver's active
+directory in sync; both carry `hostname` and, where hostkeys are used, the
+`hostkey`:
+
+```json
+{"type": "gone", "hostname": "host", "username": "joeri", "session": "<uuid>"}
+{"type": "list", "hostname": "host", "sessions": [{"username": "joeri", "session": "<uuid>"}, ...], "last": true}
+```
+
+`gone` reports a single session whose log was removed locally. `list` carries
+the complete set of sessions the host currently has on disk; the receiver
+prunes every active copy of that host not listed. A large list is split into
+chunks on one connection; the receiver accumulates them and prunes when the
+chunk with `"last": true` arrives. An empty list is ignored, so a scan that
+finds nothing (unmounted `session_dir`, config change) cannot archive a
+host's whole active directory. The uploader sends `gone` when a scan finds a
+session that the previous scan still had, and sends the full `list` after
+every completed scan, so a (re)connect resyncs the receiver as long as the
+host keeps at least one session: when a host's sessions all disappear while
+it is offline, the first list after reconnect is empty and ignored, and the
+receiver's strays for that host are only pruned once it announces sessions
+again.
+
+Pruning only affects **active** copies and is scoped to the announcing
+hostname. A pruned copy is not deleted: the receiver moves it to the archive
+layout and appends a tailer record (`c:5`) whose payload carries the size,
+SHA-256 and end time plus `"note": "deleted session"`, so the last snapshot
+of a cleaned-up session stays available as a finished record. When the
+finished copy of that session is already archived, the stale active copy is
+discarded instead. Finished archives are never rewritten. Messages without a
+valid hostname/username/session or a rejected hostkey are ignored. There is
+no reply.
 
 ## Responses
 

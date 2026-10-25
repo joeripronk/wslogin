@@ -934,6 +934,7 @@ function wire_session(username, sessioncookie) {
       session.cols = ptyproc.cols;
       session.rows = ptyproc.rows;
       session.pty = false;
+      notifyPickers(username);
       return;
     }
     for (const [key, conn] of Object.entries(session['connections'])) {
@@ -953,6 +954,7 @@ function wire_session(username, sessioncookie) {
     if (Object.keys(sessions[username]).length===0) {
       delete sessions[username];
     }
+    notifyPickers(username);
   });
 }
 
@@ -1356,7 +1358,7 @@ function hasValidSessionCookie(uuidcookie) {
 }
 
 // The username a local session cookie belongs to: cookie files are written
-// by client.js inside the session shell, so the file owner is the session
+// by the in-session login helper, so the file owner is the session
 // user. false for an unusable cookie.
 function cookieUsername(uuidcookie) {
   if (!('cookie_dir' in config)) return false;
@@ -1410,6 +1412,22 @@ function listDisconnected(username) {
     }
   }
   return list;
+}
+
+// Connections currently showing the reconnect picker, by connection index.
+// When a user's set of disconnected sessions changes (owner disconnects,
+// a session is picked/reconnected, a session ends), the pickers of that
+// user are pushed the fresh list so they update without a reload.
+var pickers = {};
+function notifyPickers(username) {
+  if (!username) return;
+  for (const idx in pickers) {
+    var conn = pickers[idx];
+    if (conn.pickerUser != username) continue;
+    try {
+      conn.sendUTF('\0' + JSON.stringify({cmd:"sessions", list:listDisconnected(username)}));
+    } catch (error) {}
+  }
 }
 
 var groupcache = {time:0, lines:[]};
@@ -1491,6 +1509,7 @@ wsServer.on('request', function(request) {
   var liveShare = typeof liveQuery.share === 'string' ? liveQuery.share : null;
   var ssoCred = ssoAuth ? ssoAuth.credentialsOf(getUuidFromCookies(request.cookies,ssoAuth.cookieName)) : false;
   var ssoUser = ssoCred ? ssoCred.user : false;
+  var index = nextIndex++;
   connection.peer = (ssoUser && ssoUser != 'root') ? ssoUser : false;
   // Only use sso login when there is no valid local session cookie: a client
   // that can reconnect to its own session must not be auto-logged in via sso,
@@ -1585,6 +1604,9 @@ wsServer.on('request', function(request) {
     var viewid=false;
     connection.loggedin=true;
     connection.username=username;
+    // this connection attached (picked/reconnected/new): it no longer
+    // watches the picker
+    delete pickers[index];
     if (!forceNew && ( username in sessions)) {
       var list='sessioncookies:\r\n';
       // When a specific session is requested (reconnect/pick), attach to that
@@ -1641,6 +1663,7 @@ wsServer.on('request', function(request) {
               }
             }
             sessions[username][sessioncookie].pty.main=connection;
+            notifyPickers(username);
           } 
           replay_pty(username,sessioncookie,cols,rows,connection);
           while(connection.sendbuffer.length>0) {
@@ -1724,6 +1747,8 @@ wsServer.on('request', function(request) {
     var list = listDisconnected(username);
     if (list.length > 0) {
       connection.username = username;
+      connection.pickerUser = username;
+      pickers[index] = connection;
       console.log("offering "+list.length+" disconnected terminal(s) to "+username);
       connection.sendUTF('\0' + JSON.stringify({cmd:"sessions", list:list}));
     } else {
@@ -1790,9 +1815,6 @@ wsServer.on('request', function(request) {
     sendError(connection, expired);
     console.log(mode+" link does not exist (anymore)");
   }
-
-  var index = nextIndex++;
-
 
   console.log('Connection from ['+remote+'] '+index+' accepted.');
 
@@ -2110,6 +2132,7 @@ wsServer.on('request', function(request) {
 
   // user disconnected
   connection.on('close', function(close) {
+    delete pickers[index];
     if (connection.username) {
       console.log('['+remote+'] Disconnected '+connection.sessioncookie+' '+index);
       if (( connection.username in sessions)) {
@@ -2119,6 +2142,7 @@ wsServer.on('request', function(request) {
 	if (connection.username in sessions && connection.sessioncookie in sessions[connection.username] && sessions[connection.username][connection.sessioncookie].pty && sessions[connection.username][connection.sessioncookie].pty.main == connection) {
 	  console.log("Main connection for "+connection.username+" "+connection.sessioncookie+" disconnected");
 	  sessions[connection.username][connection.sessioncookie].pty.main=false;
+	  notifyPickers(connection.username);
         // owner gone: end its tmux client (the shell in the tmux server
         // keeps running for a reconnect); viewer/sharer connections share
         // the owner's view and do not end it.

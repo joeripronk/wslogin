@@ -614,6 +614,194 @@ function handleCorrupt(conn, stream) {
   resetForReplace(stream);
 }
 
+var PRUNE_MAX_SESSIONS = 100000;
+var LIST_KEY_CAP = 200000;
+
+// Appends the tailer record (c:5, same shape as server.js) to a log that is
+// archived by pruning, with a note marking it as a deleted session. The
+// payload records the size and SHA-256 of the file without the tailer.
+// Empty logs get no tailer (same rule as server.js write_tailer). Returns
+// the final size and SHA-256 of the complete archived file.
+function appendDeletedTailer(file) {
+  var stat = fs.statSync(file);
+  var size = stat.size;
+  var endtime = Date.now() / 1000;
+  if (size === 0) {
+    return {size: 0, sha256: sha256hex(Buffer.alloc(0))};
+  }
+  var hash = crypto.createHash('sha256');
+  var fd = fs.openSync(file, 'r');
+  try {
+    var buffer = Buffer.alloc(256 * 1024);
+    var offset = 0;
+    while (offset < size) {
+      var read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - offset),
+        offset);
+      if (read <= 0) break;
+      hash.update(buffer.subarray(0, read));
+      offset += read;
+    }
+  } finally { fs.closeSync(fd); }
+  var contentSha256 = hash.copy().digest('hex');
+  var tail = {t: endtime, c: 5, d: JSON.stringify({
+    size: size,
+    sha256: contentSha256,
+    endtime: endtime,
+    note: 'deleted session'
+  })};
+  var tailText = JSON.stringify(tail) + '\n';
+  fs.appendFileSync(file, tailText);
+  hash.update(Buffer.from(tailText, 'utf8'));
+  return {size: size + Buffer.byteLength(tailText), sha256: hash.digest('hex')};
+}
+
+// Moves a pruned active copy into the archive layout, appends the deleted-
+// session tailer and updates the meta. When the final copy is already
+// archived, the active copy is stale and is discarded. Returns true when a
+// copy was archived, false when it was discarded.
+function archiveDeletedCopy(stored, paths) {
+  var meta = {
+    hostname: stored.hostname,
+    username: stored.username,
+    session: stored.session,
+    kind: stored.kind || 'log',
+    startdate: stored.startdate
+  };
+  var archive = archivePaths(meta);
+  var existing = loadMetaAt(archive);
+  if (existing && existing.finished === true && archive.file !== paths.file) {
+    removeStoredAt(paths);
+    return false;
+  }
+  if (archive.file !== paths.file) {
+    fs.mkdirSync(archive.dir, {recursive: true});
+    fs.renameSync(paths.file, archive.file);
+  }
+  var final = appendDeletedTailer(archive.file);
+  saveMetaAt(archive, {
+    hostname: meta.hostname,
+    username: meta.username,
+    session: meta.session,
+    kind: meta.kind,
+    size: final.size,
+    sha256: final.sha256,
+    startdate: meta.startdate,
+    finished: true,
+    time: Date.now() / 1000
+  });
+  if (archive.metaFile !== paths.metaFile) clearMetaAt(paths);
+  return true;
+}
+
+// Prunes active copies of a host whose (username, session) key is in the
+// action set. mode 'delete' prunes exactly the listed sessions (gone
+// signal), mode 'keep' prunes every active copy of the host not listed
+// (full list sync). Pruned copies are archived with a deleted-session
+// tailer, never deleted. Finished archives are final records and are never
+// touched.
+function pruneActiveCopies(hostname, keys, mode) {
+  var pruned = 0;
+  function walk(dir) {
+    var items;
+    try {
+      items = fs.readdirSync(dir, {withFileTypes: true});
+    } catch (error) {
+      return;
+    }
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var full = path.join(dir, item.name);
+      if (item.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!item.isFile() || !item.name.endsWith(META_SUFFIX)) continue;
+      var stored;
+      try {
+        stored = JSON.parse(fs.readFileSync(full, 'utf-8'));
+      } catch (error) {
+        continue;
+      }
+      if (stored.hostname !== hostname || stored.finished === true) continue;
+      var key = stored.username + ':' + stored.session;
+      if ((mode == 'keep') === keys.has(key)) continue;
+      var file = full.slice(0, -META_SUFFIX.length);
+      var paths = {file: file, metaFile: full};
+      try {
+        if (!fs.existsSync(file)) {
+          clearMetaAt(paths);
+          continue;
+        }
+        if (archiveDeletedCopy(stored, paths)) {
+          console.log('archived deleted session ' + file);
+          pruned++;
+        }
+      } catch (error) {
+        console.error('cannot archive ' + file + ': ' + error.message);
+      }
+    }
+  }
+  walk(dataDir);
+  return pruned;
+}
+
+// gone/list: the uploader reports sessions it no longer has locally, so
+// active snapshots of cleaned-up sessions do not linger as strays. A list
+// may arrive in chunks; the keys accumulate on the connection until the
+// chunk with last:true triggers the prune. An empty list is ignored: a
+// scan that finds nothing (unmounted session_dir, config change) must not
+// archive every active copy of the host as deleted.
+function handlePrune(conn, message) {
+  if (!HOSTNAME_RE.test(message.hostname || '')) return;
+  var hostkeyError = checkHostkey(message);
+  if (hostkeyError) {
+    console.log('prune from ' + message.hostname + ' rejected: ' + hostkeyError);
+    return;
+  }
+  var entries = message.type == 'gone'
+    ? [{username: message.username, session: message.session}]
+    : message.sessions;
+  if (!Array.isArray(entries) || entries.length > PRUNE_MAX_SESSIONS) return;
+  var keys = new Set();
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i] || {};
+    if (!USERNAME_RE.test(entry.username || '')
+        || !SESSION_RE.test(entry.session || '')) {
+      if (conn.listKeys) { conn.listHost = null; conn.listKeys = null; }
+      return;
+    }
+    keys.add(entry.username + ':' + entry.session);
+  }
+  if (message.type == 'gone') {
+    var removed = pruneActiveCopies(message.hostname, keys, 'delete');
+    console.log('prune gone from ' + message.hostname + ': '
+      + removed + ' active copy/copies archived as deleted');
+    return;
+  }
+  if (conn.listHost !== message.hostname) {
+    conn.listHost = message.hostname;
+    conn.listKeys = new Set();
+  }
+  keys.forEach(function(key) { conn.listKeys.add(key); });
+  if (conn.listKeys.size > LIST_KEY_CAP) {
+    console.log('prune list from ' + message.hostname + ': too many entries, ignored');
+    conn.listHost = null;
+    conn.listKeys = null;
+    return;
+  }
+  if (message.last !== true) return;
+  keys = conn.listKeys;
+  conn.listHost = null;
+  conn.listKeys = null;
+  if (keys.size === 0) {
+    console.log('prune list from ' + message.hostname + ': empty list, nothing pruned');
+    return;
+  }
+  var archived = pruneActiveCopies(message.hostname, keys, 'keep');
+  console.log('prune list from ' + message.hostname + ': '
+    + archived + ' active copy/copies archived as deleted');
+}
+
 function handleText(conn, raw) {
   var message;
   try {
@@ -625,6 +813,10 @@ function handleText(conn, raw) {
   }
   if (message.type == 'upload') {
     handleAnnounce(conn, message);
+    return;
+  }
+  if (message.type == 'gone' || message.type == 'list') {
+    handlePrune(conn, message);
     return;
   }
   if (message.id == null) return;

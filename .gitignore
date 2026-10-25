@@ -3,4 +3,5 @@ npm-debug.log*
 .DS_Store
 ssl/
 server.pid
+receiver.pid
 wslogin-run

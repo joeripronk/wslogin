@@ -491,6 +491,30 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark,
     return best;
   }
 
+  // Fire-and-forget control messages (gone/list) on one live connection.
+  // When no connection is live, start one (the reconnect triggers a rescan
+  // which re-sends the list), so pruning also works when this host has no
+  // sessions left to upload. Returns false when nothing was sent. All
+  // messages go out on the same connection so a chunked list arrives in
+  // order on the connection that accumulates it.
+  function sendControl(messages) {
+    if (!Array.isArray(messages)) messages = [messages];
+    var conn = pickConnection();
+    if (!conn) {
+      for (var i = 0; i < connections.length; i++) {
+        if (connections[i].open && !connections[i].dead) { conn = connections[i]; break; }
+      }
+    }
+    if (!conn) {
+      ensureConnection();
+      return false;
+    }
+    for (var j = 0; j < messages.length; j++) {
+      sendMessage(conn, messages[j]).catch(function() {});
+    }
+    return true;
+  }
+
   function rejectPending(error) {
     error.retryable = true;
     var waiting = pending.splice(0);
@@ -609,6 +633,7 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark,
 
   return {
     send: send,
+    sendControl: sendControl,
     close: close,
     connectionCount: function() { return connections.length; }
   };
@@ -814,6 +839,29 @@ function createUploader(config, options) {
       if (state.active == 0 && state.queue.length == 0) return Promise.resolve();
       return new Promise(function(resolve) { state.idleWaiters.push(resolve); });
     },
+    // Tell the receiver a session log is gone from the local disk: the
+    // receiver drops its active copy (finished archives stay).
+    session_gone: function(username, sessioncookie) {
+      if (!enabled || !transport) return false;
+      return transport.sendControl({type: 'gone', hostname: hostname,
+        hostkey: hostkey || undefined, username: username,
+        session: sessioncookie});
+    },
+    // Send the full set of local sessions so the receiver can prune strays.
+    // Chunked to stay well under the receiver's 1 MB max payload; the last
+    // chunk carries last:true and triggers the prune.
+    send_list: function(sessions) {
+      if (!enabled || !transport) return false;
+      var chunkSize = 5000;
+      var messages = [];
+      for (var i = 0; i < sessions.length || i === 0; i += chunkSize) {
+        messages.push({type: 'list', hostname: hostname,
+          hostkey: hostkey || undefined,
+          sessions: sessions.slice(i, i + chunkSize),
+          last: i + chunkSize >= sessions.length});
+      }
+      return transport.sendControl(messages);
+    },
     close: function() {
       state.stopped = true;
       // Queued jobs are dropped; idle must not block on them. Their onDone
@@ -906,6 +954,7 @@ async function run(config, options) {
   var seen = new Map();
   var busy = new Set();
   var pending = new Map();
+  var lastPresent = null;
   var lastActiveScheduled = new Map();
   var retryTimers = new Map();
   var stopping = false;
@@ -1023,10 +1072,13 @@ async function run(config, options) {
       }
       var present = new Set();
       var presentKeys = new Set();
+      var presentSessions = new Map();
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i];
         present.add(entry.file);
         presentKeys.add(sessionKey(entry));
+        presentSessions.set(sessionKey(entry),
+          {username: entry.username, session: entry.sessioncookie});
         var stat;
         try {
           stat = await fs.promises.stat(entry.file);
@@ -1045,6 +1097,23 @@ async function run(config, options) {
       lastActiveScheduled.forEach(function(value, key) {
         if (!presentKeys.has(key)) lastActiveScheduled.delete(key);
       });
+      // Feedback loop: sessions that were present at the previous scan and
+      // are gone now (cleaned up, removed after upload) are signalled so the
+      // receiver drops its active copy; the full list lets it prune strays
+      // that accumulated while this host was offline.
+      if (lastPresent) {
+        lastPresent.forEach(function(sess, key) {
+          if (presentKeys.has(key)) return;
+          if (uploader.session_gone(sess.username, sess.session)) {
+            console.log('[uploader] signalled gone: ' + sess.username + '/'
+              + sess.session);
+          }
+        });
+      }
+      lastPresent = presentSessions;
+      var list = [];
+      presentSessions.forEach(function(sess) { list.push(sess); });
+      uploader.send_list(list);
     } finally {
       scanning = false;
       if (scanAgain && !stopping) {
