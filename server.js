@@ -145,6 +145,96 @@ if (!session_template.endsWith('.json')) {
   process.exit(1);
 }
 console.log("session_template="+session_template);
+
+// Run the server as an unprivileged service user (default: wslogin) when
+// root starts it. The sudo setup is verified first: the user must exist,
+// sudo must be installed, the user must be able to sudo (NOPASSWD) to every
+// user except root, must be able to read /etc/shadow (PAM password login),
+// and the port must be bindable unprivileged. When all checks pass the
+// server hands itself over with sudo; otherwise it warns and keeps running
+// as root. Set run_as_user=root in the config to disable this entirely.
+var run_as_user = 'run_as_user' in config ? String(config.run_as_user).trim() : 'wslogin';
+var sudoers_hint = run_as_user+" ALL=(ALL:!root) NOPASSWD: ALL\n      "+run_as_user+" ALL=(root) ALL\n      (the second line is required for sudo-rs, which ignores the !root exclusion)";
+function sudoProbe(args) {
+  return spawnSync('sudo', args, { encoding: 'utf8' });
+}
+function ensureWritableDirs(username) {
+  var dirs = [__dirname, session_dir];
+  if ('playback_cache_dir' in config) {
+    dirs.push(path.resolve(__dirname, String(config.playback_cache_dir)));
+  }
+  dirs.forEach(function(dir) {
+    spawnSync('mkdir', ['-p', dir]);
+    var out = spawnSync('chown', ['-R', username+':', dir]);
+    if (out.status !== 0) console.error("chown "+dir+" to "+username+" failed");
+  });
+  // the recursive chown above would strip the setuid helper; it must stay
+  // root-owned with the setuid bit (see wslogin-run.c)
+  var helper = path.join(__dirname, 'wslogin-run');
+  if (fs.existsSync(helper)) {
+    spawnSync('chown', ['root:root', helper]);
+    spawnSync('chmod', ['4755', helper]);
+  }
+  if ('cookie_dir' in config) {
+    // chown the cookie directory itself only: cookie files are created by
+    // the users and their owner identifies the login; chowning them to the
+    // service user would turn a later cookie login into a wslogin session
+    spawnSync('mkdir', ['-p', String(config.cookie_dir)]);
+    var cout = spawnSync('chown', [username+':', String(config.cookie_dir)]);
+    if (cout.status !== 0) console.error("chown "+config.cookie_dir+" to "+username+" failed");
+    spawnSync('chmod', ['1777', String(config.cookie_dir)]);
+  }
+}
+function dropPrivileges(username) {
+  var problems = [];
+  var u = lookupUser(username);
+  if (!u) {
+    problems.push("user "+username+" does not exist; create it with: useradd --system --shell /usr/sbin/nologin "+username);
+  }
+  if (spawnSync('sh', ['-c', 'command -v sudo'], { encoding: 'utf8' }).status !== 0) {
+    problems.push("sudo is not installed");
+  }
+  if (webSocketsServerPort < 1024) {
+    problems.push("port "+webSocketsServerPort+" is privileged; use a port above 1024 or grant node CAP_NET_BIND_SERVICE: setcap cap_net_bind_service=+ep "+process.execPath);
+  }
+  if (problems.length === 0) {
+    var probe = sudoProbe(['-u', username, 'sudo', '-n', '-u', username, 'id', '-u']);
+    if (probe.status !== 0 || parseInt(probe.stdout, 10) !== u.uid) {
+      problems.push("user "+username+" cannot sudo to normal users without a password; create /etc/sudoers.d/"+username+" with:\n      "+sudoers_hint);
+    } else if (sudoProbe(['-u', username, 'sudo', '-n', '-u', 'root', 'id', '-u']).status === 0) {
+      problems.push("user "+username+" can sudo to root; the sudoers rule must exclude root:\n      "+sudoers_hint);
+    }
+    if (sudoProbe(['-u', username, 'sh', '-c', 'test -r /etc/shadow']).status !== 0) {
+      problems.push("user "+username+" cannot read /etc/shadow, PAM password logins will fail; add it to the shadow group: usermod -aG shadow "+username);
+    }
+  }
+  if (problems.length > 0) {
+    console.warn("sudo setup for user "+username+" is incomplete, running as root:");
+    problems.forEach(function(problem) { console.warn("  - "+problem); });
+    console.warn("fix the setup above to run wslogin as "+username+"; run_as_user=root silences this warning");
+    return;
+  }
+  ensureWritableDirs(username);
+  console.log("sudo setup for user "+username+" verified, handing over via sudo");
+  // Detach the handover: sudo -b alone stays as the parent of the server
+  // (it waits to relay the exit status). Running the server as
+  // sh -c 'exec setsid ... &' inside sudo -b lets sudo exit immediately
+  // and reparents the server to init, so no root-owned sudo stays in the
+  // process list. sudo -b sends the child's stdio to /dev/null, so pipe
+  // the output through systemd-cat to keep it in the journal (plain
+  // /dev/null when systemd-cat is not installed).
+  var cmd = ['env', 'WSLOGIN_CONFIG='+configPath, process.execPath]
+    .concat(process.argv.slice(1)).map(shQuote).join(' ');
+  var has_cat = spawnSync('sh', ['-c', 'command -v systemd-cat'], { encoding: 'utf8' }).status === 0;
+  var redir = has_cat ? ' 2>&1 | systemd-cat -t wslogin' : ' >/dev/null 2>&1';
+  var r = spawnSync('sudo', ['-b', '-u', username, 'sh', '-c',
+    'setsid '+cmd+redir+' &'], { stdio: 'inherit', cwd: __dirname });
+  process.exit(r.status === null ? 1 : r.status);
+}
+if (process.getuid() === 0 && run_as_user !== '' && run_as_user !== 'root') {
+  dropPrivileges(run_as_user);
+}
+
 function session_log_path(username, sessioncookie) {
   var relative = renderTemplate(session_template,
     {username: username, session: sessioncookie});
@@ -157,9 +247,20 @@ function session_checkpoint_path(username, sessioncookie) {
   var file = session_log_path(username, sessioncookie);
   return file.slice(0, -'.json'.length) + '.checkpoint.json';
 }
-// Per-session tmux server socket, kept in the user's home so the user's tmux
-// server can create it. The shell lives in this tmux server, independent of
-// the wslogin process, so a wslogin restart can find it again and re-attach.
+// Per-session tmux server socket. The socket directory must be traversable
+// by the wslogin service user (it removes stale sockets) and writable by
+// the session user (the tmux server creates the socket and its lock file
+// in it), so it lives under a server-wide base directory (default
+// /run/wslogin/tmux): the base is owned by wslogin (mode 755) with the
+// user ACL-granted (+wx), and <base>/<username> is created by and owned by
+// the user, inheriting the default ACL that gives wslogin rwx. The shell
+// lives in this tmux server, independent of the wslogin process, so a
+// wslogin restart can find it again and re-attach.
+var tmux_socket_dir = config.tmux_socket_dir
+  ? path.resolve(String(config.tmux_socket_dir))
+  : '/run/wslogin/tmux';
+console.log("tmux_socket_dir="+tmux_socket_dir);
+var WSLOGIN_USER = (process.userInfo && process.userInfo.username) || 'wslogin';
 function lookupUser(username) {
   try {
     var lines = fs.readFileSync('/etc/passwd', 'utf8').split('\n');
@@ -173,13 +274,33 @@ function lookupUser(username) {
   } catch (error) {}
   return null;
 }
+function session_tmux_dir(username) {
+  return path.join(tmux_socket_dir, username);
+}
 function session_tmux_path(username, sessioncookie) {
-  var u = lookupUser(username);
-  var base = u ? path.join(u.home, '.wslogin')
-               : path.dirname(session_log_path(username, sessioncookie));
-  return path.join(base, sessioncookie + '.tmux');
+  return path.join(session_tmux_dir(username), sessioncookie + '.tmux');
 }
 var tmux_conf = path.join(__dirname, 'tmux.conf');
+// wslogin runs per-user commands (tmux server start, attach, queries) as
+// the session user. node-pty attaches its direct child to the terminal, and
+// only root can become another user: the child is the small setuid helper
+// wslogin-run, which drops to the session user and execs the command as a
+// single process, so no sudo stays in the process list for the lifetime of
+// the view and no sudo/pam noise lands in the journal. Falls back to
+// sudo -u when the helper is not installed. Defined here (before the
+// startup scan) so the resume path uses it too.
+var run_helper = fs.existsSync(path.join(__dirname, 'wslogin-run'))
+  ? path.join(__dirname, 'wslogin-run') : null;
+console.log("per-user helper: "+(run_helper ? run_helper : "sudo -u (wslogin-run not installed)"));
+function user_run_prefix(username) {
+  return run_helper ? [run_helper, username] : ['sudo', '-u', username];
+}
+// Run a command as the session user: wslogin-run helper when installed,
+// sudo -u otherwise.
+function run_as(username, args, options) {
+  var prefix = user_run_prefix(username);
+  return spawnSync(prefix[0], prefix.slice(1).concat(args), options);
+}
 // The tailer is the last record of a finished log (c=5). Its payload records
 // the file size and SHA-256 of the log without the tailer itself plus the
 // session end time, so a finished log can be verified without trusting the
@@ -410,9 +531,18 @@ function finish_interrupted_sessions() {
       var file = path.join(dir, entry.name);
       var meta = read_session_header(file);
       if (session_tmux && meta && meta.tmux && meta.username && meta.sessioncookie
-          && tmux_alive(meta.tmux)) {
+          && meta.tmux.startsWith(tmux_socket_dir + path.sep)
+          && tmux_alive(meta.username, meta.tmux)) {
         resume_session(meta);
       } else {
+        if (session_tmux && meta && meta.tmux && meta.username
+            && !meta.tmux.startsWith(tmux_socket_dir + path.sep)
+            && tmux_alive(meta.username, meta.tmux)) {
+          // old socket layout (e.g. in the user's home): the log is
+          // retired, kill the orphaned tmux server with its shell
+          console.log("killing tmux server with retired socket "+meta.tmux);
+          run_as(meta.username, ['tmux', '-S', meta.tmux, 'kill-server']);
+        }
         finish_path(file);
       }
     }
@@ -551,7 +681,12 @@ async function create_replayed_terminal (file, checkpointfile) {
         } catch (error) {
           console.error("error replaying "+file+": "+error.message);
         }
-      }).on('close', finish);
+      }).on('close', finish).on('error', function(error) {
+        // a cleaned up (deleted) log must not kill the server: replay
+        // what is there (nothing) and continue with the live session
+        console.error("error reading "+file+": "+error.message);
+        finish();
+      });
     };
     if (checkpoint) {
       terminal.resize(checkpoint.cols,checkpoint.rows);
@@ -595,9 +730,33 @@ function start_tmux_session(username, sessioncookie, cols, rows, env) {
   var u = lookupUser(username);
   if (!u) { console.error("no passwd entry for "+username); return false; }
   var sock = session_tmux_path(username, sessioncookie);
-  var dir = path.dirname(sock);
-  spawnSync('sudo', ['-u', username, 'mkdir', '-p', dir]);
-  spawnSync('sudo', ['-u', username, 'chmod', '700', dir]);
+  var dir = session_tmux_dir(username);
+  // The per-user socket directory is owned by the user (their tmux server
+  // creates the socket and lock file in it). Default ACLs on the base
+  // directory give wslogin rw on everything created below it: wslogin can
+  // traverse the path and connect the attach client to the socket,
+  // even though tmux forces the socket to mode 0600 (the mask inherited
+  // from the default ACL keeps wslogin's entry effective).
+  var base = path.dirname(dir);
+  try { fs.mkdirSync(base, { recursive: true, mode: 0o755 }); } catch (error) {}
+  var bacl = spawnSync('setfacl', ['-d', '-m', 'u:'+WSLOGIN_USER+':rwx',
+    '-d', '-m', 'm::rwx', base]);
+  if (bacl.status !== 0) {
+    console.error("setfacl defaults on "+base+" for "+WSLOGIN_USER+" failed: "
+      +bacl.stderr+"; tmux sockets will be owner-only and attaching will fail");
+  }
+  // the user needs write on the base directory to create his socket dir
+  // (+wx: a leading - in a modify spec would remove the bits)
+  var uacl = spawnSync('setfacl', ['-m', 'u:'+username+':+wx', base]);
+  if (uacl.status !== 0) console.error("setfacl "+base+" for "+username+" failed: "+uacl.stderr);
+  var st = null;
+  try { st = fs.statSync(dir); } catch (error) {}
+  if (!st) {
+    var mk = run_as(username, ['mkdir', '-p', dir]);
+    if (mk.status !== 0) console.error("mkdir "+dir+" as "+username+" failed: "+mk.stderr);
+  } else if (st.uid !== (lookupUser(username)||{}).uid) {
+    console.error(dir+" exists with unexpected owner uid "+st.uid+", session attach may fail");
+  }
   var shell = u.shell || '/bin/bash';
   var viewid = ((env && env.VIEWID) || '');
   var viewurl = ((env && env.VIEWURL) || '');
@@ -610,47 +769,69 @@ function start_tmux_session(username, sessioncookie, cols, rows, env) {
     " LANG=en_US.UTF-8 COLORTERM=truecolor TERM=xterm-256color" +
     " VIEWID=" + shQuote(viewid) + " VIEWURL=" + shQuote(viewurl) +
     " " + shQuote(shell) + " -l";
-  var args = ['-u', username, 'env',
+  var args = user_run_prefix(username).concat(['env',
     'USER=' + username, 'LOGNAME=' + username, 'HOME=' + u.home,
     'SHELL=' + shell, 'PATH=/usr/local/bin:/usr/bin:/bin',
     'VIEWID=' + viewid, 'VIEWURL=' + viewurl,
-    'tmux', '-S', sock];
+    'tmux', '-S', sock]);
   if (fs.existsSync(tmux_conf)) args.push('-f', tmux_conf);
   args.push('new-session', '-d', '-s', 'main',
     '-x', String(cols), '-y', String(rows), panecmd);
-  var out = spawnSync('sudo', args, { cwd: u.home });
+  // No cwd: the service user cannot enter the user's home (mode 700) and a
+  // spawnSync child chdir there would fail with EACCES; the pane command's
+  // login shell changes into HOME itself.
+  var prog = args.shift();
+  var out = spawnSync(prog, args);
   if (out.status !== 0) {
     console.error("tmux new-session failed for "+username+" "+sessioncookie
-      +": "+out.stderr);
+      +": "+(out.stderr ? out.stderr : out.error ? out.error.message
+      : "status "+out.status));
     return false;
   }
-  return tmux_alive(sock);
+  return tmux_alive(username, sock);
 }
 
-// wslogin (root) attaches to the user's tmux server; root may connect to the
-// user-owned socket. The attach client is the live view, tied to a connection.
 function attach_tmux(username, sessioncookie, cols, rows, env, sock) {
   if (!sock) sock = session_tmux_path(username, sessioncookie);
-  var u = lookupUser(username);
-  return pty.spawn('tmux', ['-S', sock, 'attach', '-t', 'main'], {
+  var args = user_run_prefix(username).concat(
+    ['env', 'TERM=xterm-256color', 'tmux', '-S', sock, 'attach', '-t', 'main']);
+  var prog = args.shift();
+  return pty.spawn(prog, args, {
     name: 'xterm-256color',
     cols: cols,
     rows: rows,
-    cwd: (u && u.home) || '/',
+    cwd: '/',
     env: env
   });
 }
 
 // Is a tmux server with this socket alive and showing its session?
-function tmux_alive(sock) {
-  var out = spawnSync('tmux', ['-S', sock, 'list-sessions'], { encoding: 'utf8' });
+// Runs as the session's user via sudo, so it works unprivileged too.
+function tmux_alive(username, sock) {
+  var out = run_as(username, ['tmux', '-S', sock, 'list-sessions'], { encoding: 'utf8' });
   return out.status === 0 && /main/.test(out.stdout);
 }
 
 function kill_tmux_session(username, sessioncookie) {
   var sock = session_tmux_path(username, sessioncookie);
-  spawnSync('sudo', ['-u', username, 'tmux', '-S', sock, 'kill-server']);
+  run_as(username, ['tmux', '-S', sock, 'kill-server']);
   try { fs.unlinkSync(sock); } catch (error) {}
+}
+
+// Detach the tmux attach clients of a session; used when the wslogin side
+// of a view goes away (pty exit, owner disconnect) so no client lingers on
+// the tmux server. tmux 3.x has no kill-client, clients are detached by
+// their tty (the target accepted by detach-client).
+function kill_tmux_clients(username, sessioncookie) {
+  var sock = session_tmux_path(username, sessioncookie);
+  var out = run_as(username, ['tmux', '-S', sock, 'list-clients', '-F', '#{client_tty}'],
+    { encoding: 'utf8' });
+  if (out.status !== 0) return;
+  String(out.stdout).split('\n').forEach(function(entry) {
+    var tty = entry.trim();
+    if (!tty.startsWith('/dev/')) return;
+    run_as(username, ['tmux', '-S', sock, 'detach-client', '-t', tty]);
+  });
 }
 
 function append_session_log(session, log) {
@@ -742,6 +923,19 @@ function wire_session(username, sessioncookie) {
     console.log("pty "+sessioncookie+" for "+username+" exited with status "+ data);
     var log={t:now(),d:data,c:3};
     append_session_log(session,log);
+    close_pty_file(ptyproc);
+    if (session_tmux && tmux_alive(username, session_tmux_path(username, sessioncookie))) {
+      // the tmux server and its shell survive this view (owner disconnect,
+      // wslogin restart): drop any lingering attach clients and keep the
+      // session alive for a reconnect. The attach client is gone, so the
+      // session is marked detached (pty=false); a reconnect re-attaches
+      // (see create_pty).
+      kill_tmux_clients(username, sessioncookie);
+      session.cols = ptyproc.cols;
+      session.rows = ptyproc.rows;
+      session.pty = false;
+      return;
+    }
     for (const [key, conn] of Object.entries(session['connections'])) {
       if (ptyproc.main == conn) {
         sendInfo(conn,"Your session ended");
@@ -749,10 +943,6 @@ function wire_session(username, sessioncookie) {
         sendInfo(conn,"Session ended");
       }
       conn.close();
-    }
-    if (ptyproc.file) {
-      fs.close(ptyproc.file);
-      ptyproc.file=false;
     }
     finish_session(username, sessioncookie);
     delete views[session.viewid];
@@ -764,6 +954,34 @@ function wire_session(username, sessioncookie) {
       delete sessions[username];
     }
   });
+}
+
+// Close the log fd of a pty only after the queued writes on this fd have
+// run: closing immediately races with the write queue, and node reuses the
+// fd number for the next session, so late writes would hit EBADF or, worse,
+// the log of a new session.
+function close_pty_file(ptyproc) {
+  if (!ptyproc.file) return;
+  var fd = ptyproc.file;
+  ptyproc.file = false;
+  var pending = writeQueues.get(fd) || Promise.resolve();
+  writeQueues.delete(fd);
+  pending.then(function() { fs.close(fd, function() {}); },
+               function() { fs.close(fd, function() {}); });
+}
+
+// Re-attach a detached session (tmux server alive, attach client gone,
+// e.g. after the owner disconnected): spawn a fresh tmux attach client,
+// reopen its log and wire it like on creation.
+function reattach_session(username, sessioncookie, cols, rows) {
+  var session = sessions[username][sessioncookie];
+  var shellenv = { USER: username, VIEWID: session.viewid, SUDO_USER: username,
+    LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
+  session.pty = attach_tmux(username, sessioncookie, cols, rows, shellenv);
+  session.pty.file = fopen(session_log_path(username, sessioncookie), 'a+');
+  session.pty.main = false;
+  wire_session(username, sessioncookie);
+  console.log("re-attached "+sessioncookie+" for "+username);
 }
 
 function checkpoint_due(session) {
@@ -1178,12 +1396,14 @@ function listDisconnected(username) {
   if (!username || !(username in sessions)) return list;
   for (const key in sessions[username]) {
     var s = sessions[username][key];
-    if (s.pty && s.pty.main === false) {
+    // s.pty === false: detached session (tmux server alive, attach client
+    // gone after the owner disconnected); reconnect re-attaches it
+    if (s.pty === false || (s.pty && s.pty.main === false)) {
       var snap = serialize_mirror(s);
       list.push({
         reconnectid: s.reconnectid,
-        cols: s.pty.cols,
-        rows: s.pty.rows,
+        cols: s.pty ? s.pty.cols : (s.cols || 80),
+        rows: s.pty ? s.pty.rows : (s.rows || 24),
         title: (snap && snap.title) || '',
         snapshot: snap ? snap.s : ''
       });
@@ -1333,12 +1553,23 @@ wsServer.on('request', function(request) {
       // The client fits its terminal to the screen and only then sends a
       // resize if its geometry differs from the session geometry, so the
       // stale size from the reconnect request is never applied to the pty.
-      sessions[username][sessioncookie].pty.resize(serial.cols+1,serial.rows);
-      console.log("resizing "+sessioncookie+' to '+(serial.cols+1)+'x'+(serial.rows+1));
-      setTimeout(function() {
-           sessions[username][sessioncookie].pty.resize(serial.cols, serial.rows);
-           console.log("resizing back to "+sessioncookie+' to '+(serial.cols)+'x'+(serial.rows));
+      var rpty = sessions[username][sessioncookie].pty;
+      if (rpty) {
+      try {
+        rpty.resize(serial.cols+1,serial.rows);
+        console.log("resizing "+sessioncookie+' to '+(serial.cols+1)+'x'+(serial.rows+1));
+        setTimeout(function() {
+          try {
+            rpty.resize(serial.cols, serial.rows);
+            console.log("resizing back to "+sessioncookie+' to '+(serial.cols)+'x'+(serial.rows));
+          } catch (error) {
+            console.log("resize back failed: "+error.message);
+          }
         }, 30);
+      } catch (error) {
+        console.log("reconnect resize failed: "+error.message);
+      }
+      }
     }
     while(connection.sendbuffer.length>0) {
       buf=connection.sendbuffer.shift();
@@ -1362,7 +1593,8 @@ wsServer.on('request', function(request) {
       var specific = (sessioncookie !== false);
       for (const [key, value] of Object.entries(sessions[username])) {
         var requested = sessioncookie==key;
-        if(sessions[username][key].pty.main && !requested) {
+        var keypty = sessions[username][key].pty;
+        if(keypty && keypty.main && !requested) {
 		console.log("ignoring " + key + " still connected");
 		continue;
 	}
@@ -1371,7 +1603,7 @@ wsServer.on('request', function(request) {
         var mainconnection=false;
         if(!connection.viewonly && !connection.shared) {
           for (const [idx,conn] of Object.entries(sessions[username][key]['connections'])) {
-            if(!conn.viewonly && !conn.shared && sessions[username][key].pty.main==false) {
+            if(!conn.viewonly && !conn.shared && (!keypty || keypty.main==false)) {
               console.log(username + " reconnected to mainconnection "+key);
               mainconnection=true;
             }
@@ -1380,13 +1612,22 @@ wsServer.on('request', function(request) {
         if(requested || (!specific && !connection.viewonly && !connection.shared && !mainconnection)) {
           sessioncookie=key;
           connection.paused=true;
+          if (!sessions[username][sessioncookie].pty) {
+            // detached session (owner disconnected, tmux server alive):
+            // spawn a fresh attach client before wiring the connection
+            reattach_session(username, sessioncookie,
+              sessions[username][sessioncookie].cols || connection.columns,
+              sessions[username][sessioncookie].rows || connection.rows);
+          }
           if(connection.viewonly) {
             console.log("view started for "+username+" "+sessioncookie);
-            sendInfo(sessions[username][sessioncookie].pty.main,peerLabel(connection)+" is viewing your session");
+            var viewmain=sessions[username][sessioncookie].pty.main;
+            if (viewmain) sendInfo(viewmain,peerLabel(connection)+" is viewing your session");
 
           } else if(connection.shared) {
             console.log("sharing started for "+username+" "+sessioncookie);
-            sendInfo(sessions[username][sessioncookie].pty.main,peerLabel(connection)+" is sharing your session");
+            var sharemain=sessions[username][sessioncookie].pty.main;
+            if (sharemain) sendInfo(sharemain,peerLabel(connection)+" is sharing your session");
           } else {
             sendInfo(connection,"Reconnected to your session");
             if (!requested) {
@@ -1536,7 +1777,7 @@ wsServer.on('request', function(request) {
     }
     var token = ssoAuth ? ssoAuth.readLink(id) : null;
     if (token && token.m === mode && token.u in sessions
-        && token.s in sessions[token.u] && sessions[token.u][token.s].pty) {
+        && token.s in sessions[token.u] && sessions[token.u][token.s]) {
       connection.viewonly = (mode === 'view');
       connection.shared = (mode === 'share');
       connection.peer = token.t;
@@ -1578,7 +1819,7 @@ wsServer.on('request', function(request) {
                   if (connection.sessioncookie!=false) {
                     var sizelog={t:now(),d:JSON.stringify({cmd:"resize",cols:m.cols,rows:m.rows}),c:0};
                     var sizeSession=sessions[connection.username][connection.sessioncookie];
-                    sizeSession.pty.resize(m.cols,m.rows);
+                    if (sizeSession.pty) sizeSession.pty.resize(m.cols,m.rows);
                     var sizewritten=append_session_log(sizeSession,sizelog);
                     queue_mirror(sizeSession,{type:'resize',cols:m.cols,rows:m.rows,offset:sizewritten.offset,bytes:sizewritten.bytes});
                   }
@@ -1589,9 +1830,11 @@ wsServer.on('request', function(request) {
                   connection.columns = m.cols;
                   connection.rows = m.rows;
                   if (connection.sessioncookie!=false) {
-                    console.log("received resize to "+m.cols+"x"+m.rows+" "+connection.sessioncookie+" "+sessions[connection.username][connection.sessioncookie].pty.file);
-                    sessions[connection.username][connection.sessioncookie].pty.resize(m.cols,m.rows);
-                    console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+sessions[connection.username][connection.sessioncookie].pty.file);
+                    var rsession=sessions[connection.username][connection.sessioncookie];
+                    if (rsession && rsession.pty) {
+                    console.log("received resize to "+m.cols+"x"+m.rows+" "+connection.sessioncookie+" "+rsession.pty.file);
+                    rsession.pty.resize(m.cols,m.rows);
+                    console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+rsession.pty.file);
                     var written=append_session_log(sessions[connection.username][connection.sessioncookie],log);
                     queue_mirror(sessions[connection.username][connection.sessioncookie],{type:'resize',cols:m.cols,rows:m.rows,offset:written.offset,bytes:written.bytes});
                     if(Object.keys(sessions[connection.username][connection.sessioncookie]['connections']).length>0) {
@@ -1607,6 +1850,7 @@ wsServer.on('request', function(request) {
                           }
                         }
                       }
+                    }
                     }
                   } else {
                     connection.columns = m.cols;
@@ -1687,7 +1931,7 @@ wsServer.on('request', function(request) {
                       connection.username=r.username;
                       console.log("reconnect "+m.reconnect+" was taken over, starting a new session for "+r.username);
                       connection.sessioncookie=create_pty(r.username,false,connection.columns,connection.rows,connection,true);
-                    } else if (r.sessioncookie && r.username in sessions && r.sessioncookie in sessions[r.username] && sessions[r.username][r.sessioncookie].pty) {
+    } else if (r.sessioncookie && r.username in sessions && r.sessioncookie in sessions[r.username] && sessions[r.username][r.sessioncookie]) {
                       connection.username=r.username;
                       connection.sessioncookie=r.sessioncookie;
                       console.log("reconnect "+m.reconnect+" by "+r.username+" to "+r.sessioncookie);
@@ -1711,8 +1955,9 @@ wsServer.on('request', function(request) {
                   if (pick.username && !pick.stale && pick.username in sessions
                       && (!pickOwner || pickOwner == pick.username)
                       && pick.sessioncookie in sessions[pick.username]
-                      && sessions[pick.username][pick.sessioncookie].pty
-                      && sessions[pick.username][pick.sessioncookie].pty.main === false) {
+                      && sessions[pick.username][pick.sessioncookie]
+                      && (!sessions[pick.username][pick.sessioncookie].pty
+                          || sessions[pick.username][pick.sessioncookie].pty.main === false)) {
                     if (validSize(m.cols, m.rows)) {
                       connection.columns=m.cols;
                       connection.rows=m.rows;
@@ -1750,26 +1995,35 @@ wsServer.on('request', function(request) {
                   if ('cookie' in m && m.cookie.match('^[0-9a-zA-Z-]+$')) {
                     if ('cookie_dir' in config) {
                       const cookiefile=config.cookie_dir+"/cookie_"+m.cookie+".json";
-                      const stat=fs.statSync(cookiefile); 
-                      fs.rm(cookiefile, function (err) {
-                        if (err) {
-                          connection.sendUTF('\1broken session '+err);
+                      // stat asynchronously: a cookie is removed on use, a
+                      // synchronous statSync on a raced/deleted cookie file
+                      // would throw and crash the server
+                      fs.stat(cookiefile, function(staterr, stat) {
+                        if (staterr) {
+                          connection.sendUTF('\1broken session '+staterr);
                           connection.close();
-                        } else {
-                          if ('uid' in stat) {
-                            const uname=userid.username(stat.uid); 
-                            if (uname!=undefined && uname!='root' ) {
-                              connection.username=uname; 
-                              console.log("got username "+connection.username+" from cookie "+m.cookie);
-                              connection.sessioncookie=create_pty(connection.username,false,false,false,connection);
+                          return;
+                        }
+                        fs.rm(cookiefile, function (err) {
+                          if (err) {
+                            connection.sendUTF('\1broken session '+err);
+                            connection.close();
+                          } else {
+                            if ('uid' in stat) {
+                              const uname=userid.username(stat.uid); 
+                              if (uname!=undefined && uname!='root' ) {
+                                connection.username=uname; 
+                                console.log("got username "+connection.username+" from cookie "+m.cookie);
+                                connection.sessioncookie=create_pty(connection.username,false,false,false,connection);
+                              } else {
+                                connection.close();
+                              }
                             } else {
+                              connection.sendUTF('\1who are you?\n\r');
                               connection.close();
                             }
-                          } else {
-                            connection.sendUTF('\1who are you?\n\r');
-                            connection.close();
                           }
-                        }
+                        })
                       })
                     } else {
                       connection.sendUTF('\1local sessions disabled\n\r');
@@ -1813,9 +2067,11 @@ wsServer.on('request', function(request) {
           if (connection.sessioncookie!=false && !connection.viewonly) {
             var input=message.utf8Data.substr(1);
             var log={t:now(),d:input,c:2};
-            //		console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+sessions[connection.username][connection.sessioncookie].pty.file);
-            append_session_log(sessions[connection.username][connection.sessioncookie],log);
-            sessions[connection.username][connection.sessioncookie].pty.write(message.utf8Data.substr(1));
+            var isession=sessions[connection.username][connection.sessioncookie];
+            if (isession && isession.pty) {
+              append_session_log(isession,log);
+              isession.pty.write(message.utf8Data.substr(1));
+            }
           } else {
             console.log("received data while not authed"+ message.utf8Data.substr(1));
           }
@@ -1860,10 +2116,23 @@ wsServer.on('request', function(request) {
         if (connection.sessioncookie in sessions[connection.username]) {
           delete sessions[connection.username][connection.sessioncookie]['connections'][index];
         }
-	if (connection.username in sessions && connection.sessioncookie in sessions[connection.username] && sessions[connection.username][connection.sessioncookie].pty.main == connection) {
+	if (connection.username in sessions && connection.sessioncookie in sessions[connection.username] && sessions[connection.username][connection.sessioncookie].pty && sessions[connection.username][connection.sessioncookie].pty.main == connection) {
 	  console.log("Main connection for "+connection.username+" "+connection.sessioncookie+" disconnected");
 	  sessions[connection.username][connection.sessioncookie].pty.main=false;
-	  checkpoint_on_disconnect(sessions[connection.username][connection.sessioncookie]);
+        // owner gone: end its tmux client (the shell in the tmux server
+        // keeps running for a reconnect); viewer/sharer connections share
+        // the owner's view and do not end it.
+        kill_tmux_clients(connection.username, connection.sessioncookie);
+        checkpoint_on_disconnect(sessions[connection.username][connection.sessioncookie]);
+	} else if (connection.username in sessions && connection.sessioncookie in sessions[connection.username]
+	    && sessions[connection.username][connection.sessioncookie].pty
+	    && !sessions[connection.username][connection.sessioncookie].pty.main
+	    && Object.keys(sessions[connection.username][connection.sessioncookie]['connections']).length === 0) {
+	  // last viewer/sharer of a re-attached ownerless session gone: drop
+	  // the attach client (its exit handler marks the session detached),
+	  // so no live pty runs without any consumer
+	  console.log("last consumer of "+connection.sessioncookie+" disconnected, dropping attach client");
+	  kill_tmux_clients(connection.username, connection.sessioncookie);
 	}
       } else {
         console.log("username and session "+connection.sessioncookie+" for  "+connection.username+" already cleaned up");

@@ -66,7 +66,7 @@ mkdir -p "$(dirname "$AUTH_INI")"
   cat "$local_opts"
 } > "$AUTH_INI".tmp
 mv "$AUTH_INI".tmp "$AUTH_INI"
-chmod 600 "$AUTH_INI"
+chmod 640 "$AUTH_INI"
 if [[ "$(id -u)" -eq 0 ]] && id wslogin >/dev/null 2>&1; then
   chown root:wslogin "$AUTH_INI"
 fi

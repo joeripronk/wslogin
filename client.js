@@ -20,7 +20,9 @@ ws.on('message', function incoming(message) {
     case '\0':
       json=JSON.parse(msg.substr(1))
       const uuid=uuid_v4();
-      fs.writeFileSync(config.cookie_dir+"/cookie_"+uuid+".json",JSON.stringify(process.env))
+      // 0600: the cookie dir is world-writable (1777); the file content
+      // (process env) and the token itself must stay private to the user
+      fs.writeFileSync(config.cookie_dir+"/cookie_"+uuid+".json",JSON.stringify(process.env),{mode:0o600})
       switch(json.cmd) {
         case 'login':
           ws.send('\0'+JSON.stringify({cmd:'login',cookie:uuid,cols:process.stdout.columns,rows:process.stdout.rows}))
