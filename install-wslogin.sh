@@ -16,15 +16,12 @@ if [[ ! -d "$SOURCE_DIR/.git" ]]; then
   exit 1
 fi
 
-if ! command -v rsync >/dev/null 2>&1; then
-  echo "error: rsync is required" >&2
-  exit 1
-fi
-
-if ! command -v npm >/dev/null 2>&1; then
-  echo "error: npm is required" >&2
-  exit 1
-fi
+for cmd in rsync npm; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "error: $cmd is required" >&2
+    exit 1
+  fi
+done
 
 echo "Deploying $SOURCE_DIR to $APP_DIR"
 mkdir -p "$APP_DIR"
@@ -33,31 +30,22 @@ if ! id -u "$RUN_USER" >/dev/null 2>&1; then
   echo "Creating system user $RUN_USER"
   useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$RUN_USER"
 fi
-
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
-# tmux socket base directory; tmux sockets for live sessions live in
-# per-user subdirectories of it (see session_tmux_path in server.js)
-if [[ -d /run/wslogin ]]; then
-  chown "$RUN_USER":"$RUN_GROUP" /run/wslogin
-  chmod 755 /run/wslogin
-else
-  mkdir -p "/run/wslogin"
-  chown "$RUN_USER":"$RUN_GROUP" "/run/wslogin"
-  chmod 755 "/run/wslogin"
-fi
+# tmux socket base directory; the server creates the per-user socket dirs
+# below it (see session_tmux_path in wslogin-server.js). Create the base and
+# the tmux base here so a fresh install does not fail on the chmod below;
+# only the bases are chowned, the per-user dirs below belong to their users.
+mkdir -p /run/wslogin/tmux
+chown "$RUN_USER":"$RUN_GROUP" /run/wslogin /run/wslogin/tmux
+chmod 755 /run/wslogin /run/wslogin/tmux
 if ! grep -qsw /run/wslogin /etc/tmpfiles.d/wslogin.conf 2>/dev/null; then
   echo "Installing /etc/tmpfiles.d/wslogin.conf"
   printf 'd /run/wslogin 0755 %s %s\n' "$RUN_USER" "$RUN_GROUP" > /etc/tmpfiles.d/wslogin.conf
 fi
-# the server creates the per-user socket dirs below this base; create the
-# base itself here so a fresh install does not fail on the chmod below
-mkdir -p /run/wslogin/tmux
-chown "$RUN_USER":"$RUN_GROUP" /run/wslogin/tmux
-chmod 755 /run/wslogin/tmux
 if command -v setfacl >/dev/null 2>&1; then
   # default ACLs so user-owned socket directories and the tmux sockets
-  # inside them stay accessible for the service user (see server.js);
+  # inside them stay accessible for the service user (see wslogin-server.js);
   # the x bit is required for the service user to traverse into the
   # user-owned socket directories
   setfacl -d -m "u:$RUN_USER:rwx" -d -m 'm::rwx' /run/wslogin/tmux
@@ -72,9 +60,9 @@ if getent group shadow >/dev/null 2>&1; then
   fi
 fi
 
-SUDOERS="/etc/sudoers.d/$RUN_USER"
 # sudo-rs (Ubuntu >= 25.10) ignores the !root exclusion, so the deny for
 # root must be a later, password-only rule (last match wins).
+SUDOERS="/etc/sudoers.d/$RUN_USER"
 SUDOERS_RULE="$RUN_USER ALL=(ALL:!root) NOPASSWD: ALL"
 SUDOERS_DENY="$RUN_USER ALL=(root) ALL"
 if [[ ! -e "$SUDOERS" ]] || ! grep -qxF "$SUDOERS_DENY" "$SUDOERS" 2>/dev/null; then
@@ -128,8 +116,7 @@ else
 fi
 
 if [[ -r "${AUTH_CONF:-/etc/apache2/auth.conf}" ]]; then
-  AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" \
-    "$APP_DIR/sync-auth-conf.sh"
+  AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" "$APP_DIR/sync-auth-conf.sh"
 fi
 
 if [[ ! -e /etc/pam.d/wslogin ]]; then
@@ -143,7 +130,7 @@ if systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
   # EADDRINUSE. Kill leftovers of the unit first.
   LEFTOVER_PIDS="$(pgrep -x wslogin || true)"
   if [[ -n "$LEFTOVER_PIDS" ]]; then
-    echo "Stopping leftover ${SERVICE} server processes: $(echo $LEFTOVER_PIDS | tr '\n' ' ')"
+    echo "Stopping leftover ${SERVICE} server processes: $(echo "$LEFTOVER_PIDS" | tr '\n' ' ')"
     kill $LEFTOVER_PIDS 2>/dev/null || true
     sleep 1
   fi

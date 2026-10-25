@@ -617,10 +617,10 @@ function handleCorrupt(conn, stream) {
 var PRUNE_MAX_SESSIONS = 100000;
 var LIST_KEY_CAP = 200000;
 
-// Appends the tailer record (c:5, same shape as server.js) to a log that is
+// Appends the tailer record (c:5, same shape as wslogin-server.js) to a log that is
 // archived by pruning, with a note marking it as a deleted session. The
 // payload records the size and SHA-256 of the file without the tailer.
-// Empty logs get no tailer (same rule as server.js write_tailer). Returns
+// Empty logs get no tailer (same rule as wslogin-server.js write_tailer). Returns
 // the final size and SHA-256 of the complete archived file.
 function appendDeletedTailer(file) {
   var stat = fs.statSync(file);

@@ -4,7 +4,7 @@ This document describes the upload feature of wslogin and the protocol for the
 server that receives the uploads. The uploader is implemented in `uploader.js`
 and the receiver in `receiver.js`, both enabled through the
 configuration file. The uploader runs as its own process, separate from
-`server.js`, so uploading can never block or crash terminal sessions.
+`wslogin-server.js`, so uploading can never block or crash terminal sessions.
 
 ## Purpose
 
@@ -140,9 +140,9 @@ printf '%s\n' "$(printf '%s' '<hostkey>' | sha256sum | cut -d' ' -f1)" \
 
 ### Finished-session signal
 
-`server.js` writes a session log while it is running, at the path produced by
+`wslogin-server.js` writes a session log while it is running, at the path produced by
 `session_template` (default `<username>/<sessioncookie>.json`, relative to
-`session_dir`). When the session ends, `server.js` renames the log to add a
+`session_dir`). When the session ends, `wslogin-server.js` renames the log to add a
 `.done` suffix:
 
 ```text
@@ -175,7 +175,7 @@ reconnects and are **not** uploaded.
 
 Renaming (or removing) the log prevents the same finished session from being
 uploaded again after the uploader restarts. `.uploaded` files are ignored by
-both the uploader and `server.js`.
+both the uploader and `wslogin-server.js`.
 
 Files are hashed and uploaded as streams, so large logs are not read into
 memory. Size and SHA-256 are computed in a streaming pass, then the file is sent
@@ -217,7 +217,7 @@ node receiver.js                 # run the receiver
 
 Both read the same configuration file (`WSLOGIN_CONFIG`, default
 `/etc/wslogin/config.ini`); the uploader uses the same `session_dir` as
-`server.js`. It must be able to
+`wslogin-server.js`. It must be able to
 read the session files and rename (or, with `upload_remove_uploaded`, remove)
 them inside `session_dir` after uploading, so run it as a user that has write
 access to that directory.

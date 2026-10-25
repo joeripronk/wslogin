@@ -881,7 +881,7 @@ function resolveSessionDir(config) {
 
 /**
  * Lists the session logs in session_dir. Active logs are uploaded as
- * snapshots; once server.js renames a log to <sessioncookie>.json.done its
+ * snapshots; once wslogin-server.js renames a log to <sessioncookie>.json.done its
  * final copy is uploaded. Checkpoints stay on the wslogin host.
  */
 async function listSessionFiles(sessionDir, template) {
@@ -926,7 +926,7 @@ async function listSessionFiles(sessionDir, template) {
 
 /**
  * Scans session_dir and uploads active and finished session logs. Runs as its
- * own process so uploads can never interfere with server.js.
+ * own process so uploads can never interfere with wslogin-server.js.
  */
 async function run(config, options) {
   options = options || {};

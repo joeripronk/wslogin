@@ -69,7 +69,7 @@ function userInGroup(username, group) {
 
 // The username of a request with a valid auth server session cookie
 // (auth.ini), false when the request has no usable sso session. Mirrors
-// the sso checks of server.js: cookie domain, sso group, root, and PAM
+// the sso checks of wslogin-server.js: cookie domain, sso group, root, and PAM
 // verification of the password stored in the auth server session.
 function ssoUser(request, callback) {
   if (!ssoAuth) {

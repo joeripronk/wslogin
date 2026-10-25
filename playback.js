@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
-// Session listing, playback streaming and checkpoint caching for server.js.
+// Session listing, playback streaming and checkpoint caching for wslogin-server.js.
 //
-// Logs written by server.js are JSON lines: {"t":<epoch seconds>,"d":"...","c":N}
+// Logs written by wslogin-server.js are JSON lines: {"t":<epoch seconds>,"d":"...","c":N}
 // where c=0 is a command (resize), c=1 terminal output, c=2 user input and c=3
 // the exit status. The playback backend turns these logs into an NDJSON stream
 // that the browser can apply to xterm.js. Checkpoints (rendered terminal state
@@ -1054,7 +1054,7 @@ function titleDescription(titles, lastTitle) {
     var enddate = metadata && metadata.lastT != null
       ? metadata.lastT : await readLastDate(entry.file);
     // No staleness check: a session that is not finished is listed as
-    // active (exact on server.js hosts through isActive). Disconnections
+    // active (exact on wslogin-server.js hosts through isActive). Disconnections
     // are discovered by the tailer when the event stream is processed.
     var active = entry.finished ? false
       : (isActive ? !!isActive(entry.username, entry.session) : true);
