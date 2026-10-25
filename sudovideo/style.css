@@ -274,6 +274,34 @@ button:disabled {
   white-space: nowrap;
 }
 
+.session-shot {
+  position: relative;
+  height: 84px;
+  margin-top: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #090b0e;
+  cursor: zoom-in;
+}
+
+.session-shot .xterm-viewport {
+  overflow: hidden !important;
+}
+
+.session-shot.shot-full {
+  position: fixed;
+  top: 4%;
+  left: 4%;
+  z-index: 60;
+  width: 92%;
+  height: 92%;
+  margin: 0;
+  border-color: #3b4654;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.65);
+  cursor: zoom-out;
+}
+
 .dot {
   width: 7px;
   height: 7px;

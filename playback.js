@@ -1049,6 +1049,11 @@ function titleDescription(titles, lastTitle) {
     if (cached && cached.key === key) return cached.value;
     var state = cacheStates.get(entry.file);
     var metadata = state && state.data ? state.data : null;
+    // Sessions played back earlier have a disk cache with checkpoints and
+    // titles; loading it here lets the list advertise checkpoint counts (and
+    // thumbnail slots) without building anything. Never-played sessions have
+    // no cache file and stay at zero, so listing never triggers a cache pass.
+    if (!metadata) metadata = loadDiskCache(entry.file);
     var startdate = metadata && metadata.startdate != null
       ? metadata.startdate : await readStartDate(entry.file);
     var enddate = metadata && metadata.lastT != null
@@ -1407,7 +1412,8 @@ function titleDescription(titles, lastTitle) {
     if (pathname == '/api/playback' || pathname == '/api/playback/') {
       sendJson(response, 200, {
         enabled: true,
-        endpoints: ['sessions', 'session', 'events', 'download', 'login'],
+        endpoints: ['sessions', 'session', 'events', 'thumbnail', 'download',
+          'login'],
         auth: authRequired,
         sso: !!sso,
         idle_skip_enabled: idleSkipEnabled,
@@ -1438,6 +1444,35 @@ function titleDescription(titles, lastTitle) {
     try {
       if (pathname == '/api/playback/sessions' && request.method == 'GET') {
         sendJson(response, 200, {sessions: await listSessions()});
+        return;
+      }
+      // Thumbnail: the rendered screen of the newest checkpoint of a session,
+      // requested lazily by the session list. The checkpoint cache is built on
+      // demand, so an unlisted thumbnail costs one cache pass of the log.
+      if (pathname == '/api/playback/thumbnail' && request.method == 'GET') {
+        var thumbUser = url.searchParams.get('u') || '';
+        var thumbSession = url.searchParams.get('s') || '';
+        var thumbHost = url.searchParams.get('h') || '';
+        var thumbFound = await findSessionFile(thumbUser, thumbSession, thumbHost);
+        if (!thumbFound) {
+          sendJson(response, 404, {error: 'session not found'});
+          return;
+        }
+        var thumbData = await ensureCache(thumbFound.file, thumbUser, thumbSession);
+        var thumb = thumbData.tail
+          || (thumbData.checkpoints.length
+            ? thumbData.checkpoints[thumbData.checkpoints.length - 1] : null);
+        if (!thumb || !thumb.serialized) {
+          sendJson(response, 200, {empty: true});
+          return;
+        }
+        sendJson(response, 200, {
+          t: thumb.t,
+          cols: thumb.cols,
+          rows: thumb.rows,
+          title: thumb.title,
+          serialized: thumb.serialized
+        });
         return;
       }
       if ((pathname == '/api/playback/session'

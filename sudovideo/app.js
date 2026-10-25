@@ -1598,6 +1598,119 @@ function openFromHash() {
   openSession(meta, Number.isFinite(time) ? time : undefined, true);
 }
 
+var thumbTerms = [];
+var thumbCache = new Map();
+var thumbObserver = null;
+
+if (window.IntersectionObserver) {
+  thumbObserver = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (!entry.isIntersecting) return;
+      thumbObserver.unobserve(entry.target);
+      loadThumb(entry.target);
+    });
+  }, {root: els.list, rootMargin: '300px'});
+}
+
+function disposeThumbs() {
+  if (thumbObserver) thumbObserver.disconnect();
+  thumbTerms.forEach(function(term) {
+    try { term.dispose(); } catch (error) {}
+  });
+  thumbTerms = [];
+}
+
+function thumbKey(meta) {
+  return (meta.hostname || '') + '/' + meta.username + '/' + meta.session
+    + ':' + (meta.size || 0);
+}
+
+function scaleShot(shot, term) {
+  var cell = null;
+  try {
+    cell = term._core._renderService.dimensions.css.cell;
+  } catch (error) {
+    cell = null;
+  }
+  if (!cell || !cell.width || !cell.height) cell = cellMetrics(11);
+  var w = shot.clientWidth;
+  var h = shot.clientHeight;
+  if (!w || !h) return;
+  var scale = Math.min(w / (term.cols * cell.width),
+    h / (term.rows * cell.height));
+  if (!isFinite(scale) || scale <= 0) return;
+  var el = shot.querySelector('.xterm');
+  if (el) {
+    el.style.transformOrigin = '0 0';
+    el.style.transform = 'scale(' + scale + ')';
+  }
+}
+
+function renderShot(shot, data) {
+  var term = new Terminal({
+    cols: Math.max(2, data.cols || 80),
+    rows: Math.max(2, data.rows || 24),
+    allowProposedApi: true,
+    disableStdin: true,
+    cursorBlink: false,
+    scrollback: 1,
+    fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
+    fontSize: 11,
+    lineHeight: 1,
+    theme: {background: '#090b0e', foreground: '#d8dee8'}
+  });
+  term.open(shot);
+  thumbTerms.push(term);
+  shot.__term = term;
+  if (data.serialized) {
+    term.write(data.serialized, function() {
+      requestAnimationFrame(function() {
+        if (shot.isConnected) scaleShot(shot, term);
+      });
+    });
+  }
+}
+
+// Lazily fetches the newest checkpoint of a session once its thumbnail slot
+// scrolls into view. Results are cached per session content (size keyed).
+function loadThumb(shot) {
+  var meta = shot.__meta;
+  var key = shot.__key;
+  var cached = thumbCache.get(key);
+  if (cached) {
+    if (cached.serialized) renderShot(shot, cached);
+    return;
+  }
+  var params = new URLSearchParams();
+  params.set('u', meta.username);
+  params.set('s', meta.session);
+  if (meta.hostname) params.set('h', meta.hostname);
+  fetch(API + '/thumbnail?' + params.toString(), {
+    cache: 'no-store',
+    credentials: 'same-origin'
+  }).then(function(response) {
+    if (!response.ok) return null;
+    return response.json();
+  }).then(function(data) {
+    if (!data || shot.__key !== key) return;
+    if (thumbCache.size > 50) thumbCache.clear();
+    thumbCache.set(key, data);
+    if (data.serialized && shot.isConnected) renderShot(shot, data);
+  }).catch(function() {});
+}
+
+function collapseShots() {
+  var expanded = document.querySelectorAll('.session-shot.shot-full');
+  if (!expanded.length) return false;
+  expanded.forEach(function(shot) {
+    shot.classList.remove('shot-full');
+    requestAnimationFrame(function() {
+      if (shot.__term) scaleShot(shot, shot.__term);
+    });
+  });
+  return true;
+}
+
 function createSessionItem(meta) {
   var button = document.createElement('div');
   button.className = 'session-item';
@@ -1640,6 +1753,22 @@ function createSessionItem(meta) {
     desc.textContent = meta.description;
     button.appendChild(desc);
   }
+  if (meta.checkpoints > 0 && thumbObserver) {
+    var shot = document.createElement('div');
+    shot.className = 'session-shot';
+    shot.title = 'Click to expand / collapse';
+    shot.__meta = meta;
+    shot.__key = thumbKey(meta);
+    shot.addEventListener('click', function(event) {
+      event.stopPropagation();
+      shot.classList.toggle('shot-full');
+      requestAnimationFrame(function() {
+        if (shot.__term) scaleShot(shot, shot.__term);
+      });
+    });
+    button.appendChild(shot);
+    thumbObserver.observe(shot);
+  }
   button.addEventListener('click', function() {
     setSidebarVisible(false);
     openSession(meta);
@@ -1673,6 +1802,7 @@ function createSessionItem(meta) {
 }
 
 function renderSessions() {
+  disposeThumbs();
   var query = els.filter.value.trim().toLowerCase();
   var list = state.sessions.filter(function(meta) {
     if (!query) return true;
@@ -1860,6 +1990,7 @@ document.addEventListener('keydown', function(event) {
     return;
   }
   if (typing) return;
+  if (event.key === 'Escape' && collapseShots()) return;
   if (event.code === 'Space') {
     event.preventDefault();
     togglePlayback();
