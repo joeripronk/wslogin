@@ -7,7 +7,7 @@
 // model and the recording; wslogin authenticates browser clients and
 // relays frames between the websocket and the daemon's unix socket.
 // termdLink returns a node-pty compatible adapter so wire_session works
-// unchanged: file=false (the daemon logs), mirror=null (no checkpoints).
+// unchanged: file=false (the daemon logs).
 
 const fs = require('fs');
 const path = require('path');
@@ -29,7 +29,7 @@ function termdSockPath(username, id) {
   return path.join(termdDir(username), id + '.sock');
 }
 
-// Directory layout mirrors the tmux socket pattern: the base is owned by
+// Directory layout: the base is owned by
 // the service user with the session user ACL-granted +wx, the per-user
 // directory is created by (and owned by) the user and inherits the
 // default ACL that keeps the service user in.

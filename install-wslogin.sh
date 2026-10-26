@@ -32,25 +32,25 @@ if ! id -u "$RUN_USER" >/dev/null 2>&1; then
 fi
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
-# tmux socket base directory; the server creates the per-user socket dirs
-# below it (see session_tmux_path in wslogin-server.js). Create the base and
-# the tmux base here so a fresh install does not fail on the chmod below;
-# only the bases are chowned, the per-user dirs below belong to their users.
-mkdir -p /run/wslogin/tmux
-chown "$RUN_USER":"$RUN_GROUP" /run/wslogin /run/wslogin/tmux
-chmod 755 /run/wslogin /run/wslogin/tmux
+# termd registry base; termd-bridge.js creates the per-user socket dirs
+# below it. Create the base here so a fresh install does not fail on the
+# chmod below; only the base is chowned, the per-user dirs below belong to
+# their users.
+mkdir -p /run/wslogin/termd
+chown "$RUN_USER":"$RUN_GROUP" /run/wslogin /run/wslogin/termd
+chmod 755 /run/wslogin /run/wslogin/termd
 if ! grep -qsw /run/wslogin /etc/tmpfiles.d/wslogin.conf 2>/dev/null; then
   echo "Installing /etc/tmpfiles.d/wslogin.conf"
   printf 'd /run/wslogin 0755 %s %s\n' "$RUN_USER" "$RUN_GROUP" > /etc/tmpfiles.d/wslogin.conf
 fi
 if command -v setfacl >/dev/null 2>&1; then
-  # default ACLs so user-owned socket directories and the tmux sockets
-  # inside them stay accessible for the service user (see wslogin-server.js);
+  # default ACLs so user-owned socket directories and the daemon sockets
+  # inside them stay accessible for the service user (see termd-bridge.js);
   # the x bit is required for the service user to traverse into the
   # user-owned socket directories
-  setfacl -d -m "u:$RUN_USER:rwx" -d -m 'm::rwx' /run/wslogin/tmux
+  setfacl -d -m "u:$RUN_USER:rwx" -d -m 'm::rwx' /run/wslogin/termd
 else
-  echo "warning: setfacl not installed, tmux socket attach will fail when the server runs unprivileged" >&2
+  echo "warning: setfacl not installed, wslogin cannot reach the daemon sockets" >&2
 fi
 
 if getent group shadow >/dev/null 2>&1; then
@@ -99,21 +99,6 @@ echo "Installing dependencies"
 
 echo "Handing $APP_DIR to $RUN_USER"
 chown -R "$RUN_USER":"$RUN_GROUP" "$APP_DIR"
-
-# setuid helper for the tmux attach (see wslogin-run.c): node-pty's child
-# must run as the session user and only root can become one; the helper
-# execs tmux directly, without sudo's forked parent in the process list.
-# Built after the chown so it keeps root ownership and the setuid bit.
-if command -v gcc >/dev/null 2>&1; then
-  echo "Building setuid attach helper wslogin-run"
-  gcc -O2 -Wall -DWSLOGIN_RUN_CALLER="\"$RUN_USER\"" \
-    -o "$APP_DIR/wslogin-run.new" "$APP_DIR/wslogin-run.c"
-  chown root:root "$APP_DIR/wslogin-run.new"
-  chmod 4755 "$APP_DIR/wslogin-run.new"
-  mv -f "$APP_DIR/wslogin-run.new" "$APP_DIR/wslogin-run"
-else
-  echo "warning: gcc not found, wslogin-run helper not built; attach falls back to sudo" >&2
-fi
 
 if [[ -r "${AUTH_CONF:-/etc/apache2/auth.conf}" ]]; then
   AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" "$APP_DIR/sync-auth-conf.sh"

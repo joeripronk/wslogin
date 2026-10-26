@@ -13,7 +13,6 @@ wslogin keeps a session log for every interactive terminal session in
 can be inspected or restored from another machine, even when the wslogin host
 is gone. Active sessions are uploaded as near-real-time snapshots triggered by
 a file monitor; finished sessions are uploaded once more as their final copy.
-Checkpoints are local-only and are not uploaded.
 
 Uploads are best effort and asynchronous. They must never block, slow down or
 break a terminal session. Failed uploads are retried and finally dropped.
@@ -65,7 +64,7 @@ upload_append_verbose=false
   during an upload are coalesced into the next snapshot, so a session is
   uploaded as soon as new output is ready and the previous upload has finished
   and an older snapshot can never overwrite a newer one on the receiver.
-- `upload_remove_uploaded` removes a finished session log and its checkpoint
+- `upload_remove_uploaded` removes a finished session log
   after it has been uploaded successfully instead of renaming the log to
   `.uploaded`. Defaults to `false`. Active logs are never removed.
 - `upload_connections` is the maximum number of WebSocket connections. Defaults
@@ -167,11 +166,9 @@ renames the log from `.done` to `.uploaded`:
 ```
 
 With `upload_remove_uploaded=true` the finished log and its
-`<sessioncookie>.checkpoint.json` are removed instead of renamed, freeing the
+are removed instead of renamed, freeing the
 disk space as soon as the upload has succeeded.
 
-Checkpoints (`<sessioncookie>.checkpoint.json`) are only used locally for
-reconnects and are **not** uploaded.
 
 Renaming (or removing) the log prevents the same finished session from being
 uploaded again after the uploader restarts. `.uploaded` files are ignored by
@@ -364,10 +361,10 @@ evolve):
 `3` mouse pointer, `4` session header, `5` tailer. `t` is a Unix timestamp and
 `d` the payload. The first line of every log is the header record (`c:4`); its
 payload carries `viewid`, `shareid`, `viewurl` and `shareurl`, the viewonly and
-shared links of the wslogin host. When sessions run under tmux (`session_tmux`)
-it also carries reconnect meta: `username`, `sessioncookie`, `reconnectid`,
-`cols`, `rows`, `starttime` and the `tmux` server socket, which the server reads
-at startup to re-attach live sessions after a restart. The last line of a
+shared links of the wslogin host, and reconnect meta: `username`,
+`sessioncookie`, `reconnectid`, `cols`, `rows`, `starttime` and the `termd`
+daemon socket, which the server reads at startup to resume live sessions
+after a restart. The last line of a
 finished log is the tailer record (`c:5`); its payload carries `size` and
 `sha256` of the log without the tailer itself plus the session `endtime`, so a
 finished log is self-verifying. `wslogin` appends the tailer when a session ends and, at

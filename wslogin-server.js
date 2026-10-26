@@ -9,12 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const readline = require('readline');
-const pty = require('node-pty');
 const { spawn, spawnSync } = require('child_process');
-const { Terminal } =  require ("@xterm/headless");
-//const { Terminal } =  require ("@xterm/xterm");
-const { SerializeAddon } = require("@xterm/addon-serialize");
 const { loadSslOptions, allowPlaintext } = require('./ssl');
 const { render: renderTemplate, placeholders: templatePlaceholders,
   match: matchTemplate, isSafeRelative } = require('./template');
@@ -23,10 +18,6 @@ const { createSsoAuth, parseCookieHeader } = require('./auth');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
-// keep in sync with the browser terminal scrollback (www/wslogin.js) and
-// the playback viewer (playback.js); tmux keeps no scrollback of its own
-// (tmux.conf history-limit 0), wslogin's session log is the history
-const SCROLLBACK = 2000;
 function now() {
   return Date.now()/1000;
   //var hrTime = process.hrtime()
@@ -64,20 +55,6 @@ function validSize(cols, rows) {
   return Number.isInteger(cols) && Number.isInteger(rows)
     && cols >= 1 && rows >= 1 && cols <= max_cols && rows <= max_rows;
 }
-
-var checkpoint_enabled = configBool('checkpoint_enabled', true);
-var checkpoint_interval_seconds = Math.max(0, configInt('checkpoint_interval_seconds', 3600));
-var checkpoint_bytes = Math.max(0, configInt('checkpoint_bytes', 1024 * 1024));
-if (checkpoint_interval_seconds==0 && checkpoint_bytes==0) {
-  checkpoint_enabled=false;
-}
-console.log("checkpoints: enabled="+checkpoint_enabled
-  +" interval="+checkpoint_interval_seconds+"s bytes="+checkpoint_bytes);
-
-// Run each session shell under a per-session tmux server so it outlives a
-// wslogin restart; on startup live sessions are re-attached (see resume_sessions).
-var session_tmux = configBool('session_tmux', true);
-console.log("session_tmux="+session_tmux);
 
 // Addresses whose X-Forwarded-For header we trust to carry the real client
 // address (reverse proxies, load balancers). Defaults to loopback.
@@ -172,13 +149,6 @@ function ensureWritableDirs(username) {
     var out = spawnSync('chown', ['-R', username+':', dir]);
     if (out.status !== 0) console.error("chown "+dir+" to "+username+" failed");
   });
-  // the recursive chown above would strip the setuid helper; it must stay
-  // root-owned with the setuid bit (see wslogin-run.c)
-  var helper = path.join(__dirname, 'wslogin-run');
-  if (fs.existsSync(helper)) {
-    spawnSync('chown', ['root:root', helper]);
-    spawnSync('chmod', ['4755', helper]);
-  }
   if ('cookie_dir' in config) {
     // chown the cookie directory itself only: cookie files are created by
     // the users and their owner identifies the login; chowning them to the
@@ -247,23 +217,9 @@ function session_log_path(username, sessioncookie) {
   }
   return path.join(session_dir, relative);
 }
-function session_checkpoint_path(username, sessioncookie) {
-  var file = session_log_path(username, sessioncookie);
-  return file.slice(0, -'.json'.length) + '.checkpoint.json';
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
-// Per-session tmux server socket. The socket directory must be traversable
-// by the wslogin service user (it removes stale sockets) and writable by
-// the session user (the tmux server creates the socket and its lock file
-// in it), so it lives under a server-wide base directory (default
-// /run/wslogin/tmux): the base is owned by wslogin (mode 755) with the
-// user ACL-granted (+wx), and <base>/<username> is created by and owned by
-// the user, inheriting the default ACL that gives wslogin rwx. The shell
-// lives in this tmux server, independent of the wslogin process, so a
-// wslogin restart can find it again and re-attach.
-var tmux_socket_dir = config.tmux_socket_dir
-  ? path.resolve(String(config.tmux_socket_dir))
-  : '/run/wslogin/tmux';
-console.log("tmux_socket_dir="+tmux_socket_dir);
 var WSLOGIN_USER = (process.userInfo && process.userInfo.username) || 'wslogin';
 function lookupUser(username) {
   try {
@@ -278,37 +234,20 @@ function lookupUser(username) {
   } catch (error) {}
   return null;
 }
-function session_tmux_dir(username) {
-  return path.join(tmux_socket_dir, username);
-}
-function session_tmux_path(username, sessioncookie) {
-  return path.join(session_tmux_dir(username), sessioncookie + '.tmux');
-}
-var tmux_conf = path.join(__dirname, 'tmux.conf');
-// wslogin runs per-user commands (tmux server start, attach, queries) as
-// the session user. node-pty attaches its direct child to the terminal, and
-// only root can become another user: the child is the small setuid helper
-// wslogin-run, which drops to the session user and execs the command as a
-// single process, so no sudo stays in the process list for the lifetime of
-// the view and no sudo/pam noise lands in the journal. Falls back to
-// sudo -u when the helper is not installed. Defined here (before the
-// startup scan) so the resume path uses it too.
-var run_helper = fs.existsSync(path.join(__dirname, 'wslogin-run'))
-  ? path.join(__dirname, 'wslogin-run') : null;
-console.log("per-user helper: "+(run_helper ? run_helper : "sudo -u (wslogin-run not installed)"));
+// wslogin runs per-user commands (termd daemon start, queries) as the
+// session user via sudo -u. Defined here (before the startup scan) so the
+// resume path uses it too.
 function user_run_prefix(username) {
-  return run_helper ? [run_helper, username] : ['sudo', '-u', username];
+  return ['sudo', '-u', username];
 }
-// Run a command as the session user: wslogin-run helper when installed,
-// sudo -u otherwise.
+// Run a command as the session user.
 function run_as(username, args, options) {
   var prefix = user_run_prefix(username);
   return spawnSync(prefix[0], prefix.slice(1).concat(args), options);
 }
 // termd mode: sessions run in per-session termd daemons (pty owner,
-// terminal model and recording live in the daemon); wslogin becomes the
+// terminal model and recording live in the daemon); wslogin is the
 // authenticating proxy between browser clients and daemon sockets.
-var termd_enabled = configBool('termd', false);
 var termd_base = config.termd_dir
   ? path.resolve(String(config.termd_dir))
   : '/run/wslogin/termd';
@@ -321,8 +260,7 @@ termd.init({
   wsloginUser: WSLOGIN_USER, runAs: run_as, spawnSync: spawnSync, lookupUser: lookupUser,
   userRunPrefix: user_run_prefix, sessionLogPath: session_log_path
 });
-if (termd_enabled) checkpoint_enabled = false;
-console.log("termd mode: enabled=" + termd_enabled + " dir=" + termd_base + " command=" + termd_command);
+console.log("termd mode: dir=" + termd_base + " command=" + termd_command);
 // The tailer is the last record of a finished log (c=5). Its payload records
 // the file size and SHA-256 of the log without the tailer itself plus the
 // session end time, so a finished log can be verified without trusting the
@@ -389,7 +327,7 @@ function write_tailer(file) {
   console.log("added tailer to "+file);
 }
 // Renaming the log of an ended session signals uploader.js that the session is
-// complete and can be uploaded. Checkpoints are not uploaded.
+// complete and can be uploaded.
 function finish_path(file) {
   try {
     if (fs.existsSync(file)) {
@@ -462,50 +400,6 @@ function delete_reconnect_token(username, sessioncookie) {
   } catch (error) {}
 }
 
-// Rebuild a live session from its header meta after a wslogin restart. The
-// tmux server (and the shell in it) survived; re-attach and restore the map
-// entries so the user can reconnect.
-function resume_session(meta) {
-  var username = meta.username, sessioncookie = meta.sessioncookie;
-  var cols = meta.cols || 80, rows = meta.rows || 24;
-  // reconnectid is deliberately not stored in the session log header (the
-  // header is uploaded with the log); the current token is kept in the
-  // local sidecar file so reconnect tokens survive a restart
-  var reconnectid = read_reconnect_token(username, sessioncookie)
-    || meta.reconnectid || uuid_v4();
-  sessions[username] = sessions[username] || {};
-  sessions[username][sessioncookie] = {
-    viewid: meta.viewid, shareid: meta.shareid,
-    reconnectid: reconnectid, connections: {}
-  };
-  var session = sessions[username][sessioncookie];
-  session.sessioncookie = sessioncookie;
-  session.checkpoint_path = session_checkpoint_path(username, sessioncookie);
-  var logfile = session_log_path(username, sessioncookie);
-  try { session.logBytes = fs.statSync(logfile).size; } catch (error) { session.logBytes = 0; }
-  session.mirror = create_mirror(cols, rows);
-  reconnects[reconnectid] = {username: username, sessioncookie: sessioncookie};
-  save_reconnect_token(username, sessioncookie);
-  views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
-  shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
-  var shellenv = { USER: username, VIEWID: meta.viewid, VIEWURL: meta.viewurl, SUDO_USER: username, LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
-  session.pty = attach_tmux(username, sessioncookie, cols, rows, shellenv, meta.tmux);
-  session.pty.file = fopen(logfile, 'a+');
-  session.pty.main = false;
-  wire_session(username, sessioncookie);
-  console.log("resumed session "+sessioncookie+" for "+username+" tmux "+meta.tmux);
-  if (checkpoint_enabled && session.mirror) {
-    create_replayed_terminal(logfile, session.checkpoint_path).then(function(serial) {
-      if (session.mirror) {
-        session.mirror.terminal.resize(serial.cols, serial.rows);
-        session.mirror.terminal.write(serial.s);
-        // restore the window title the session had before the restart
-        var title = extract_title(serial.s);
-        if (title) session.mirror.title = title;
-      }
-    }).catch(function() {});
-  }
-}
 // A termd session whose daemon is gone (killed via the termd CLI, daemon
 // crash, exit while wslogin was down): nothing will ever deliver an exit
 // frame for a detached session, so wslogin must drop the map entries
@@ -592,9 +486,9 @@ function termd_reattach(username, sessioncookie, cols, rows, view, connection) {
   link.resize(cols, rows);
 }
 
-// termd replacement for replay_pty: the snapshot already arrived (or is
-// arriving) through the link and was buffered for the paused client;
-// drain the buffer and complete the handshake.
+// Complete a reconnect: the snapshot already arrived (or is arriving)
+// through the link and was buffered for the paused client; drain the
+// buffer and complete the handshake.
 function termd_replay(username, sessioncookie, connection) {
   var session = sessions[username][sessioncookie];
   var finish = function () {
@@ -631,8 +525,8 @@ function termd_replay(username, sessioncookie, connection) {
   setTimeout(finish, 300);
 }
 
-// Live-session state, declared before the startup scan (finish_interrupted_
-// sessions / resume_session) that rebuilds sessions from disk.
+// Live-session state, declared before the startup scan
+// (finish_interrupted_sessions) that rebuilds sessions from disk.
 // connection index counter; connections are reachable through the sessions
 // maps, no global list is kept, so closed clients do not accumulate
 var nextIndex = 0;
@@ -695,9 +589,7 @@ function finish_interrupted_sessions() {
       else if (entry.name.endsWith('.uploaded')) finished = -'.uploaded'.length;
       if (finished !== null) {
         var baseRel = rel.slice(0, finished);
-        if (!baseRel.endsWith('.json')
-            || baseRel.endsWith('.checkpoint.json')
-            || baseRel.endsWith('.meta.json')) continue;
+        if (!baseRel.endsWith('.json')) continue;
         if (!matchTemplate(session_template, baseRel, ['username', 'session'])) {
           continue;
         }
@@ -709,29 +601,15 @@ function finish_interrupted_sessions() {
         }
         continue;
       }
-      if (!entry.name.endsWith('.json')
-          || entry.name.endsWith('.checkpoint.json')
-          || entry.name.endsWith('.meta.json')) continue;
+      if (!entry.name.endsWith('.json')) continue;
       var parts = matchTemplate(session_template, rel, ['username', 'session']);
       if (!parts) continue;
       var file = path.join(dir, entry.name);
       var meta = read_session_header(file);
-      if (termd_enabled && meta && meta.termd && meta.username && meta.sessioncookie
+      if (meta && meta.termd && meta.username && meta.sessioncookie
           && meta.termd.startsWith(termd_base + path.sep)) {
         termd_resume(meta);
-      } else if (session_tmux && meta && meta.tmux && meta.username && meta.sessioncookie
-          && meta.tmux.startsWith(tmux_socket_dir + path.sep)
-          && tmux_alive(meta.username, meta.tmux)) {
-        resume_session(meta);
       } else {
-        if (session_tmux && meta && meta.tmux && meta.username
-            && !meta.tmux.startsWith(tmux_socket_dir + path.sep)
-            && tmux_alive(meta.username, meta.tmux)) {
-          // old socket layout (e.g. in the user's home): the log is
-          // retired, kill the orphaned tmux server with its shell
-          console.log("killing tmux server with retired socket "+meta.tmux);
-          run_as(meta.username, ['tmux', '-S', meta.tmux, 'kill-server']);
-        }
         finish_path(file);
       }
     }
@@ -804,233 +682,6 @@ function write(fd,d) {
 function fopen(fname,flags) {
   return fs.openSync(fname,flags);
 }
-function serialize_terminal(terminal, serializeAddon, viewportOnly) {
-  const {isCursorHidden} = terminal._core._inputHandler._coreService;
-  // scrollback: 0 serializes the visible screen only (thumbnails do not
-  // need the mirror's history, checkpoints do for reconnects)
-  return serializeAddon.serialize(viewportOnly ? {scrollback:0} : undefined)+(isCursorHidden ? '\x1b[?25l' : '\x1b[?25h');
-}
-
-function load_checkpoint(file, checkpointfile) {
-  if (!fs.existsSync(checkpointfile)) {
-    return null;
-  }
-  try {
-    var checkpoint=JSON.parse(fs.readFileSync(checkpointfile, 'utf-8'));
-    if (checkpoint.version!==1 ||
-        !Number.isInteger(checkpoint.offset) || checkpoint.offset<0 ||
-        !Number.isInteger(checkpoint.cols) || checkpoint.cols<1 ||
-        !Number.isInteger(checkpoint.rows) || checkpoint.rows<1 ||
-        typeof checkpoint.serialized !== 'string') {
-      console.log("ignoring invalid checkpoint "+checkpointfile);
-      return null;
-    }
-    if (checkpoint.offset > fs.statSync(file).size) {
-      console.log("ignoring checkpoint past end of "+file);
-      return null;
-    }
-    console.log("using checkpoint "+checkpointfile+" at offset "+checkpoint.offset);
-    return checkpoint;
-  } catch (error) {
-    console.error("error reading checkpoint "+checkpointfile+": "+error.message);
-    return null;
-  }
-}
-
-async function create_replayed_terminal (file, checkpointfile) {
-  var checkpoint=checkpointfile ? load_checkpoint(file, checkpointfile) : null;
-  return new Promise((resolve, reject) => {
-    // scrollback matching the browser terminal (wslogin.js): the serialized
-    // replay carries this much history to the reconnecting client
-    var terminal = new Terminal({ allowProposedApi: true, scrollback: SCROLLBACK });
-    var serializeAddon = new SerializeAddon();
-    terminal.loadAddon(serializeAddon);
-    const finish = function() {
-      terminal.write("",function () {
-        const {isCursorHidden} = terminal._core._inputHandler._coreService;
-        if (isCursorHidden) {
-          console.log("cursor is hidden");
-        }
-        resolve({cols:terminal.cols,rows:terminal.rows,s:serialize_terminal(terminal, serializeAddon)});
-      })
-    };
-    const replay = function() {
-      var options=checkpoint ? {start:checkpoint.offset} : undefined;
-      var rd = readline.createInterface({
-        input: fs.createReadStream(file, options),
-        terminal: false
-      });
-      rd.on('line', function(line) {
-        try {
-          var json=JSON.parse(line);
-          if (json.c==0) {
-            const c=JSON.parse(json.d);
-            if (c.cmd=="resize") {
-              terminal.resize(c.cols,c.rows);
-            } else if (c.cmd=="b64") {
-              terminal.write(Buffer.from(c.data,'base64'));
-            }
-          } else if (json.c==1) {
-            terminal.write(json.d);
-          }
-        } catch (error) {
-          console.error("error replaying "+file+": "+error.message);
-        }
-      }).on('close', finish).on('error', function(error) {
-        // a cleaned up (deleted) log must not kill the server: replay
-        // what is there (nothing) and continue with the live session
-        console.error("error reading "+file+": "+error.message);
-        finish();
-      });
-    };
-    if (checkpoint) {
-      terminal.resize(checkpoint.cols,checkpoint.rows);
-      terminal.write(checkpoint.serialized, function() { replay(); });
-    } else {
-      replay();
-    }
-  });
-}
-
-function create_mirror(cols, rows) {
-  if (!checkpoint_enabled) {
-    return null;
-  }
-  var terminal = new Terminal({ allowProposedApi: true, scrollback: SCROLLBACK });
-  var serializeAddon = new SerializeAddon();
-  terminal.loadAddon(serializeAddon);
-  terminal.resize(cols, rows);
-  return {
-    terminal: terminal,
-    serializeAddon: serializeAddon,
-    queue: [],
-    offset: 0,
-    bytesSinceCheckpoint: 0,
-    lastCheckpoint: now(),
-    busy: false,
-    saving: false,
-    saveRequested: false
-  };
-}
-
-function shQuote(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'";
-}
-
-// Start a detached per-session tmux server, running as the user, with the
-// user's shell as its only pane. The shell is a direct child of the user's
-// tmux server (no lingering sudo), and survives a wslogin restart. Returns
-// true when the session is up.
-function start_tmux_session(username, sessioncookie, cols, rows, env) {
-  var u = lookupUser(username);
-  if (!u) { console.error("no passwd entry for "+username); return false; }
-  var sock = session_tmux_path(username, sessioncookie);
-  var dir = session_tmux_dir(username);
-  // The per-user socket directory is owned by the user (their tmux server
-  // creates the socket and lock file in it). Default ACLs on the base
-  // directory give wslogin rw on everything created below it: wslogin can
-  // traverse the path and connect the attach client to the socket,
-  // even though tmux forces the socket to mode 0600 (the mask inherited
-  // from the default ACL keeps wslogin's entry effective).
-  var base = path.dirname(dir);
-  try { fs.mkdirSync(base, { recursive: true, mode: 0o755 }); } catch (error) {}
-  var bacl = spawnSync('setfacl', ['-d', '-m', 'u:'+WSLOGIN_USER+':rwx',
-    '-d', '-m', 'm::rwx', base]);
-  if (bacl.status !== 0) {
-    console.error("setfacl defaults on "+base+" for "+WSLOGIN_USER+" failed: "
-      +bacl.stderr+"; tmux sockets will be owner-only and attaching will fail");
-  }
-  // the user needs write on the base directory to create his socket dir;
-  // '+wx' (add entry, keep mask) is rejected as EINVAL by setfacl 2.3.x on
-  // tmpfs, so set the entry and the mask explicitly
-  var uacl = spawnSync('setfacl', ['-m', 'u:'+username+':rwx,m::rwx', base]);
-  if (uacl.status !== 0) console.error("setfacl "+base+" for "+username+" failed: "+uacl.stderr);
-  var st = null;
-  try { st = fs.statSync(dir); } catch (error) {}
-  if (!st) {
-    var mk = run_as(username, ['mkdir', '-p', dir]);
-    if (mk.status !== 0) console.error("mkdir "+dir+" as "+username+" failed: "+mk.stderr);
-  } else if (st.uid !== (lookupUser(username)||{}).uid) {
-    console.error(dir+" exists with unexpected owner uid "+st.uid+", session attach may fail");
-  }
-  var shell = u.shell || '/bin/bash';
-  var viewid = ((env && env.VIEWID) || '');
-  var viewurl = ((env && env.VIEWURL) || '');
-  // Pane command: env -i drops everything tmux and sudo inject (TMUX,
-  // TMUX_PANE, TERM_PROGRAM*, SUDO_*, SHLVL, PWD) and starts a login shell
-  // with a minimal, hand-picked environment.
-  var panecmd = "exec env -i HOME=" + shQuote(u.home) + " SHELL=" + shQuote(shell) +
-    " USER=" + shQuote(username) + " LOGNAME=" + shQuote(username) +
-    " PATH=/usr/local/bin:/usr/bin:/bin" +
-    " LANG=en_US.UTF-8 COLORTERM=truecolor TERM=xterm-256color" +
-    " VIEWID=" + shQuote(viewid) + " VIEWURL=" + shQuote(viewurl) +
-    " " + shQuote(shell) + " -l";
-  var args = user_run_prefix(username).concat(['env',
-    'USER=' + username, 'LOGNAME=' + username, 'HOME=' + u.home,
-    'SHELL=' + shell, 'PATH=/usr/local/bin:/usr/bin:/bin',
-    'VIEWID=' + viewid, 'VIEWURL=' + viewurl,
-    'tmux', '-S', sock]);
-  if (fs.existsSync(tmux_conf)) args.push('-f', tmux_conf);
-  args.push('new-session', '-d', '-s', 'main',
-    '-x', String(cols), '-y', String(rows), panecmd);
-  // No cwd: the service user cannot enter the user's home (mode 700) and a
-  // spawnSync child chdir there would fail with EACCES; the pane command's
-  // login shell changes into HOME itself.
-  var prog = args.shift();
-  var out = spawnSync(prog, args);
-  if (out.status !== 0) {
-    console.error("tmux new-session failed for "+username+" "+sessioncookie
-      +": "+(out.stderr ? out.stderr : out.error ? out.error.message
-      : "status "+out.status));
-    return false;
-  }
-  return tmux_alive(username, sock);
-}
-
-function attach_tmux(username, sessioncookie, cols, rows, env, sock) {
-  if (!sock) sock = session_tmux_path(username, sessioncookie);
-  var args = user_run_prefix(username).concat(
-    ['env', 'TERM=xterm-256color', 'tmux', '-S', sock, 'attach', '-t', 'main']);
-  var prog = args.shift();
-  return pty.spawn(prog, args, {
-    name: 'xterm-256color',
-    cols: cols,
-    rows: rows,
-    cwd: '/',
-    encoding: null,
-    env: env
-  });
-}
-
-// Is a tmux server with this socket alive and showing its session?
-// Runs as the session's user via sudo, so it works unprivileged too.
-function tmux_alive(username, sock) {
-  var out = run_as(username, ['tmux', '-S', sock, 'list-sessions'], { encoding: 'utf8' });
-  return out.status === 0 && /main/.test(out.stdout);
-}
-
-function kill_tmux_session(username, sessioncookie) {
-  var sock = session_tmux_path(username, sessioncookie);
-  run_as(username, ['tmux', '-S', sock, 'kill-server']);
-  try { fs.unlinkSync(sock); } catch (error) {}
-}
-
-// Detach the tmux attach clients of a session; used when the wslogin side
-// of a view goes away (pty exit, owner disconnect) so no client lingers on
-// the tmux server. tmux 3.x has no kill-client, clients are detached by
-// their tty (the target accepted by detach-client).
-function kill_tmux_clients(username, sessioncookie) {
-  var sock = session_tmux_path(username, sessioncookie);
-  var out = run_as(username, ['tmux', '-S', sock, 'list-clients', '-F', '#{client_tty}'],
-    { encoding: 'utf8' });
-  if (out.status !== 0) return;
-  String(out.stdout).split('\n').forEach(function(entry) {
-    var tty = entry.trim();
-    if (!tty.startsWith('/dev/')) return;
-    run_as(username, ['tmux', '-S', sock, 'detach-client', '-t', tty]);
-  });
-}
-
 function append_session_log(session, log) {
   var text=JSON.stringify(log)+'\n';
   var bytes=Buffer.byteLength(text);
@@ -1041,57 +692,7 @@ function append_session_log(session, log) {
   return {offset:session.logBytes,bytes:bytes};
 }
 
-function pump_mirror(session) {
-  var mirror=session.mirror;
-  if (!mirror || mirror.busy) return;
-  var op=mirror.queue.shift();
-  if (!op) return;
-  mirror.busy=true;
-  const done=function() {
-    mirror.offset=op.offset;
-    if (op.type=='data') {
-      mirror.bytesSinceCheckpoint+=op.bytes;
-    }
-    mirror.busy=false;
-    maybe_save_checkpoint(session);
-    pump_mirror(session);
-  };
-  try {
-    if (op.type=='resize') {
-      mirror.terminal.resize(op.cols,op.rows);
-      done();
-    } else {
-      mirror.terminal.write(op.data,done);
-    }
-  } catch (error) {
-    console.error("error updating checkpoint terminal: "+error.message);
-    mirror.busy=false;
-    pump_mirror(session);
-  }
-}
-
-// The window title a terminal last set with OSC 0/2. The headless mirror
-// terminal ignores title sequences, so it is tracked from the raw stream.
-function extract_title(s) {
-  var last = '';
-  var re = /\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
-  var m;
-  s = String(s);
-  while ((m = re.exec(s)) !== null) last = m[1];
-  return last;
-}
-
-function queue_mirror(session, op) {
-  if (!session.mirror) return;
-  if (op.type === 'data' && session.mirror) {
-    var title = extract_title(op.data);
-    if (title) session.mirror.title = title;
-  }
-  session.mirror.queue.push(op);
-  pump_mirror(session);
-}
-
-// Wire a session's tmux-attach pty to the log, the mirror and its viewers.
+// Wire a session pty (termd link) to the log and its viewers.
 // Used both when a session is created and when it is resumed after a restart.
 function wire_session(username, sessioncookie) {
   var session = sessions[username][sessioncookie];
@@ -1106,15 +707,12 @@ function wire_session(username, sessioncookie) {
     var text=data.toString('utf8');
     if (Buffer.compare(Buffer.from(text,'utf8'), data) === 0) {
       var log={t:now(),d:text,c:1};
-      var written=append_session_log(session,log);
-      queue_mirror(session,{type:'data',data:text,offset:written.offset,bytes:written.bytes});
+      append_session_log(session,log);
       senddata='\1'+ text;
     } else {
       var cmd={cmd:'b64',data:data.toString('base64')};
       var log={t:now(),d:JSON.stringify(cmd),c:0};
-      var written=append_session_log(session,log);
-      // keep the checkpoint mirror in sync: xterm accepts raw Buffers
-      queue_mirror(session,{type:'data',data:data.slice(),offset:written.offset,bytes:written.bytes});
+      append_session_log(session,log);
       senddata='\0'+ JSON.stringify(cmd);
     }
     for (const [key, conn] of Object.entries(session['connections'])) {
@@ -1126,16 +724,14 @@ function wire_session(username, sessioncookie) {
     }
   });
   ptyproc.on('resize', function() {
-    // node-pty fires 'resize' on every resize() call, also no-op ones;
-    // a same-size resize reflows the mirror's whole scrollback and
-    // appends a duplicate resize op to the log, so ignore it
+    // termd links fire 'resize' only on real size changes; node-pty fired
+    // it on every resize() call, also no-op ones, so keep the dedupe
     if (ptyproc.cols === lastCols && ptyproc.rows === lastRows) return;
     lastCols = ptyproc.cols; lastRows = ptyproc.rows;
     var resize={cmd:"resize",rows:ptyproc.rows,cols:ptyproc.cols};
     var cmdtext='\0'+JSON.stringify(resize);
     var log={t:now(),d:JSON.stringify(resize),c:0};
-    var written=append_session_log(session,log);
-    queue_mirror(session,{type:'resize',cols:resize.cols,rows:resize.rows,offset:written.offset,bytes:written.bytes});
+    append_session_log(session,log);
     for (const [key, conn] of Object.entries(session.connections)) {
       if (conn.paused) {
         bufferSend(conn, cmdtext);
@@ -1149,19 +745,6 @@ function wire_session(username, sessioncookie) {
     var log={t:now(),d:data,c:3};
     append_session_log(session,log);
     close_pty_file(ptyproc);
-    if (!termd_enabled && session_tmux && tmux_alive(username, session_tmux_path(username, sessioncookie))) {
-      // the tmux server and its shell survive this view (owner disconnect,
-      // wslogin restart): drop any lingering attach clients and keep the
-      // session alive for a reconnect. The attach client is gone, so the
-      // session is marked detached (pty=false); a reconnect re-attaches
-      // (see create_pty).
-      kill_tmux_clients(username, sessioncookie);
-      session.cols = ptyproc.cols;
-      session.rows = ptyproc.rows;
-      session.pty = false;
-      notifyPickers(username);
-      return;
-    }
     for (const [key, conn] of Object.entries(session['connections'])) {
       if (ptyproc.main == conn) {
         sendInfo(conn,"Your session ended");
@@ -1175,7 +758,6 @@ function wire_session(username, sessioncookie) {
     delete reconnects[session.reconnectid];
     delete_reconnect_token(username, sessioncookie);
     delete shares[session.shareid];
-    if (!termd_enabled) kill_tmux_session(username, sessioncookie);
     delete sessions[username][sessioncookie];
     if (Object.keys(sessions[username]).length===0) {
       delete sessions[username];
@@ -1198,91 +780,7 @@ function close_pty_file(ptyproc) {
                function() { fs.close(fd, function() {}); });
 }
 
-// Re-attach a detached session (tmux server alive, attach client gone,
-// e.g. after the owner disconnected): spawn a fresh tmux attach client,
-// reopen its log and wire it like on creation.
-function reattach_session(username, sessioncookie, cols, rows) {
-  var session = sessions[username][sessioncookie];
-  var shellenv = { USER: username, VIEWID: session.viewid, SUDO_USER: username,
-    LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
-  session.pty = attach_tmux(username, sessioncookie, cols, rows, shellenv);
-  session.pty.file = fopen(session_log_path(username, sessioncookie), 'a+');
-  session.pty.main = false;
-  wire_session(username, sessioncookie);
-  console.log("re-attached "+sessioncookie+" for "+username);
-}
-
-function checkpoint_due(session) {
-  var mirror=session.mirror;
-  if (!mirror || !checkpoint_enabled || mirror.bytesSinceCheckpoint<=0) return false;
-  var bytesdue=checkpoint_bytes>0 && mirror.bytesSinceCheckpoint>=checkpoint_bytes;
-  var timedue=checkpoint_interval_seconds>0 && (now()-mirror.lastCheckpoint)>=checkpoint_interval_seconds;
-  return bytesdue || timedue;
-}
-
-function maybe_save_checkpoint(session) {
-  var mirror=session.mirror;
-  if (!mirror || mirror.busy || mirror.saving) return;
-  if (!mirror.saveRequested && !checkpoint_due(session)) return;
-  if (save_checkpoint(session)) mirror.saveRequested=false;
-}
-
-function save_checkpoint(session) {
-  var mirror=session.mirror;
-  if (!session.pty || !session.pty.file || !session.checkpoint_path) return false;
-  var offset=mirror.offset;
-  try {
-    if (fs.fstatSync(session.pty.file).size < offset) {
-      return false;
-    }
-  } catch (error) {
-    return false;
-  }
-  var checkpoint={
-    version:1,
-    offset:offset,
-    cols:mirror.terminal.cols,
-    rows:mirror.terminal.rows,
-    time:now(),
-    serialized:serialize_terminal(mirror.terminal, mirror.serializeAddon)
-  };
-  var tmp=session.checkpoint_path+'.tmp';
-  mirror.saving=true;
-  mirror.bytesSinceCheckpoint=0;
-  mirror.lastCheckpoint=now();
-  fs.writeFile(tmp, JSON.stringify(checkpoint), function(error) {
-    if (error) {
-      console.error("error writing checkpoint "+tmp+": "+error.message);
-      mirror.saving=false;
-      return;
-    }
-    fs.rename(tmp, session.checkpoint_path, function(error) {
-      if (error) {
-        console.error("error saving checkpoint "+session.checkpoint_path+": "+error.message);
-      } else {
-        console.log("checkpoint saved for "+session.sessioncookie+" at offset "+offset);
-      }
-      mirror.saving=false;
-    });
-  });
-  return true;
-}
-
-function checkpoint_on_disconnect(session) {
-  if (!session || !session.mirror) return;
-  session.mirror.saveRequested=true;
-  maybe_save_checkpoint(session);
-}
-
 setInterval(function() {
-  for (const username in sessions) {
-    for (const sessioncookie in sessions[username]) {
-      var session=sessions[username][sessioncookie];
-      if (session && session.mirror) {
-        maybe_save_checkpoint(session);
-      }
-    }
-  }
   for (const token in reconnects) {
     var r=reconnects[token];
     if (r.stale && (now()-r.time)>7*24*3600) {
@@ -1300,7 +798,6 @@ setInterval(function() {
 // tell wslogin, so probe the registry sockets periodically and clean up
 // the ghosts.
 var termd_sweep = setInterval(function() {
-  if (!termd_enabled) return;
   for (const username in sessions) {
     for (const sessioncookie in sessions[username]) {
       var session = sessions[username][sessioncookie];
@@ -1624,20 +1121,15 @@ function cookieUsername(uuidcookie) {
   }
 }
 
-// A rendered snapshot of a session's current screen, for a reconnect picker.
-function serialize_mirror(session) {
-  var mirror = session.mirror;
-  if (!mirror || !mirror.terminal) return null;
-  try {
-    return {
-      cols: mirror.terminal.cols,
-      rows: mirror.terminal.rows,
-      title: (mirror.title || mirror.terminal.title) || '',
-      s: serialize_terminal(mirror.terminal, mirror.serializeAddon, true)
-    };
-  } catch (error) {
-    return null;
-  }
+// The window title a terminal last set with OSC 0/2, tracked from the raw
+// stream (the daemon snapshot carries it through to the picker).
+function extract_title(s) {
+  var last = '';
+  var re = /\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  var m;
+  s = String(s);
+  while ((m = re.exec(s)) !== null) last = m[1];
+  return last;
 }
 
 // The user's terminals that are running but have no owner connection (the
@@ -1650,42 +1142,31 @@ function listDisconnected(username) {
     // s.pty === false: detached session (daemon alive, link gone after
     // the owner disconnected); reconnect re-links it
     if (s.pty === false || (s.pty && s.pty.main === false)) {
-      if (termd_enabled) {
-        list.push({
-          reconnectid: s.reconnectid,
-          cols: s.cols || 80,
-          rows: s.rows || 24,
-          title: s.title || '',
-          snapshot: s.snapshot || ''
-        });
-        if (s.termd && !s.snapshot) {
-          termd.termdSnapshot(username, s.termd, (function (sess) {
-            return function (snap) {
-              if (!snap || sess.snapshot) return;
-              sess.snapshot = snap.serialized;
-              var t = extract_title(snap.serialized);
-              if (t) sess.title = t;
-              notifyPickers(username);
-            };
-          })(s));
-        }
-        if (s.termd && s.pty === false) {
-          termd.probeSock(termd.termdSockPath(username, s.termd), (function (sess) {
-            return function (info) {
-              if (!info) termd_cleanup_gone(username, sess.sessioncookie);
-            };
-          })(s));
-        }
-        continue;
-      }
-      var snap = serialize_mirror(s);
       list.push({
         reconnectid: s.reconnectid,
-        cols: s.pty ? s.pty.cols : (s.cols || 80),
-        rows: s.pty ? s.pty.rows : (s.rows || 24),
-        title: (snap && snap.title) || '',
-        snapshot: snap ? snap.s : ''
+        cols: s.cols || 80,
+        rows: s.rows || 24,
+        title: s.title || '',
+        snapshot: s.snapshot || ''
       });
+      if (s.termd && !s.snapshot) {
+        termd.termdSnapshot(username, s.termd, (function (sess) {
+          return function (snap) {
+            if (!snap || sess.snapshot) return;
+            sess.snapshot = snap.serialized;
+            var t = extract_title(snap.serialized);
+            if (t) sess.title = t;
+            notifyPickers(username);
+          };
+        })(s));
+      }
+      if (s.termd && s.pty === false) {
+        termd.probeSock(termd.termdSockPath(username, s.termd), (function (sess) {
+          return function (info) {
+            if (!info) termd_cleanup_gone(username, sess.sessioncookie);
+          };
+        })(s));
+      }
     }
   }
   return list;
@@ -1826,45 +1307,6 @@ wsServer.on('request', function(request) {
       connection.sendUTF('\0' + JSON.stringify(cmd));
     }
     */
-  async function replay_pty(username,sessioncookie,cols,rows,connection) {
-    console.log("reconnected to "+sessioncookie+" "+sessions[username][sessioncookie].pty.file);
-    var checkpointfile=checkpoint_enabled ? session_checkpoint_path(username,sessioncookie) : null;
-    var serial = await create_replayed_terminal(session_log_path(username,sessioncookie), checkpointfile);
-    connection.sendUTF('\0'+JSON.stringify({cmd:"resize",cols:serial.cols,rows:serial.rows}));
-    connection.sendUTF('\1'+serial.s);
-    console.log("sending replayed terminal");
-    console.log("done sending replay for "+sessioncookie);
-    if (connection.shared || connection.viewonly) {
-      var cmd={cmd:"replaydone"};
-      connection.sendUTF('\0' + JSON.stringify(cmd));
-      console.log("send replaydone to "+sessioncookie);
-    } else {
-      var cmd={cmd:"reconnected",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid,personalized:personalizedLinks};
-      connection.sendUTF('\0' + JSON.stringify(cmd));
-      console.log("send reconnected to "+sessioncookie);
-      // force tmux to repaint the pane, to fix term properties at the
-      // cursor for tmux and others (e.g. the green bar of tmux) after the
-      // replayed snapshot. refresh-client redraws the attached clients
-      // without touching the geometry: the old ±1 resize dance reflowed
-      // the scrollback of the mirror and of every viewer and appended a
-      // full screen repaint to the log per resize, duplicating the screen
-      // several times at the replay boundary on every reconnect.
-      try {
-        run_as(username, ['tmux', '-S', session_tmux_path(username, sessioncookie), 'refresh-client']);
-      } catch (error) {
-        console.log("refresh-client failed for "+sessioncookie+": "+error.message);
-      }
-    }
-    while(connection.sendbuffer.length>0) {
-      buf=connection.sendbuffer.shift();
-      if (buf!=false) {
-        console.log("sending buffered to "+index);
-        connection.sendUTF(buf);
-      }
-    }
-    connection.paused=false;
-  }
-
   function create_pty(username,sessioncookie,cols,rows,connection,forceNew) {
     var viewid=false;
     connection.loggedin=true;
@@ -1900,7 +1342,7 @@ wsServer.on('request', function(request) {
           sessioncookie=key;
           connection.paused=true;
           if (!sessions[username][sessioncookie].pty ||
-              (termd_enabled && sessions[username][sessioncookie].pty.dead)) {
+              sessions[username][sessioncookie].pty.dead) {
             // detached session (owner disconnected, daemon alive): re-link
             // it at the reconnecting client's geometry; the daemon replays
             // its snapshot through the link
@@ -1934,15 +1376,7 @@ wsServer.on('request', function(request) {
             sessions[username][sessioncookie].pty.main=connection;
             notifyPickers(username);
           } 
-          if (termd_enabled) {
-            termd_replay(username, sessioncookie, connection);
-          } else {
-            // replay_pty is async and drains connection.sendbuffer itself,
-            // after the replayed screen is sent; draining here would deliver
-            // live output buffered during the replay before that screen and
-            // the client would render the older replay on top of it.
-            replay_pty(username,sessioncookie,cols,rows,connection);
-          }
+          termd_replay(username, sessioncookie, connection);
           console.log("done sending replay for "+sessioncookie);
           break;
         }
@@ -1967,83 +1401,42 @@ wsServer.on('request', function(request) {
       views[viewid]={sessioncookie:sessioncookie,username:username}
       shares[shareid]={sessioncookie:sessioncookie,username:username}
       connection.sessioncookie=sessioncookie;
-      if (termd_enabled) {
-        session.pty = false;
-        session.cols = connection.columns;
-        session.rows = connection.rows;
-        console.log("creating termd session "+sessioncookie+" "+connection.columns+"x"+connection.rows+" for "+index);
-        termd.termdSpawn(username, sessioncookie, connection.columns, connection.rows,
-          {viewid:viewid, viewurl:request.origin+'/#view='+viewid, shareid:shareid,
-           shareurl:request.origin+'/#share='+shareid},
-          function(error, termdid) {
-            if (error) {
-              console.error("termd spawn failed for "+sessioncookie+": "+error.message);
-              sendError(connection, "Session start failed");
-              connection.close();
-              delete sessions[username][sessioncookie];
-              delete views[viewid];
-              delete shares[shareid];
-              delete reconnects[reconnectid];
-              delete_reconnect_token(username, sessioncookie);
-              return;
-            }
-            session.termd = termdid;
-            var link = termd.termdLink(username, termdid, false);
-            link.main = connection;
-            link.on('linkerror', function(e) {
-              console.error("termd link failed for "+sessioncookie+": "+e.message);
-              sendError(connection, "Session start failed");
-              termd_cleanup_gone(username, sessioncookie);
-            });
-            session.pty = link;
-            var cmd1={"cmd":"resize","cols":connection.columns,"rows":connection.rows};
-            connection.sendUTF('\0' + JSON.stringify(cmd1));
-            wire_session(username, sessioncookie);
-            link.resize(connection.columns, connection.rows);
-            var cmd2={cmd:"authenticated",viewid:session.viewid,shareid:session.shareid,reconnect:session.reconnectid,personalized:personalizedLinks};
-            connection.sendUTF('\0' + JSON.stringify(cmd2));
-            console.log(username + " authenticated (termd "+termdid+")");
+      session.pty = false;
+      session.cols = connection.columns;
+      session.rows = connection.rows;
+      console.log("creating termd session "+sessioncookie+" "+connection.columns+"x"+connection.rows+" for "+index);
+      termd.termdSpawn(username, sessioncookie, connection.columns, connection.rows,
+        {viewid:viewid, viewurl:request.origin+'/#view='+viewid, shareid:shareid,
+         shareurl:request.origin+'/#share='+shareid},
+        function(error, termdid) {
+          if (error) {
+            console.error("termd spawn failed for "+sessioncookie+": "+error.message);
+            sendError(connection, "Session start failed");
+            connection.close();
+            delete sessions[username][sessioncookie];
+            delete views[viewid];
+            delete shares[shareid];
+            delete reconnects[reconnectid];
+            delete_reconnect_token(username, sessioncookie);
+            return;
+          }
+          session.termd = termdid;
+          var link = termd.termdLink(username, termdid, false);
+          link.main = connection;
+          link.on('linkerror', function(e) {
+            console.error("termd link failed for "+sessioncookie+": "+e.message);
+            sendError(connection, "Session start failed");
+            termd_cleanup_gone(username, sessioncookie);
           });
-      } else {
-      session.checkpoint_path=session_checkpoint_path(username,sessioncookie);
-      session.mirror=create_mirror(connection.columns, connection.rows);
-      var shellenv = { USER: username, VIEWID: viewid, VIEWURL: request.origin+'/#view='+viewid, SUDO_USER: username, LANG: 'en_US.UTF-8', COLORTERM: 'truecolor' };
-      if (session_tmux) {
-        start_tmux_session(username, sessioncookie, connection.columns, connection.rows, shellenv);
-        sessions[username][sessioncookie].pty = attach_tmux(username, sessioncookie, connection.columns, connection.rows, shellenv);
-      } else {
-        sessions[username][sessioncookie].pty = pty.spawn('sudo', ['-u',username,'-i'], {
-          name: 'xterm',
-          cols: connection.columns,
-          rows: connection.rows,
-          cwd: '/',
-          encoding: null,
-          env: shellenv
+          session.pty = link;
+          var cmd1={"cmd":"resize","cols":connection.columns,"rows":connection.rows};
+          connection.sendUTF('\0' + JSON.stringify(cmd1));
+          wire_session(username, sessioncookie);
+          link.resize(connection.columns, connection.rows);
+          var cmd2={cmd:"authenticated",viewid:session.viewid,shareid:session.shareid,reconnect:session.reconnectid,personalized:personalizedLinks};
+          connection.sendUTF('\0' + JSON.stringify(cmd2));
+          console.log(username + " authenticated (termd "+termdid+")");
         });
-      }
-      sessions[username][sessioncookie].pty.file = fopen(session_log_path(username,sessioncookie), 'a+');
-      sessions[username][sessioncookie].pty.main=connection;
-      console.log("created pty "+sessioncookie+" "+connection.columns+"x"+connection.rows+" for "+index);
-      var headermeta={viewid:viewid,shareid:shareid,viewurl:request.origin+'/#view='+viewid,shareurl:request.origin+'/#share='+shareid,
-        username:username,sessioncookie:sessioncookie,
-        cols:connection.columns,rows:connection.rows,starttime:now()};
-      if (session_tmux) headermeta.tmux=session_tmux_path(username,sessioncookie);
-      var metalog={t:now(),d:JSON.stringify(headermeta),c:4};
-      append_session_log(session,metalog);
-      cmd={"cmd":"resize","cols":connection.columns,"rows":connection.rows}
-      log={t:now(),d:JSON.stringify(cmd),c:0}
-      var written=append_session_log(session,log);
-      queue_mirror(session,{type:'resize',cols:connection.columns,rows:connection.rows,offset:written.offset,bytes:written.bytes});
-      // Tell the client the real pty size. On sso auto-login the pty is
-      // created with the server defaults before the client reports its
-      // window, and the client only sends a resize when its own size
-      // changes; without this echo the pty would stay at the defaults.
-      connection.sendUTF('\0' + JSON.stringify(cmd));
-      wire_session(username, sessioncookie);
-      var cmd={cmd:"authenticated",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid,personalized:personalizedLinks};
-      connection.sendUTF('\0' + JSON.stringify(cmd));
-      console.log(username + " authenticated!");
-      }
     }
     sessions[username][sessioncookie]['connections'][index]=connection;
     console.log("returning cookie "+sessioncookie+" file "+sessions[username][sessioncookie].pty.file);
@@ -2168,7 +1561,6 @@ wsServer.on('request', function(request) {
                     var sizelog={t:now(),d:JSON.stringify({cmd:"resize",cols:m.cols,rows:m.rows}),c:0};
                     if (sizeSession.pty) sizeSession.pty.resize(m.cols,m.rows);
                     var sizewritten=append_session_log(sizeSession,sizelog);
-                    queue_mirror(sizeSession,{type:'resize',cols:m.cols,rows:m.rows,offset:sizewritten.offset,bytes:sizewritten.bytes});
                   }
                 }
                 break;;
@@ -2183,9 +1575,8 @@ wsServer.on('request', function(request) {
                      console.log("received resize to "+m.cols+"x"+m.rows+" "+connection.sessioncookie+" "+rsession.pty.file);
                     rsession.pty.resize(m.cols,m.rows);
                     console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+rsession.pty.file);
-                    var written=append_session_log(sessions[connection.username][connection.sessioncookie],log);
-                    queue_mirror(sessions[connection.username][connection.sessioncookie],{type:'resize',cols:m.cols,rows:m.rows,offset:written.offset,bytes:written.bytes});
-                    if(Object.keys(sessions[connection.username][connection.sessioncookie]['connections']).length>0) {
+                     var written=append_session_log(sessions[connection.username][connection.sessioncookie],log);
+                     if(Object.keys(sessions[connection.username][connection.sessioncookie]['connections']).length>0) {
                       //  console.log("broadcasting resize");
                       for (const [key, conn] of Object.entries(sessions[connection.username][connection.sessioncookie]['connections'])) {
                         if (true || key!=index) {
@@ -2400,9 +1791,8 @@ wsServer.on('request', function(request) {
                       break;
                     }
                      loginAttempt(clientIp);
-                     // root is refused on every other login path (cookie,
-                     // sso, wslogin-run); wslogin-run would refuse the spawn
-                     // anyway, reject it here for a clear, consistent error
+                      // root is refused on every other login path (cookie,
+                      // sso); reject it here too for a clear, consistent error
                      if (m.username == 'root') {
                        console.log("root login rejected");
                        sendError(connection, "root login is not allowed");
@@ -2507,35 +1897,25 @@ wsServer.on('request', function(request) {
 	  console.log("Main connection for "+connection.username+" "+connection.sessioncookie+" disconnected");
 	  sessions[connection.username][connection.sessioncookie].pty.main=false;
 	  notifyPickers(connection.username);
-        // owner gone: end its tmux client (the shell in the tmux server
-        // keeps running for a reconnect); viewer/sharer connections share
-        // the owner's view and do not end it. In termd mode the daemon
-        // keeps the shell: dropping the link detaches the owner.
-        if (termd_enabled) {
-          var tsess = sessions[connection.username][connection.sessioncookie];
-          if (tsess && tsess.pty && tsess.pty.close) tsess.pty.close();
-        } else {
-          kill_tmux_clients(connection.username, connection.sessioncookie);
-        }
-        checkpoint_on_disconnect(sessions[connection.username][connection.sessioncookie]);
+        // owner gone: drop the daemon link (the daemon keeps the shell
+        // alive for a reconnect); viewer/sharer connections share the
+        // owner's view and do not end it.
+        var tsess = sessions[connection.username][connection.sessioncookie];
+        if (tsess && tsess.pty && tsess.pty.close) tsess.pty.close();
 	} else if (connection.username in sessions && connection.sessioncookie in sessions[connection.username]
 	    && sessions[connection.username][connection.sessioncookie].pty
 	    && !sessions[connection.username][connection.sessioncookie].pty.main
 	    && Object.keys(sessions[connection.username][connection.sessioncookie]['connections']).length === 0) {
-	  // last viewer/sharer of a re-attached ownerless session gone: drop
-	  // the attach client (its exit handler marks the session detached),
-	  // so no live pty runs without any consumer
-	  console.log("last consumer of "+connection.sessioncookie+" disconnected, dropping attach client");
-	  if (termd_enabled) {
-	    var lsess = sessions[connection.username][connection.sessioncookie];
-	    if (lsess && lsess.pty) {
-	      if (lsess.pty.close) lsess.pty.close();
-	      lsess.cols = lsess.pty.cols || lsess.cols;
-	      lsess.rows = lsess.pty.rows || lsess.rows;
-	      lsess.pty = false;
-	    }
-	  } else {
-	    kill_tmux_clients(connection.username, connection.sessioncookie);
+	  // last viewer/sharer of a detached (ownerless) session gone: drop
+	  // the link so no proxy connection runs without any consumer; the
+	  // daemon keeps the shell, the session shows up detached again.
+	  console.log("last consumer of "+connection.sessioncookie+" disconnected, dropping daemon link");
+	  var lsess = sessions[connection.username][connection.sessioncookie];
+	  if (lsess && lsess.pty) {
+	    if (lsess.pty.close) lsess.pty.close();
+	    lsess.cols = lsess.pty.cols || lsess.cols;
+	    lsess.rows = lsess.pty.rows || lsess.rows;
+	    lsess.pty = false;
 	  }
 	}
       } else {

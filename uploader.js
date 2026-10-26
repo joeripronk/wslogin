@@ -15,7 +15,6 @@ const DEFAULT_HIGH_WATER_MARK = 1024 * 1024;
 const DEFAULT_CONNECTIONS = 4;
 const RETRY_BASE_MS = 1000;
 const LOG_SUFFIX = '.json';
-const CHECKPOINT_LOG_SUFFIX = '.checkpoint.json';
 const FINISHED_SUFFIX = '.done';
 const UPLOADED_SUFFIX = '.uploaded';
 const MAX_UPLOADED_TRACKED = 10000;
@@ -642,7 +641,7 @@ function createTransport(target, ca, identity, maxConnections, highWaterMark,
 /**
  * Uploads session logs to a remote receiver: active logs as periodic snapshots
  * and finished logs as their final copy. The remote server is identified by
- * hostname and an optional hostkey. Checkpoints stay local. See RECEIVER.md for
+ * hostname and an optional hostkey. See RECEIVER.md for
  * the protocol.
  */
 function createUploader(config, options) {
@@ -882,7 +881,7 @@ function resolveSessionDir(config) {
 /**
  * Lists the session logs in session_dir. Active logs are uploaded as
  * snapshots; once wslogin-server.js renames a log to <sessioncookie>.json.done its
- * final copy is uploaded. Checkpoints stay on the wslogin host.
+ * final copy is uploaded.
  */
 async function listSessionFiles(sessionDir, template) {
   template = template || '<username>/<session>.json';
@@ -907,7 +906,6 @@ async function listSessionFiles(sessionDir, template) {
       var activeRel = finished
         ? rel.slice(0, -FINISHED_SUFFIX.length) : rel;
       if (!activeRel.endsWith(LOG_SUFFIX)) continue;
-      if (activeRel.endsWith(CHECKPOINT_LOG_SUFFIX)) continue;
       if (activeRel.endsWith('.meta.json')) continue;
       var values = matchTemplate(template, activeRel, ['username', 'session']);
       if (!values) continue;
@@ -977,15 +975,10 @@ async function run(config, options) {
   function markUploaded(file) {
     if (!file.endsWith(FINISHED_SUFFIX)) return;
     if (removeUploaded) {
-      var checkpointFile = file.slice(0,
-        -FINISHED_SUFFIX.length - LOG_SUFFIX.length) + CHECKPOINT_LOG_SUFFIX;
-      [file, checkpointFile].forEach(function(target) {
-        fs.promises.unlink(target).catch(function(error) {
-          if (error.code != 'ENOENT') {
-            console.error('[uploader] cannot remove ' + target + ': '
-              + error.message);
-          }
-        });
+      fs.promises.unlink(file).catch(function(error) {
+        if (error.code != 'ENOENT') {
+          console.error('[uploader] cannot remove ' + file + ': ' + error.message);
+        }
       });
       return;
     }
