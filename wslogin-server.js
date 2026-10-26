@@ -259,9 +259,10 @@ function run_as(username, args, options) {
   var prefix = user_run_prefix(username);
   return spawnSync(prefix[0], prefix.slice(1).concat(args), options);
 }
-// termd mode: sessions run in per-session termd daemons (pty owner,
-// terminal model and recording live in the daemon); wslogin is the
-// authenticating proxy between browser clients and daemon sockets.
+// sessions run in per-session termd daemons (pty owner, terminal model
+// and recording live in the daemon); wslogin is the authenticating proxy
+// between browser clients and daemon sockets. The termd config key is
+// read by playback.js (live-session awareness), not by the server.
 var termd_base = config.termd_dir
   ? path.resolve(String(config.termd_dir))
   : '/run/wslogin/termd';
@@ -1163,10 +1164,12 @@ function listDisconnected(username) {
         title: s.title || '',
         snapshot: s.snapshot || ''
       });
-      if (s.termd && !s.snapshot) {
+      if (s.termd && !s.snapFetching) {
+        s.snapFetching = true;
         termd.termdSnapshot(username, s.termd, (function (sess) {
           return function (snap) {
-            if (!snap || sess.snapshot) return;
+            sess.snapFetching = false;
+            if (!snap) return;
             sess.snapshot = snap.serialized;
             var t = extract_title(snap.serialized);
             if (t) sess.title = t;
@@ -1428,6 +1431,7 @@ wsServer.on('request', function(request) {
             sendError(connection, "Session start failed");
             connection.close();
             delete sessions[username][sessioncookie];
+            if (Object.keys(sessions[username]).length === 0) delete sessions[username];
             delete views[viewid];
             delete shares[shareid];
             delete reconnects[reconnectid];
@@ -1453,7 +1457,7 @@ wsServer.on('request', function(request) {
         });
     }
     sessions[username][sessioncookie]['connections'][index]=connection;
-    console.log("returning cookie "+sessioncookie+" file "+sessions[username][sessioncookie].pty.file);
+    console.log("returning cookie "+sessioncookie+" for "+username);
     return sessioncookie;
 
   }

@@ -74,20 +74,28 @@ function termdSpawn(username, sessioncookie, cols, rows, meta, cb) {
   args.push(deps.nodeCommand, deps.termdCommand, 'session', String(cols), String(rows));
   var child = spawn(prefix[0], prefix.slice(1).concat(args), { detached: true, stdio: 'ignore', cwd: '/' });
   child.unref();
-  var started = Date.now();
+  // Identify the daemon by its own log header (c:4 carries the cookie it
+  // was spawned with and its socket path): scanning the registry by mtime
+  // is racy, socket connects update the mtime and concurrent spawns are
+  // indistinguishable. The daemon writes the header before it listens.
+  var header = function () {
+    var d;
+    try {
+      var line = fs.readFileSync(logfile, 'utf8').split('\n')[0];
+      d = JSON.parse(line);
+    } catch (e) { return null; }
+    if (!d || d.c !== 4) return null;
+    try {
+      var m = JSON.parse(d.d);
+      if (m.sessioncookie !== sessioncookie || !m.termd) return null;
+      return path.basename(String(m.termd)).replace(/\.sock$/, '');
+    } catch (e) { return null; }
+  };
   var tries = 0;
   var poll = function () {
-    var ids = [];
-    try {
-      for (const f of fs.readdirSync(termdDir(username))) {
-        if (!f.endsWith('.sock')) continue;
-        try {
-          if (fs.statSync(path.join(termdDir(username), f)).mtimeMs >= started - 1000) ids.push(f.slice(0, -5));
-        } catch (e) {}
-      }
-    } catch (e) {}
-    if (ids.length > 0) { cb(null, ids[0]); return; }
-    if (tries++ > 50) { cb(new Error('termd daemon did not register a socket')); return; }
+    var id = header();
+    if (id) { cb(null, id); return; }
+    if (tries++ > 50) { cb(new Error('termd daemon did not write its log header')); return; }
     setTimeout(poll, 200);
   };
   setTimeout(poll, 200);
@@ -177,9 +185,14 @@ function termdLink(username, id, view) {
   link.termd = id;
   var ws = new WebSocket('ws+unix://' + termdSockPath(username, id));
   var opened = false;
+  var pendingResize = null;
   ws.on('open', function () {
     opened = true;
     ws.send('\x00' + JSON.stringify({ cmd: 'attach', id: id, view: view === true }));
+    if (pendingResize) {
+      ws.send('\x00' + JSON.stringify({ cmd: 'resize', cols: pendingResize[0], rows: pendingResize[1] }));
+      pendingResize = null;
+    }
   });
   ws.on('message', function (raw) {
     var m = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
@@ -203,6 +216,7 @@ function termdLink(username, id, view) {
   link.write = function (s) { if (ws.readyState === 1) ws.send('\x01' + s); };
   link.resize = function (c, r) {
     if (ws.readyState === 1) ws.send('\x00' + JSON.stringify({ cmd: 'resize', cols: c, rows: r }));
+    else if (!opened) pendingResize = [c, r];
   };
   link.kill = function () { if (ws.readyState === 1) ws.send('\x00' + JSON.stringify({ cmd: 'kill' })); };
   link.close = function () { try { ws.close(); } catch (e) {} };

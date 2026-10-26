@@ -165,9 +165,8 @@ renames the log from `.done` to `.uploaded`:
 <sessioncookie>.json.uploaded
 ```
 
-With `upload_remove_uploaded=true` the finished log and its
-are removed instead of renamed, freeing the
-disk space as soon as the upload has succeeded.
+With `upload_remove_uploaded=true` the finished log is removed instead of
+renamed, freeing the disk space as soon as the upload has succeeded.
 
 
 Renaming (or removing) the log prevents the same finished session from being
