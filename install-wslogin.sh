@@ -130,6 +130,15 @@ if [[ ! -e /etc/pam.d/wslogin ]]; then
 fi
 
 if systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
+  # Node 22's libuv io_uring backend deadlocks spawnSync on kernel >= 7
+  # (the event loop freezes on a zombie child), which hangs session
+  # creation; disable io_uring for the server via a drop-in.
+  DROPIN_DIR="/etc/systemd/system/${SERVICE}.service.d"
+  if [[ ! -e "$DROPIN_DIR/io_uring.conf" ]]; then
+    echo "Installing $DROPIN_DIR/io_uring.conf (UV_USE_IO_URING=0)"
+    mkdir -p "$DROPIN_DIR"
+    printf '[Service]\nEnvironment=UV_USE_IO_URING=0\n' > "$DROPIN_DIR/io_uring.conf"
+  fi
   # The detached server (process.title=wslogin, ppid=1) survives a unit
   # restart and would keep holding the port, failing the new instance with
   # EADDRINUSE. Kill leftovers of the unit first.
