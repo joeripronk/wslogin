@@ -506,6 +506,27 @@ function resume_session(meta) {
     }).catch(function() {});
   }
 }
+// A termd session whose daemon is gone (killed via the termd CLI, daemon
+// crash, exit while wslogin was down): nothing will ever deliver an exit
+// frame for a detached session, so wslogin must drop the map entries
+// itself once a probe shows the socket is dead.
+function termd_cleanup_gone(username, sessioncookie) {
+  var session = sessions[username] && sessions[username][sessioncookie];
+  if (!session) return;
+  for (const idx in session.connections) {
+    try { session.connections[idx].close(); } catch (e) {}
+  }
+  finish_session(username, sessioncookie);
+  if (session.viewid) delete views[session.viewid];
+  if (session.shareid) delete shares[session.shareid];
+  if (session.reconnectid) delete reconnects[session.reconnectid];
+  delete_reconnect_token(username, sessioncookie);
+  delete sessions[username][sessioncookie];
+  if (Object.keys(sessions[username]).length === 0) delete sessions[username];
+  console.log("termd session "+sessioncookie+" for "+username+" is gone, cleaned up");
+  notifyPickers(username);
+}
+
 // Rebuild a live termd session from its log header after a wslogin
 // restart: the daemon (shell, model, recording) survived; probe its socket
 // and restore the map entries so the session shows up detached in the
@@ -544,12 +565,26 @@ function termd_resume(meta) {
 // The daemon sends attached+resize+snapshot on link; wire_session
 // relays them to the connections (the reconnecting client is paused and
 // gets them through its sendbuffer, drained by termd_replay).
-function termd_reattach(username, sessioncookie, cols, rows, view) {
+function termd_reattach(username, sessioncookie, cols, rows, view, connection) {
   var session = sessions[username][sessioncookie];
   var link = termd.termdLink(username, session.termd, view === true);
   link.main = false;
   link.on('linkerror', function (e) {
     console.error("termd link failed for "+sessioncookie+": "+e.message);
+    if (connection) {
+      try { connection.sendUTF('\0' + JSON.stringify({cmd: "reconnectfailed"})); } catch (err) {}
+    }
+    termd_cleanup_gone(username, sessioncookie);
+  });
+  link.on('linkclose', function () {
+    // the daemon died (crash, kill) while this link was the live side:
+    // the session is detached from wslogin's point of view; the probe
+    // sweep removes it once the socket is confirmed gone
+    if (session.pty === link) {
+      session.cols = link.cols; session.rows = link.rows;
+      session.pty = false;
+      notifyPickers(username);
+    }
   });
   session.pty = link;
   session.cols = cols; session.rows = rows;
@@ -1239,7 +1274,30 @@ setInterval(function() {
     var a = logins[ip];
     if (now()-a.first > login_block_seconds+login_window_seconds) delete logins[ip];
   }
-}, 1000).unref();
+  }, 1000).unref();
+
+// termd sweep: a detached session whose daemon no longer answers (killed
+// via the termd CLI, daemon crash) has no event source that could ever
+// tell wslogin, so probe the registry sockets periodically and clean up
+// the ghosts.
+var termd_sweep = setInterval(function() {
+  if (!termd_enabled) return;
+  for (const username in sessions) {
+    for (const sessioncookie in sessions[username]) {
+      var session = sessions[username][sessioncookie];
+      if (session && session.termd && session.pty === false && !session.probed) {
+        session.probed = true;
+        termd.probeSock(termd.termdSockPath(username, session.termd), (function(user, cookie) {
+          return function(info) {
+            var s = sessions[user] && sessions[user][cookie];
+            if (s) s.probed = false;
+            if (!info) termd_cleanup_gone(user, cookie);
+          };
+        })(username, sessioncookie));
+      }
+    }
+  }
+}, 60000).unref();
 
 function sendError(c,msg) {
   cmd={cmd:'error',error:msg};
@@ -1592,6 +1650,13 @@ function listDisconnected(username) {
             };
           })(s));
         }
+        if (s.termd && s.pty === false) {
+          termd.probeSock(termd.termdSockPath(username, s.termd), (function (sess) {
+            return function (info) {
+              if (!info) termd_cleanup_gone(username, sess.sessioncookie);
+            };
+          })(s));
+        }
         continue;
       }
       var snap = serialize_mirror(s);
@@ -1823,7 +1888,7 @@ wsServer.on('request', function(request) {
             termd_reattach(username, sessioncookie,
               connection.columns || sessions[username][sessioncookie].cols,
               connection.rows || sessions[username][sessioncookie].rows,
-              connection.viewonly || connection.shared);
+              connection.viewonly || connection.shared, connection);
           }
           if(connection.viewonly) {
             console.log("view started for "+username+" "+sessioncookie);
@@ -1908,6 +1973,8 @@ wsServer.on('request', function(request) {
             link.main = connection;
             link.on('linkerror', function(e) {
               console.error("termd link failed for "+sessioncookie+": "+e.message);
+              sendError(connection, "Session start failed");
+              termd_cleanup_gone(username, sessioncookie);
             });
             session.pty = link;
             var cmd1={"cmd":"resize","cols":connection.columns,"rows":connection.rows};
