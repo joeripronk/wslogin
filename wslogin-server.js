@@ -597,7 +597,7 @@ function termd_reattach(username, sessioncookie, cols, rows, view, connection) {
 // drain the buffer and complete the handshake.
 function termd_replay(username, sessioncookie, connection) {
   var session = sessions[username][sessioncookie];
-  setTimeout(function () {
+  var finish = function () {
     while (connection.sendbuffer.length > 0) {
       var buf = connection.sendbuffer.shift();
       if (buf !== false) connection.sendUTF(buf);
@@ -609,7 +609,26 @@ function termd_replay(username, sessioncookie, connection) {
       connection.sendUTF('\0' + JSON.stringify({cmd: "reconnected", viewid: session.viewid,
         shareid: session.shareid, reconnect: session.reconnectid, personalized: personalizedLinks}));
     }
-  }, 300);
+  };
+  // A viewer/sharer joins a session whose live link belongs to the owner:
+  // the daemon snapshot only reaches the link, so fetch one for this
+  // viewer; live frames buffered while paused are drained after it, in
+  // the right order. A viewer of a session without an owner gets its own
+  // link, whose snapshot already lands in the sendbuffer - no fetch.
+  if ((connection.viewonly || connection.shared) && session.termd &&
+      session.pty && !session.pty.dead && session.pty.main) {
+    termd.termdSnapshot(username, session.termd, function (snap) {
+      if (snap) {
+        try {
+          connection.sendUTF('\0' + JSON.stringify({cmd: "resize", cols: snap.cols, rows: snap.rows}));
+          connection.sendUTF('\x01' + snap.serialized);
+        } catch (e) {}
+      }
+      finish();
+    });
+    return;
+  }
+  setTimeout(finish, 300);
 }
 
 // Live-session state, declared before the startup scan (finish_interrupted_
@@ -1643,8 +1662,8 @@ function listDisconnected(username) {
           termd.termdSnapshot(username, s.termd, (function (sess) {
             return function (snap) {
               if (!snap || sess.snapshot) return;
-              sess.snapshot = snap;
-              var t = extract_title(snap);
+              sess.snapshot = snap.serialized;
+              var t = extract_title(snap.serialized);
               if (t) sess.title = t;
               notifyPickers(username);
             };

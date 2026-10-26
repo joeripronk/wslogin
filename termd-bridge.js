@@ -134,6 +134,7 @@ function termdList(username, cb) {
 function termdSnapshot(username, id, cb) {
   var ws = new WebSocket('ws+unix://' + termdSockPath(username, id));
   var snap = '';
+  var cols = 80, rows = 24;
   var done = false;
   var settle = null;
   var finish = function () {
@@ -141,17 +142,24 @@ function termdSnapshot(username, id, cb) {
     done = true;
     if (settle) clearTimeout(settle);
     try { ws.close(); } catch (e) {}
-    cb(snap);
+    cb(snap ? { serialized: snap, cols: cols, rows: rows } : null);
   };
   var timer = setTimeout(finish, 2000);
   ws.on('open', function () { ws.send('\x00' + JSON.stringify({ cmd: 'attach', id: id, view: true })); });
   ws.on('message', function (raw) {
     var m = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-    if (String.fromCharCode(m[0]) === '\x01') {
-      snap += m.slice(1).toString('utf8');
+    var kind = String.fromCharCode(m[0]);
+    var body = m.slice(1).toString('utf8');
+    if (kind === '\x01') {
+      snap += body;
       if (settle) clearTimeout(settle);
       settle = setTimeout(function () { clearTimeout(timer); finish(); }, 250);
+      return;
     }
+    try {
+      var j = JSON.parse(body);
+      if (j.cmd === 'attached') { cols = j.cols; rows = j.rows; }
+    } catch (e) {}
   });
   ws.on('error', function () { clearTimeout(timer); finish(); });
   ws.on('close', function () { if (settle) clearTimeout(settle); settle = setTimeout(function () { clearTimeout(timer); finish(); }, 250); });
