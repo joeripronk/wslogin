@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const WebSocket = require('ws');
 const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 const { render: renderTemplate, placeholders: templatePlaceholders,
@@ -162,6 +163,74 @@ async function thumbnailScreen(checkpoint) {
   return s;
 }
 
+// termd: the live screen of a running session. The log header names the
+// daemon socket; a view-attach delivers attached+snapshot, which settles
+// when the frames stop arriving. The daemon is not there (session ended
+// between listing and probe) and cb gets null: the caller falls back to
+// the checkpoint path.
+function termdLiveSnapshot(sockPath, cb) {
+  var ws;
+  try { ws = new WebSocket('ws+unix://' + sockPath); } catch (e) { cb(null); return; }
+  var snap = '';
+  var cols = 80, rows = 24;
+  var done = false;
+  var settle = null;
+  var finish = function () {
+    if (done) return;
+    done = true;
+    if (settle) clearTimeout(settle);
+    try { ws.close(); } catch (e) {}
+    if (!snap) { cb(null); return; }
+    var title = '';
+    var re = /\x1b\][012];([^\x07]*?)(?:\x07|\x1b\\)/g;
+    var m;
+    while ((m = re.exec(snap))) title = m[1];
+    cb({ serialized: snap, cols: cols, rows: rows, title: title,
+      t: Math.floor(Date.now() / 1000) });
+  };
+  var timer = setTimeout(finish, 2500);
+  ws.on('open', function () { ws.send('\x00' + JSON.stringify({ cmd: 'attach', view: true })); });
+  ws.on('message', function (raw) {
+    var m = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    var kind = String.fromCharCode(m[0]);
+    var body = m.slice(1).toString('utf8');
+    if (kind === '\x01') {
+      snap += body;
+      if (settle) clearTimeout(settle);
+      settle = setTimeout(function () { clearTimeout(timer); finish(); }, 250);
+      return;
+    }
+    try {
+      var j = JSON.parse(body);
+      if (j.cmd === 'attached') { cols = j.cols; rows = j.rows; }
+    } catch (e) {}
+  });
+  ws.on('error', function () { clearTimeout(timer); finish(); });
+  ws.on('close', function () {
+    if (settle) clearTimeout(settle);
+    settle = setTimeout(function () { clearTimeout(timer); finish(); }, 250);
+  });
+}
+
+// The c:4 header record of a session log (first line), parsed; null when
+// the log is empty or has no header. Only the head of the file is read.
+function readLogHeader(file) {
+  var fd;
+  try { fd = fs.openSync(file, 'r'); } catch (e) { return null; }
+  var buf = Buffer.alloc(8192);
+  var n = 0;
+  try { n = fs.readSync(fd, buf, 0, 8192, 0); } catch (e) {}
+  fs.closeSync(fd);
+  if (!n) return null;
+  var nl = buf.slice(0, n).indexOf(0x0a);
+  if (nl < 0) return null;
+  try {
+    var j = JSON.parse(buf.slice(0, nl).toString('utf8'));
+    if (j.c === 4) return JSON.parse(j.d);
+  } catch (e) {}
+  return null;
+}
+
 function parseRecord(line) {
   try {
     return JSON.parse(line.toString('utf-8'));
@@ -290,6 +359,10 @@ function createPlayback(config, options) {
   var authenticate = options.authenticate || null;
   var sso = options.sso || null;
   var isActive = options.isActive || null;
+  var termdEnabled = configBool(config, 'termd', false);
+  var termdBase = config.termd_dir
+    ? path.resolve(String(config.termd_dir))
+    : '/run/wslogin/termd';
 
   var templateNames = templatePlaceholders(sessionTemplate);
   templateNames.delete('username');
@@ -1480,6 +1553,27 @@ function titleDescription(titles, lastTitle) {
         if (!thumbFound) {
           sendJson(response, 404, {error: 'session not found'});
           return;
+        }
+        // termd live session: the daemon is the source of the current
+        // screen; serve it when the header names a daemon socket inside
+        // the registry and the daemon answers.
+        if (termdEnabled) {
+          var lhdr = readLogHeader(thumbFound.file);
+          if (lhdr && lhdr.termd && lhdr.termd.startsWith(termdBase + path.sep)) {
+            var live = await new Promise(function (resolve) {
+              termdLiveSnapshot(lhdr.termd, resolve);
+            });
+            if (live) {
+              sendJson(response, 200, {
+                t: live.t,
+                cols: live.cols,
+                rows: live.rows,
+                title: live.title,
+                serialized: await thumbnailScreen({ cols: live.cols, rows: live.rows, serialized: live.serialized })
+              });
+              return;
+            }
+          }
         }
         var thumbData = await ensureCache(thumbFound.file, thumbUser, thumbSession);
         var thumb = thumbData.tail
