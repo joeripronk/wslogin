@@ -280,12 +280,6 @@ var loginform = document.getElementById('loginform');
 term.open(document.getElementById('terminal'));
 //      term.loadAddon(attachAddon); 
 term.loadAddon(fitAddon);
-// The DOM renderer lays out glyphs in CSS line boxes, whose leading shows
-// up as small gaps between rows. The canvas renderer draws glyphs at exact
-// row positions and is seamless in all browsers.
-if (window.CanvasAddon) {
-  try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (e) {}
-}
 var lastMouseSent={x:-1,y:-1,t:0};
 var dragStart=false;
 function dragText(a,b) {
@@ -666,8 +660,8 @@ function onmessage(message) {
           document.getElementById("reload").style.display="none";
           terminaldiv.style.display="block";
           term.reset();
-          // term.reset() resets the canvas renderer's measured cell size to
-          // the default geometry, which would make the next fit propose
+          // term.reset() resets the renderer's measured cell size to the
+          // default geometry, which would make the next fit propose
           // wrong dimensions; force it to remeasure for the current size.
           term.resize(term.cols, term.rows);
           term.refresh(0,term.rows-1);

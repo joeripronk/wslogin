@@ -48,6 +48,7 @@ install -m 0644 "$TMP/addon-fit/lib/addon-fit.js.map" www/t/xterm-addon-fit.js.m
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js" www/t/xterm-addon-web-links.js
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js.map" www/t/xterm-addon-web-links.js.map
 rm -f www/t/xterm-addon-webgl.js www/t/xterm-addon-webgl.js.map
+rm -f www/t/xterm-addon-canvas.js www/t/xterm-addon-canvas.js.map
 
 echo "vendoring browser assets into sudovideo"
 mkdir -p sudovideo
