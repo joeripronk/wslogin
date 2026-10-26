@@ -1149,7 +1149,7 @@ function extract_title(s) {
 
 // The user's terminals that are running but have no owner connection (the
 // owner disconnected): these can be reconnected to.
-function listDisconnected(username) {
+function listDisconnected(username, noFetch) {
   var list = [];
   if (!username || !(username in sessions)) return list;
   for (const key in sessions[username]) {
@@ -1164,7 +1164,8 @@ function listDisconnected(username) {
         title: s.title || '',
         snapshot: s.snapshot || ''
       });
-      if (s.termd && !s.snapFetching) {
+      if (noFetch) continue;
+      if (s.termd && !s.snapshot && !s.snapFetching) {
         s.snapFetching = true;
         termd.termdSnapshot(username, s.termd, (function (sess) {
           return function (snap) {
@@ -1177,9 +1178,11 @@ function listDisconnected(username) {
           };
         })(s));
       }
-      if (s.termd && s.pty === false) {
+      if (s.termd && s.pty === false && !s.probed) {
+        s.probed = true;
         termd.probeSock(termd.termdSockPath(username, s.termd), (function (sess) {
           return function (info) {
+            sess.probed = false;
             if (!info) termd_cleanup_gone(username, sess.sessioncookie);
           };
         })(s));
@@ -1200,7 +1203,7 @@ function notifyPickers(username) {
     var conn = pickers[idx];
     if (conn.pickerUser != username) continue;
     try {
-      conn.sendUTF('\0' + JSON.stringify({cmd:"sessions", list:listDisconnected(username)}));
+      conn.sendUTF('\0' + JSON.stringify({cmd:"sessions", list:listDisconnected(username, true)}));
     } catch (error) {}
   }
 }
@@ -1474,7 +1477,10 @@ wsServer.on('request', function(request) {
       console.log("offering "+list.length+" disconnected terminal(s) to "+username);
       connection.sendUTF('\0' + JSON.stringify({cmd:"sessions", list:list}));
     } else {
-      sendError(connection,"Your session has expired");
+      // not an error frame: the client's reconnect/picker flow handles
+      // reconnectfailed itself (a cookie login with no disconnected
+      // session starts a new one), an error would show twice in the
+      // cli's token->cookie fallback
       connection.sendUTF('\0' + JSON.stringify({cmd:"reconnectfailed"}));
     }
   }
