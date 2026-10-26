@@ -135,7 +135,7 @@ function terminalAt(checkpoint) {
     allowProposedApi: true,
     cols: checkpoint.cols || 80,
     rows: checkpoint.rows || 24,
-    scrollback: 10000
+    scrollback: 2000
   });
   terminal.resize(checkpoint.cols || 80, checkpoint.rows || 24);
   if (checkpoint.serialized) terminal.write(checkpoint.serialized);
@@ -146,6 +146,20 @@ function flushTerminal(terminal) {
   return new Promise(function(resolve) {
     terminal.write('', resolve);
   });
+}
+
+// The visible screen of a checkpoint, without its scrollback: a thumbnail
+// renders the checkpoint's serialized state (which carries the full
+// history for reconnects) into a headless terminal and serializes the
+// viewport only.
+async function thumbnailScreen(checkpoint) {
+  var terminal = terminalAt(checkpoint);
+  var serialize = new SerializeAddon();
+  terminal.loadAddon(serialize);
+  await flushTerminal(terminal);
+  var s = serialize.serialize({scrollback:0});
+  terminal.dispose();
+  return s;
 }
 
 function parseRecord(line) {
@@ -1480,7 +1494,7 @@ function titleDescription(titles, lastTitle) {
           cols: thumb.cols,
           rows: thumb.rows,
           title: thumb.title,
-          serialized: thumb.serialized
+          serialized: await thumbnailScreen(thumb)
         });
         return;
       }

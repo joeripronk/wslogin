@@ -239,7 +239,7 @@ var isBaseTheme = true;
 var term = new window.Terminal({
   theme: baseTheme,
   cursorBlink: true,
-  scrollback: 10000,
+  scrollback: 2000,
   convertEol: false,
   allowProposedFeatures: true,
   fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',

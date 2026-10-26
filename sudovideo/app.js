@@ -405,7 +405,7 @@ function newTerminal(cols, rows) {
     fontFamily: '"Ubuntu Mono", "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace',
     fontSize: 14,
     lineHeight: 1,
-    scrollback: 10000,
+    scrollback: 2000,
     theme: {
       background: '#090b0e',
       foreground: '#d8dee8',

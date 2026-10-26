@@ -23,9 +23,10 @@ const { createSsoAuth, parseCookieHeader } = require('./auth');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
-// keep in sync with tmux history-limit (tmux.conf) and the browser
-// terminal scrollback (www/wslogin.js)
-const SCROLLBACK = 10000;
+// keep in sync with the browser terminal scrollback (www/wslogin.js) and
+// the playback viewer (playback.js); tmux keeps no scrollback of its own
+// (tmux.conf history-limit 0), wslogin's session log is the history
+const SCROLLBACK = 2000;
 function now() {
   return Date.now()/1000;
   //var hrTime = process.hrtime()
@@ -657,9 +658,11 @@ function write(fd,d) {
 function fopen(fname,flags) {
   return fs.openSync(fname,flags);
 }
-function serialize_terminal(terminal, serializeAddon) {
+function serialize_terminal(terminal, serializeAddon, viewportOnly) {
   const {isCursorHidden} = terminal._core._inputHandler._coreService;
-  return serializeAddon.serialize()+(isCursorHidden ? '\x1b[?25l' : '\x1b[?25h');
+  // scrollback: 0 serializes the visible screen only (thumbnails do not
+  // need the mirror's history, checkpoints do for reconnects)
+  return serializeAddon.serialize(viewportOnly ? {scrollback:0} : undefined)+(isCursorHidden ? '\x1b[?25l' : '\x1b[?25h');
 }
 
 function load_checkpoint(file, checkpointfile) {
@@ -1454,7 +1457,7 @@ function serialize_mirror(session) {
       cols: mirror.terminal.cols,
       rows: mirror.terminal.rows,
       title: (mirror.title || mirror.terminal.title) || '',
-      s: serialize_terminal(mirror.terminal, mirror.serializeAddon)
+      s: serialize_terminal(mirror.terminal, mirror.serializeAddon, true)
     };
   } catch (error) {
     return null;
