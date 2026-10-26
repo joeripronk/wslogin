@@ -23,6 +23,9 @@ const { createSsoAuth, parseCookieHeader } = require('./auth');
 const { v4: uuid_v4 } = require('uuid');
 const userid = require('userid');
 var pam = require('authenticate-pam');
+// keep in sync with tmux history-limit (tmux.conf) and the browser
+// terminal scrollback (www/wslogin.js)
+const SCROLLBACK = 10000;
 function now() {
   return Date.now()/1000;
   //var hrTime = process.hrtime()
@@ -688,7 +691,9 @@ function load_checkpoint(file, checkpointfile) {
 async function create_replayed_terminal (file, checkpointfile) {
   var checkpoint=checkpointfile ? load_checkpoint(file, checkpointfile) : null;
   return new Promise((resolve, reject) => {
-    var terminal = new Terminal({ allowProposedApi: true });
+    // scrollback matching the browser terminal (wslogin.js): the serialized
+    // replay carries this much history to the reconnecting client
+    var terminal = new Terminal({ allowProposedApi: true, scrollback: SCROLLBACK });
     var serializeAddon = new SerializeAddon();
     terminal.loadAddon(serializeAddon);
     const finish = function() {
@@ -742,7 +747,7 @@ function create_mirror(cols, rows) {
   if (!checkpoint_enabled) {
     return null;
   }
-  var terminal = new Terminal({ allowProposedApi: true });
+  var terminal = new Terminal({ allowProposedApi: true, scrollback: SCROLLBACK });
   var serializeAddon = new SerializeAddon();
   terminal.loadAddon(serializeAddon);
   terminal.resize(cols, rows);
