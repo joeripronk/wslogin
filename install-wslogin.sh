@@ -100,6 +100,22 @@ echo "Installing dependencies"
 echo "Handing $APP_DIR to $RUN_USER"
 chown -R "$RUN_USER":"$RUN_GROUP" "$APP_DIR"
 
+# setuid helper for per-user commands (see wslogin-run.c): only root can
+# become the session user; the helper drops privileges and execs the
+# command directly, without sudo's forked parent in the process list.
+# Built after the chown so it keeps root ownership and the setuid bit.
+# wslogin-server falls back to sudo -u when it is not installed.
+if command -v gcc >/dev/null 2>&1; then
+  echo "Building setuid helper wslogin-run"
+  gcc -O2 -Wall -DWSLOGIN_RUN_CALLER="\"$RUN_USER\"" \
+    -o "$APP_DIR/wslogin-run.new" "$APP_DIR/wslogin-run.c"
+  chown root:root "$APP_DIR/wslogin-run.new"
+  chmod 4755 "$APP_DIR/wslogin-run.new"
+  mv -f "$APP_DIR/wslogin-run.new" "$APP_DIR/wslogin-run"
+else
+  echo "warning: gcc not found, wslogin-run helper not built; per-user commands fall back to sudo" >&2
+fi
+
 if [[ -r "${AUTH_CONF:-/etc/apache2/auth.conf}" ]]; then
   AUTH_INI="${AUTH_INI:-/etc/wslogin/auth.ini}" "$APP_DIR/sync-auth-conf.sh"
 fi

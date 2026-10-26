@@ -149,6 +149,13 @@ function ensureWritableDirs(username) {
     var out = spawnSync('chown', ['-R', username+':', dir]);
     if (out.status !== 0) console.error("chown "+dir+" to "+username+" failed");
   });
+  // the recursive chown above would strip the setuid helper; it must stay
+  // root-owned with the setuid bit (see wslogin-run.c)
+  var helper = path.join(__dirname, 'wslogin-run');
+  if (fs.existsSync(helper)) {
+    spawnSync('chown', ['root:root', helper]);
+    spawnSync('chmod', ['4755', helper]);
+  }
   if ('cookie_dir' in config) {
     // chown the cookie directory itself only: cookie files are created by
     // the users and their owner identifies the login; chowning them to the
@@ -235,12 +242,19 @@ function lookupUser(username) {
   return null;
 }
 // wslogin runs per-user commands (termd daemon start, queries) as the
-// session user via sudo -u. Defined here (before the startup scan) so the
-// resume path uses it too.
+// session user: the small setuid helper wslogin-run, which drops to the
+// target user and execs the command as a single process, so no sudo stays
+// in the process list and no sudo/pam noise lands in the journal. Falls
+// back to sudo -u when the helper is not installed. Defined here (before
+// the startup scan) so the resume path uses it too.
+var run_helper = fs.existsSync(path.join(__dirname, 'wslogin-run'))
+  ? path.join(__dirname, 'wslogin-run') : null;
+console.log("per-user helper: "+(run_helper ? run_helper : "sudo -u (wslogin-run not installed)"));
 function user_run_prefix(username) {
-  return ['sudo', '-u', username];
+  return run_helper ? [run_helper, username] : ['sudo', '-u', username];
 }
-// Run a command as the session user.
+// Run a command as the session user: wslogin-run helper when installed,
+// sudo -u otherwise.
 function run_as(username, args, options) {
   var prefix = user_run_prefix(username);
   return spawnSync(prefix[0], prefix.slice(1).concat(args), options);
@@ -1792,7 +1806,8 @@ wsServer.on('request', function(request) {
                     }
                      loginAttempt(clientIp);
                       // root is refused on every other login path (cookie,
-                      // sso); reject it here too for a clear, consistent error
+                      // sso, wslogin-run); wslogin-run would refuse the spawn
+                      // anyway, reject it here for a clear, consistent error
                      if (m.username == 'root') {
                        console.log("root login rejected");
                        sendError(connection, "root login is not allowed");

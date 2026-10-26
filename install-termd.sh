@@ -67,8 +67,10 @@ chmod 0755 "$APP_DIR/termd.js"
 echo "Installing dependencies"
 (cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund)
 
-# The daemon must be able to spawn its shell as the session user:
-# wslogin-server starts it via sudo -u, termd itself never needs privileges.
+# The daemon must be able to spawn its shell as the session user: the
+# wslogin-run setuid helper (built by install-wslogin.sh, sudo -u
+# fallback) is used by wslogin-server to start it, termd itself never
+# needs privileges.
 
 # Registry base for the daemon sockets: the base is owned by the service
 # user with the session users ACL-granted wx, the per-user dirs below
