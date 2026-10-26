@@ -280,6 +280,12 @@ var loginform = document.getElementById('loginform');
 term.open(document.getElementById('terminal'));
 //      term.loadAddon(attachAddon); 
 term.loadAddon(fitAddon);
+// The DOM renderer lays out glyphs in CSS line boxes, whose leading shows
+// up as small gaps between rows. The canvas renderer draws glyphs at exact
+// row positions and is seamless in all browsers.
+if (window.CanvasAddon) {
+  try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (e) {}
+}
 var lastMouseSent={x:-1,y:-1,t:0};
 var dragStart=false;
 function dragText(a,b) {

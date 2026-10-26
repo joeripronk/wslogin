@@ -27,15 +27,25 @@ fetch_package() {
     tar xz -C "$dest" --strip-components=1
 }
 
-XTERM_VERSION="$(latest_version @xterm/xterm)"
-FIT_VERSION="$(latest_version @xterm/addon-fit)"
-WEBLINKS_VERSION="$(latest_version @xterm/addon-web-links)"
+XTERM_VERSION="5.5.0"
+FIT_VERSION="0.10.0"
+WEBLINKS_VERSION="0.11.0"
+CANVAS_VERSION="0.7.0"
 SERIALIZE_VERSION="$(latest_version @xterm/addon-serialize)"
 HEADLESS_VERSION="$(latest_version @xterm/headless)"
+
+# Browser core pinned to xterm 5.5.0: the canvas renderer (addon-canvas
+# 0.7.0, the last release) is the seamless renderer this project uses,
+# and its peer dependency is @xterm/xterm ^5.0.0. xterm 6.x changed the
+# renderer internals, so canvas 0.7.0 renders stale text on 6.x (e.g.
+# '0;10;10m' fragments at the prompt). The server-side packages
+# (headless, serialize) stay on 6.x; they are independent of the
+# browser core.
 
 fetch_package @xterm/xterm "$XTERM_VERSION" "$TMP/xterm"
 fetch_package @xterm/addon-fit "$FIT_VERSION" "$TMP/addon-fit"
 fetch_package @xterm/addon-web-links "$WEBLINKS_VERSION" "$TMP/addon-web-links"
+fetch_package @xterm/addon-canvas "$CANVAS_VERSION" "$TMP/addon-canvas"
 fetch_package @xterm/addon-serialize "$SERIALIZE_VERSION" "$TMP/addon-serialize"
 fetch_package @xterm/headless "$HEADLESS_VERSION" "$TMP/headless"
 
@@ -47,8 +57,9 @@ install -m 0644 "$TMP/addon-fit/lib/addon-fit.js" www/t/xterm-addon-fit.js
 install -m 0644 "$TMP/addon-fit/lib/addon-fit.js.map" www/t/xterm-addon-fit.js.map
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js" www/t/xterm-addon-web-links.js
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js.map" www/t/xterm-addon-web-links.js.map
+install -m 0644 "$TMP/addon-canvas/lib/addon-canvas.js" www/t/xterm-addon-canvas.js
+install -m 0644 "$TMP/addon-canvas/lib/addon-canvas.js.map" www/t/xterm-addon-canvas.js.map
 rm -f www/t/xterm-addon-webgl.js www/t/xterm-addon-webgl.js.map
-rm -f www/t/xterm-addon-canvas.js www/t/xterm-addon-canvas.js.map
 
 echo "vendoring browser assets into sudovideo"
 mkdir -p sudovideo
@@ -59,6 +70,8 @@ install -m 0644 "$TMP/addon-fit/lib/addon-fit.js" sudovideo/addon-fit.js
 install -m 0644 "$TMP/addon-fit/lib/addon-fit.js.map" sudovideo/addon-fit.js.map
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js" sudovideo/addon-web-links.js
 install -m 0644 "$TMP/addon-web-links/lib/addon-web-links.js.map" sudovideo/addon-web-links.js.map
+install -m 0644 "$TMP/addon-canvas/lib/addon-canvas.js" sudovideo/addon-canvas.js
+install -m 0644 "$TMP/addon-canvas/lib/addon-canvas.js.map" sudovideo/addon-canvas.js.map
 
 echo "updating www symlinks"
 link_asset() {
@@ -73,16 +86,18 @@ link_asset xterm-addon-fit.js
 link_asset xterm-addon-fit.js.map
 link_asset xterm-addon-web-links.js
 link_asset xterm-addon-web-links.js.map
+link_asset xterm-addon-canvas.js
+link_asset xterm-addon-canvas.js.map
 
 echo "updating package.json"
-node - "$XTERM_VERSION" "$FIT_VERSION" "$WEBLINKS_VERSION" "$SERIALIZE_VERSION" "$HEADLESS_VERSION" <<'NODE'
+node - "$XTERM_VERSION" "$FIT_VERSION" "$WEBLINKS_VERSION" "$CANVAS_VERSION" "$SERIALIZE_VERSION" "$HEADLESS_VERSION" <<'NODE'
 const fs = require('fs');
-const [xterm, fit, webLinks, serialize, headless] = process.argv.slice(2);
+const [xterm, fit, webLinks, canvas, serialize, headless] = process.argv.slice(2);
 const file = 'package.json';
 const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
 const deps = pkg.dependencies || {};
 
-for (const name of ['xterm', 'xterm-addon-fit', 'xterm-addon-web-links', 'xterm-addon-serialize', 'xterm-headless']) {
+for (const name of ['xterm', 'xterm-addon-fit', 'xterm-addon-web-links', 'xterm-addon-canvas', 'xterm-addon-serialize', 'xterm-headless']) {
   delete deps[name];
 }
 
@@ -90,6 +105,7 @@ Object.assign(deps, {
   '@xterm/xterm': xterm,
   '@xterm/addon-fit': fit,
   '@xterm/addon-web-links': webLinks,
+  '@xterm/addon-canvas': canvas,
   '@xterm/addon-serialize': serialize,
   '@xterm/headless': headless,
 });
@@ -135,5 +151,5 @@ else
 fi
 
 echo
-echo "xterm updated: core $XTERM_VERSION, addon-fit $FIT_VERSION, addon-web-links $WEBLINKS_VERSION, addon-serialize $SERIALIZE_VERSION, headless $HEADLESS_VERSION"
+echo "xterm updated: browser core $XTERM_VERSION (canvas-compatible 5.x pin), addon-fit $FIT_VERSION, addon-web-links $WEBLINKS_VERSION, addon-canvas $CANVAS_VERSION; server serialize $SERIALIZE_VERSION, headless $HEADLESS_VERSION"
 echo "run 'npm install' to install the updated server dependencies."
