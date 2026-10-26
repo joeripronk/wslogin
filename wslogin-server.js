@@ -949,6 +949,7 @@ function queue_mirror(session, op) {
 function wire_session(username, sessioncookie) {
   var session = sessions[username][sessioncookie];
   var ptyproc = session.pty;
+  var lastCols = ptyproc.cols, lastRows = ptyproc.rows;
   ptyproc.on('data', function(data) {
     var senddata=false;
     // node-pty emits raw Buffers (encoding: null). A utf8 round-trip that
@@ -978,6 +979,11 @@ function wire_session(username, sessioncookie) {
     }
   });
   ptyproc.on('resize', function() {
+    // node-pty fires 'resize' on every resize() call, also no-op ones;
+    // a same-size resize reflows the mirror's whole scrollback and
+    // appends a duplicate resize op to the log, so ignore it
+    if (ptyproc.cols === lastCols && ptyproc.rows === lastRows) return;
+    lastCols = ptyproc.cols; lastRows = ptyproc.rows;
     var resize={cmd:"resize",rows:ptyproc.rows,cols:ptyproc.cols};
     var cmdtext='\0'+JSON.stringify(resize);
     var log={t:now(),d:JSON.stringify(resize),c:0};
@@ -1638,35 +1644,17 @@ wsServer.on('request', function(request) {
       var cmd={cmd:"reconnected",viewid:sessions[username][sessioncookie].viewid,shareid:sessions[username][sessioncookie].shareid,reconnect:sessions[username][sessioncookie].reconnectid,personalized:personalizedLinks};
       connection.sendUTF('\0' + JSON.stringify(cmd));
       console.log("send reconnected to "+sessioncookie);
-      // force a redraw, to fix term properties at cursor for tmux and others
-      // currently terminal properties of the last drawn character are active
-      // e.g. the green bar of tmux
-      // The reconnected client is replayed at the session geometry first.
-      // The client fits its terminal to the screen and only then sends a
-      // resize if its geometry differs from the session geometry, so the
-      // stale size from the reconnect request is never applied to the pty.
-      var rpty = sessions[username][sessioncookie].pty;
-      if (rpty) {
+      // force tmux to repaint the pane, to fix term properties at the
+      // cursor for tmux and others (e.g. the green bar of tmux) after the
+      // replayed snapshot. refresh-client redraws the attached clients
+      // without touching the geometry: the old ±1 resize dance reflowed
+      // the scrollback of the mirror and of every viewer and appended a
+      // full screen repaint to the log per resize, duplicating the screen
+      // several times at the replay boundary on every reconnect.
       try {
-        rpty.resize(serial.cols+1,serial.rows+1);
-        console.log("resizing "+sessioncookie+' to '+(serial.cols+1)+'x'+(serial.rows+1));
-        setTimeout(function() {
-          try {
-            // resize back to the client's current size: a browser fits
-            // its element to the replay geometry and resends its own
-            // size in the meantime, a terminal client (wslogin cli)
-            // never fits the session geometry and must win
-            var tcols = connection.columns || serial.cols;
-            var trows = connection.rows || serial.rows;
-            rpty.resize(tcols, trows);
-            console.log("resizing back to "+sessioncookie+' to '+tcols+'x'+trows);
-          } catch (error) {
-            console.log("resize back failed: "+error.message);
-          }
-        }, 30);
+        run_as(username, ['tmux', '-S', session_tmux_path(username, sessioncookie), 'refresh-client']);
       } catch (error) {
-        console.log("reconnect resize failed: "+error.message);
-      }
+        console.log("refresh-client failed for "+sessioncookie+": "+error.message);
       }
     }
     while(connection.sendbuffer.length>0) {
@@ -1933,8 +1921,9 @@ wsServer.on('request', function(request) {
                   connection.columns = m.cols;
                   connection.rows = m.rows;
                   if (connection.sessioncookie!=false) {
-                    var sizelog={t:now(),d:JSON.stringify({cmd:"resize",cols:m.cols,rows:m.rows}),c:0};
                     var sizeSession=sessions[connection.username][connection.sessioncookie];
+                    if (sizeSession.pty && sizeSession.pty.cols===m.cols && sizeSession.pty.rows===m.rows) break;
+                    var sizelog={t:now(),d:JSON.stringify({cmd:"resize",cols:m.cols,rows:m.rows}),c:0};
                     if (sizeSession.pty) sizeSession.pty.resize(m.cols,m.rows);
                     var sizewritten=append_session_log(sizeSession,sizelog);
                     queue_mirror(sizeSession,{type:'resize',cols:m.cols,rows:m.rows,offset:sizewritten.offset,bytes:sizewritten.bytes});
@@ -1945,10 +1934,11 @@ wsServer.on('request', function(request) {
                 if (!connection.viewonly && validSize(m.cols, m.rows)) {
                   connection.columns = m.cols;
                   connection.rows = m.rows;
-                  if (connection.sessioncookie!=false) {
-                    var rsession=sessions[connection.username][connection.sessioncookie];
-                    if (rsession && rsession.pty) {
-                    console.log("received resize to "+m.cols+"x"+m.rows+" "+connection.sessioncookie+" "+rsession.pty.file);
+                   if (connection.sessioncookie!=false) {
+                     var rsession=sessions[connection.username][connection.sessioncookie];
+                     if (rsession && rsession.pty) {
+                     if (rsession.pty.cols===m.cols && rsession.pty.rows===m.rows) break;
+                     console.log("received resize to "+m.cols+"x"+m.rows+" "+connection.sessioncookie+" "+rsession.pty.file);
                     rsession.pty.resize(m.cols,m.rows);
                     console.log("writing to "+connection.username+" "+connection.sessioncookie+" "+rsession.pty.file);
                     var written=append_session_log(sessions[connection.username][connection.sessioncookie],log);
