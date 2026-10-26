@@ -886,9 +886,10 @@ function start_tmux_session(username, sessioncookie, cols, rows, env) {
     console.error("setfacl defaults on "+base+" for "+WSLOGIN_USER+" failed: "
       +bacl.stderr+"; tmux sockets will be owner-only and attaching will fail");
   }
-  // the user needs write on the base directory to create his socket dir
-  // (+wx: a leading - in a modify spec would remove the bits)
-  var uacl = spawnSync('setfacl', ['-m', 'u:'+username+':+wx', base]);
+  // the user needs write on the base directory to create his socket dir;
+  // '+wx' (add entry, keep mask) is rejected as EINVAL by setfacl 2.3.x on
+  // tmpfs, so set the entry and the mask explicitly
+  var uacl = spawnSync('setfacl', ['-m', 'u:'+username+':rwx,m::rwx', base]);
   if (uacl.status !== 0) console.error("setfacl "+base+" for "+username+" failed: "+uacl.stderr);
   var st = null;
   try { st = fs.statSync(dir); } catch (error) {}

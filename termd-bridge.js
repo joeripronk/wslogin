@@ -40,7 +40,10 @@ function ensureTermdDir(username) {
   if (bacl.status !== 0) {
     console.error('setfacl defaults on ' + base + ' for ' + deps.wsloginUser + ' failed: ' + bacl.stderr);
   }
-  var uacl = deps.spawnSync('setfacl', ['-m', 'u:' + username + ':+wx', base]);
+  // '+wx' (add entry, keep mask) is rejected as EINVAL by setfacl 2.3.x on
+  // tmpfs; set the entry and the mask explicitly so the session user can
+  // create and traverse his socket dir
+  var uacl = deps.spawnSync('setfacl', ['-m', 'u:' + username + ':rwx,m::rwx', base]);
   if (uacl.status !== 0) console.error('setfacl ' + base + ' for ' + username + ' failed: ' + uacl.stderr);
   var mk = deps.runAs(username, ['mkdir', '-p', termdDir(username)]);
   if (mk.status !== 0) console.error('mkdir ' + termdDir(username) + ' as ' + username + ' failed: ' + mk.stderr);
