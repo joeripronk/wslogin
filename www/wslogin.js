@@ -291,12 +291,11 @@ var dragStart=false;
 function dragText(a,b) {
   var buf=term.buffer.active;
   var y1=Math.min(a.y,b.y), y2=Math.max(a.y,b.y);
-  var x1=Math.min(a.x,b.x), x2=Math.max(a.x,b.x);
   var out=[];
   for (var y=y1; y<=y2; y++) {
     var line=buf.getLine(buf.baseY+y-1);
     if (!line) continue;
-    out.push(line.translateToString(true).slice(x1-1,x2));
+    out.push(line.translateToString(false));
   }
   return out.join('\n').replace(/\s+$/,'');
 }
