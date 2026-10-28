@@ -11,7 +11,10 @@
 // the live stream, so reconnect is native: the daemon's memory is the
 // history.
 //
-// registry: $XDG_RUNTIME_DIR/termd/<id>.sock + <id>.meta; list scans it.
+// registry: <termd_dir>/<user> when wslogin is installed (CLI daemons
+// then register in wslogin's registry and show in the browser picker),
+// else $XDG_RUNTIME_DIR/termd; termd_dir from /etc/wslogin/config.ini,
+// default /run/wslogin/termd. The client scans both dirs.
 // clients speak the wslogin framing: '\x01' + raw data, '\x00' + JSON.
 // daemon speaks: '\x00' resize, '\x01' snapshot/output, '\x00' b64, '\x00' exit.
 
@@ -21,20 +24,67 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const WebSocket = require('ws');
-const pty = require('node-pty');
-const { Terminal } = require('@xterm/headless');
-const { SerializeAddon } = require('@xterm/addon-serialize');
+// ws, node-pty and xterm are required lazily (in the daemon and the
+// client paths that need them) so that `termd ping` can run and report
+// a missing module instead of the script dying at startup
 
 const SCROLLBACK = 10000;
 const VERSION = '0.1.0';
 
 function now() { return Date.now() / 1000; }
 function runtimeDir() { return process.env.XDG_RUNTIME_DIR || '/tmp'; }
-function regDir() { return process.env.TERMD_DIR || path.join(runtimeDir(), 'termd'); }
+// registry: wslogin installed -> <termd_dir>/<user> (termd_dir from
+// /etc/wslogin/config.ini, default /run/wslogin/termd), so CLI daemons
+// register in the same registry wslogin lists and the browser picker
+// shows them; else $XDG_RUNTIME_DIR/termd. The client scans both.
+function regDir() {
+  if (process.env.TERMD_DIR) return process.env.TERMD_DIR;
+  var w = wsloginRegDir();
+  if (w && canWriteWsloginBase(w)) return w;
+  return path.join(runtimeDir(), 'termd');
+}
 function sockPath(id) { return path.join(regDir(), id + '.sock'); }
 function metaPath(id) { return path.join(regDir(), id + '.meta'); }
 function logPath(id) { return process.env.TERMD_LOG || path.join(regDir(), 'sess-' + id + '.jsonl'); }
+
+// registry dir of the wslogin-started sessions of the current user:
+// <termd_dir>/<user> with termd_dir from the wslogin config (readable
+// only for root in the default install; fall back to the server default)
+var wsloginRegDirCache = null;
+function wsloginRegDir() {
+  if (wsloginRegDirCache !== null) return wsloginRegDirCache;
+  var base = '/run/wslogin/termd';
+  try {
+    var conf = fs.readFileSync(process.env.WSLOGIN_CONFIG || '/etc/wslogin/config.ini', 'utf8');
+    var m = conf.match(/^\s*termd_dir\s*=\s*(.+)$/m);
+    if (m) base = path.resolve(m[1].trim());
+  } catch (e) {}
+  var user;
+  // the real uid, not $USER: $USER is user-controlled and would let a
+  // user register daemons in another user's registry dir
+  try { user = os.userInfo().username; } catch (e) { user = process.env.USER; }
+  wsloginRegDirCache = user ? path.join(base, user) : null;
+  return wsloginRegDirCache;
+}
+
+// the wslogin registry is usable only when the base exists and the
+// current user has write access (the ACL entry ensureTermdDir sets);
+// a user who never had a wslogin session falls back to the XDG dir
+function canWriteWsloginBase(w) {
+  var base = path.dirname(w);
+  try { fs.accessSync(base, fs.constants.W_OK | fs.constants.X_OK); } catch (e) { return false; }
+  return true;
+}
+
+// the registries the client scans: its own dir plus the wslogin dir
+function regDirs() {
+  var dirs = [regDir()];
+  var w = wsloginRegDir();
+  if (w && w !== regDir()) dirs.push(w);
+  return dirs;
+}
+function sockOf(entry) { return path.join(entry.dir, entry.id + '.sock'); }
+function metaOf(entry) { return path.join(entry.dir, entry.id + '.meta'); }
 
 var MOUSE_SEQ_RE = /\x1b\[<[\d;?]*[Mm]|\x1b\[M[\x20-\x7f]{3}/g;
 
@@ -52,13 +102,40 @@ function validSize(cols, rows) {
   return Number.isInteger(cols) && Number.isInteger(rows) && cols >= 1 && cols <= 4000 && rows >= 1 && rows <= 1000;
 }
 
+// is this path termd itself? (the passwd shell field is the termd
+// binary, so $SHELL is termd when the daemon looks for the real shell)
+function isTermdPath(p) {
+  var base = path.basename(p);
+  if (base === 'termd' || base === 'termd.js') return true;
+  try { return fs.realpathSync(p) === fs.realpathSync(__filename); } catch (e) { return false; }
+}
+
+// the real shell a session runs: TERMD_SHELL (set by the login shell
+// mode, from the optional shell argument in the passwd field), else
+// $SHELL, and /bin/bash when $SHELL is termd itself (recursion guard)
+function realShell() {
+  var sh = process.env.TERMD_SHELL || process.env.SHELL || '/bin/bash';
+  if (isTermdPath(sh)) sh = '/bin/bash';
+  return sh;
+}
+
 // ---------------------------------------------------------------- session daemon
 
 function runSession(cols, rows) {
+  var pty = require('node-pty');
+  var WebSocket = require('ws');
+  var { Terminal } = require('@xterm/headless');
+  var { SerializeAddon } = require('@xterm/addon-serialize');
   if (!validSize(cols, rows)) { cols = 80; rows = 24; }
-  fs.mkdirSync(regDir(), { recursive: true, mode: 0o700 });
+  // 0750 (not 0700): in the wslogin registry the per-user dir inherits
+  // the base's default ACL for the service user, and a 0700 mkdir would
+  // set the ACL mask to --- and mask that entry away; 0750 keeps the
+  // mask at r-x (traverse + readdir is all wslogin needs on the dir)
+  // and keeps the dir closed to other users, who could otherwise read
+  // the session meta and the sess-<id>.jsonl recording in it
+  fs.mkdirSync(regDir(), { recursive: true, mode: 0o750 });
   var id = crypto.randomUUID();
-  var shell = process.env.SHELL || '/bin/bash';
+  var shell = realShell();
   var session = {
     id: id, cols: cols, rows: rows, shell: shell,
     connections: Object.create(null), owner: null,
@@ -73,7 +150,10 @@ function runSession(cols, rows) {
   session.term = term; session.ser = ser;
 
   var logfile = logPath(id);
-  fs.writeFileSync(metaPath(id), JSON.stringify({ id: id, cols: cols, rows: rows, start: now(), shell: shell }));
+  // 0600: the meta and the recording are readable only by the session
+  // user (the wslogin service user gets in through the ACLs on the dirs)
+  fs.writeFileSync(metaPath(id), JSON.stringify({ id: id, cols: cols, rows: rows, start: now(), shell: shell }), { mode: 0o600 });
+  fs.writeFileSync(logfile, '', { mode: 0o600, flag: 'a' });
   var header = {
     username: os.userInfo().username, sessioncookie: process.env.TERMD_COOKIE || id,
     cols: cols, rows: rows, starttime: now(), shell: shell, termd: sockPath(id) };
@@ -253,10 +333,12 @@ function runSession(cols, rows) {
 
 // ---------------------------------------------------------------- client
 
-function connectSock(id, cb) {
+function connectSock(entry, cb) {
+  var WebSocket = require('ws');
+  var sock = sockOf(entry);
   var tries = 0;
   var attempt = function () {
-    var ws = new WebSocket('ws+unix://' + sockPath(id));
+    var ws = new WebSocket('ws+unix://' + sock);
     var done = false;
     ws.on('open', function () { done = true; cb(null, ws); });
     ws.on('error', function (e) {
@@ -271,8 +353,9 @@ function connectSock(id, cb) {
   attempt();
 }
 
-function probe(id, cb) {
-  var ws = new WebSocket('ws+unix://' + sockPath(id));
+function probe(entry, cb) {
+  var WebSocket = require('ws');
+  var ws = new WebSocket('ws+unix://' + sockOf(entry));
   var done = false;
   var timer = setTimeout(function () { done = true; try { ws.close(); } catch (e) {} cb(null); }, 1000);
   ws.on('open', function () {
@@ -288,23 +371,39 @@ function probe(id, cb) {
   ws.on('error', function () { clearTimeout(timer); if (!done) { done = true; cb(null); } });
 }
 
-function registryIds(cb) {
-  var ids = [];
-  try {
-    for (const f of fs.readdirSync(regDir())) {
-      if (f.endsWith('.sock')) ids.push(f.slice(0, -5));
+function registryEntries(cb) {
+  var entries = [];
+  var seen = Object.create(null);
+  for (const dir of regDirs()) {
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (f.endsWith('.sock')) {
+          var id = f.slice(0, -5);
+          if (!seen[id]) { seen[id] = true; entries.push({ dir: dir, id: id }); }
+        }
+      }
+    } catch (e) {}
+  }
+  cb(entries);
+}
+
+// resolve an id given on the command line to its registry entry
+function findEntry(id, cb) {
+  registryEntries(function (entries) {
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].id === id) { cb(entries[i]); return; }
     }
-  } catch (e) {}
-  cb(ids);
+    cb(null);
+  });
 }
 
 function collectList(cb) {
-  registryIds(function (ids) {
+  registryEntries(function (entries) {
     var found = [];
-    var pending = ids.length;
+    var pending = entries.length;
     if (pending === 0) { cb(found); return; }
-    ids.forEach(function (id) {
-      probe(id, function (info) {
+    entries.forEach(function (entry) {
+      probe(entry, function (info) {
         if (info) found.push(info);
         if (--pending === 0) { found.sort(function (a, b) { return a.id < b.id ? -1 : 1; }); cb(found); }
       });
@@ -326,11 +425,14 @@ function clientList() {
 }
 
 function clientKill(id) {
-  connectSock(id, function (e, ws) {
-    if (!ws) { console.log('no such session: ' + id); process.exit(1); }
-    ws.send('\x00' + JSON.stringify({ cmd: 'kill' }));
-    ws.on('message', function () { process.exit(0); });
-    setTimeout(function () { process.exit(0); }, 1000);
+  findEntry(id, function (entry) {
+    if (!entry) { console.log('no such session: ' + id); process.exit(1); }
+    connectSock(entry, function (e, ws) {
+      if (!ws) { console.log('no such session: ' + id); process.exit(1); }
+      ws.send('\x00' + JSON.stringify({ cmd: 'kill' }));
+      ws.on('message', function () { process.exit(0); });
+      setTimeout(function () { process.exit(0); }, 1000);
+    });
   });
 }
 
@@ -416,6 +518,7 @@ function bridge(ws, view) {
     try { j = JSON.parse(m.slice(1)); } catch (err) { return; }
     if (j.cmd === 'attached') {
       if (view) {
+        var { Terminal } = require('@xterm/headless');
         viewTerm = new Terminal({ allowProposedApi: true, cols: process.stdout.columns || 80,
           rows: process.stdout.rows || 24, scrollback: SCROLLBACK });
       } else {
@@ -483,21 +586,42 @@ function cleanup(ws) {
   try { ws.close(); } catch (e) {}
 }
 
+function fallbackShell(reason) {
+  console.log('termd: ' + reason + '; falling back to a plain shell (no detach, no recording)');
+  // realShell(): with termd as login shell $SHELL is termd itself,
+  // spawning it here would loop back into clientNew
+  var shell = realShell();
+  var child = spawn(shell, ['-l'], { stdio: 'inherit', env: process.env });
+  child.on('exit', function (code, sig) { process.exit(sig ? 1 : (code === null ? 1 : code)); });
+  child.on('error', function (e) { console.log('termd: cannot start ' + shell + ': ' + e.message); process.exit(1); });
+}
+
 function clientNew() {
+  var marker = 'cli-' + crypto.randomUUID();
   var cols = process.stdout.columns || 80, rows = process.stdout.rows || 24;
   var child = spawn(process.execPath, [__filename, 'session', String(cols), String(rows)],
-    { detached: true, stdio: 'ignore', env: process.env });
+    { detached: true, stdio: 'ignore', env: Object.assign({}, process.env, { TERMD_COOKIE: marker }) });
+  child.on('error', function (e) { fallbackShell('cannot spawn the session daemon: ' + e.message); });
   child.unref();
   var tries = 0;
   var attachNew = function () {
-    registryIds(function (ids) {
-      var fresh = ids.filter(function (id) {
-        try { return fs.statSync(metaPath(id)).mtimeMs > Date.now() - 10000; } catch (e) { return false; }
+    registryEntries(function (entries) {
+      var mine = entries.filter(function (entry) {
+        // identify our own daemon by the cookie in its log header:
+        // a wslogin session started in the same window would otherwise
+        // pass the fresh-by-mtime filter
+        var log = process.env.TERMD_LOG || path.join(entry.dir, 'sess-' + entry.id + '.jsonl');
+        try {
+          var d = JSON.parse(fs.readFileSync(log, 'utf8').split('\n')[0]);
+          if (!d || d.c !== 4) return false;
+          var m = JSON.parse(d.d);
+          return m.sessioncookie === marker;
+        } catch (e) { return false; }
       });
-      if (fresh.length === 0 && tries++ < 20) { setTimeout(attachNew, 250); return; }
-      if (fresh.length === 0) { console.log('session daemon did not start'); process.exit(1); }
-      connectSock(fresh[0], function (e, ws) {
-        if (!ws) { console.log('cannot attach to new session: ' + (e ? e.message : '')); process.exit(1); }
+      if (mine.length === 0 && tries++ < 20) { setTimeout(attachNew, 250); return; }
+      if (mine.length === 0) { fallbackShell('session daemon did not start (termd ping shows why)'); return; }
+      connectSock(mine[0], function (e, ws) {
+        if (!ws) { fallbackShell('cannot attach to the new session: ' + (e ? e.message : '')); return; }
         bridge(ws, false);
         ws.send('\x00' + JSON.stringify({ cmd: 'attach' }));
       });
@@ -509,14 +633,95 @@ function clientNew() {
 function clientAttach(id, view) {
   var start = function (sessId) {
     if (!sessId) { console.log('no session to attach'); process.exit(1); }
-    connectSock(sessId, function (e, ws) {
-      if (!ws) { console.log('session is gone (' + sessId + ')'); process.exit(1); }
-      bridge(ws, view === true);
-      ws.send('\x00' + JSON.stringify({ cmd: 'attach', id: sessId, view: view === true }));
+    findEntry(sessId, function (entry) {
+      if (!entry) { console.log('session is gone (' + sessId + ')'); process.exit(1); }
+      connectSock(entry, function (e, ws) {
+        if (!ws) { console.log('session is gone (' + sessId + ')'); process.exit(1); }
+        bridge(ws, view === true);
+        ws.send('\x00' + JSON.stringify({ cmd: 'attach', id: sessId, view: view === true }));
+      });
     });
   };
   if (id) { start(id); return; }
   collectList(function (list) { pickSession(list, start); });
+}
+
+// end-to-end self test: spawn a daemon, find it by the cookie it writes
+// to its log header (concurrent sessions cannot be confused), attach and
+// kill it. Shows why it fails when it does: node, modules, registry dirs.
+function clientPing() {
+  var marker = 'ping-' + crypto.randomUUID();
+  var logfile = path.join(runtimeDir(), marker + '.jsonl');
+  // the killed daemon writes its exit record ~200ms after the killed
+  // frame, recreating the log after a first unlink; clean up after that
+  var cleanup = function () { try { fs.unlinkSync(logfile); } catch (e) {} };
+  var cleanupLater = function () { setTimeout(cleanup, 1500); };
+  var pingEntry = null;
+  var fail = function (msg) {
+    cleanup();
+    console.log('termd ping: FAIL - ' + msg);
+    console.log('node ' + process.version + ' (' + process.execPath + ')');
+    try {
+      require('node-pty'); require('ws');
+      require('@xterm/headless'); require('@xterm/addon-serialize');
+      console.log('modules ok');
+    } catch (e) { console.log('module check: ' + e.message); }
+    console.log('registries: ' + regDirs().join(', '));
+    var done = function () { process.exit(1); };
+    // best effort: do not leave a daemon we started running as a ghost
+    if (pingEntry) {
+      try {
+        var WS = require('ws');
+        var killws = new WS('ws+unix://' + sockOf(pingEntry));
+        var t = setTimeout(function () { try { killws.close(); } catch (e) {} done(); }, 1000);
+        killws.on('open', function () { killws.send('\x00' + JSON.stringify({ cmd: 'kill' })); });
+        killws.on('message', function () { clearTimeout(t); try { killws.close(); } catch (e) {} done(); });
+        killws.on('error', function () { clearTimeout(t); done(); });
+      } catch (e) { done(); }
+    } else { done(); }
+  };
+  var child = spawn(process.execPath, [__filename, 'session', '40', '10'],
+    { detached: true, stdio: 'ignore',
+      env: Object.assign({}, process.env, { TERMD_COOKIE: marker, TERMD_LOG: logfile }) });
+  child.on('error', function (e) { fail('cannot spawn the session daemon: ' + e.message); });
+  child.unref();
+  var tries = 0;
+  var poll = function () {
+    var d = null;
+    try { d = JSON.parse(fs.readFileSync(logfile, 'utf8').split('\n')[0]); } catch (e) {}
+    if (!d || d.c !== 4) {
+      if (tries++ < 40) { setTimeout(poll, 250); return; }
+      fail('daemon did not write its log header');
+      return;
+    }
+    var m;
+    try { m = JSON.parse(d.d); } catch (e) {}
+    if (!m || m.sessioncookie !== marker || !m.termd) { fail('log header has no ping cookie'); return; }
+    var entry = { dir: path.dirname(String(m.termd)), id: path.basename(String(m.termd), '.sock') };
+    pingEntry = entry;
+    connectSock(entry, function (e, ws) {
+      if (!ws) { fail('socket connect failed: ' + (e ? e.message : '')); return; }
+      var timer = setTimeout(function () { fail('daemon did not answer'); }, 10000);
+      ws.on('message', function (raw) {
+        var s = Buffer.from(raw).toString('utf8');
+        if (s.charAt(0) !== '\x00') return;
+        var j;
+        try { j = JSON.parse(s.slice(1)); } catch (e) { return; }
+        if (j.cmd === 'attached') ws.send('\x00' + JSON.stringify({ cmd: 'kill' }));
+        else if (j.cmd === 'killed') {
+          clearTimeout(timer);
+          cleanup();
+          cleanupLater();
+          try { ws.close(); } catch (e) {}
+          console.log('termd ping: ok (daemon ' + entry.id + ' in ' + entry.dir +
+            ': pty, registry, socket and framing work)');
+        }
+      });
+      ws.on('error', function (e) { clearTimeout(timer); fail('socket error: ' + e.message); });
+      ws.send('\x00' + JSON.stringify({ cmd: 'attach' }));
+    });
+  };
+  setTimeout(poll, 250);
 }
 
 function usage() {
@@ -529,16 +734,47 @@ function usage() {
     '  attach [id] attach a session (picker when no id)\n' +
     '  view <id>   attach read-only\n' +
     '  list        list sessions\n' +
+    '  ping        check that a session daemon runs (self test)\n' +
     '  kill <id>   kill a session\n' +
     '  daemon      alias for new (compat)\n' +
     '\n' +
     'Ctrl-] detaches; the session keeps running and is reattached on the next run.\n' +
     'view: Ctrl-C exits, arrows/PageUp/PageDown scroll, Home/End jump to top/bottom.\n' +
-    'one detached daemon per session, registry: ' + regDir());
+    'login shell: set the passwd shell to /usr/local/bin/termd (optionally\n' +
+    '"termd /bin/zsh" for a non-default session shell); ssh/getty/su logins then\n' +
+    'attach a detached session or start a new one, and scp/sftp/rsync/su -c\n' +
+    'keep working through a direct shell exec.\n' +
+    'one detached daemon per session, registries: ' + regDirs().join(', '));
 }
 
+// direct shell exec for the non-interactive invocations a login shell
+// must serve: sshd runs the passwd shell field with -c for scp, sftp,
+// rsync, git, and su -c runs the shell with -c too
+function execShell(shell, args) {
+  var child = spawn(shell, args, { stdio: 'inherit', env: process.env });
+  child.on('exit', function (code, sig) { process.exit(sig ? 1 : (code === null ? 1 : code)); });
+  child.on('error', function (e) { console.log('termd: cannot run ' + shell + ': ' + e.message); process.exit(1); });
+}
+
+var KNOWN_CMDS = { new: 1, daemon: 1, attach: 1, view: 1, list: 1, ping: 1,
+  kill: 1, session: 1, help: 1, '-h': 1, '--help': 1, '-c': 1 };
+
 function main() {
-  var cmd = process.argv[2];
+  var argv = process.argv.slice(2);
+  // passwd shell field: "/usr/local/bin/termd /bin/zsh" -> the first
+  // argument is the real session shell (sshd passes the field's rest
+  // through, so `termd /bin/zsh -c cmd` reaches scp/su -c too)
+  var shellArg = null;
+  if (argv[0] && argv[0].charAt(0) === '/' && argv[0] !== __filename && fs.existsSync(argv[0])) {
+    shellArg = argv.shift();
+  }
+  var cmd = argv[0];
+  // login shell mode: no command (ssh, getty, su) or a login convention
+  // argument (-user from su -l, -l, -i): attach a detached session,
+  // else start a new one. The daemon's argv0 is node, so a leading-dash
+  // argv[0] is not visible here; the argument shape decides.
+  var loginMode = (cmd === undefined ||
+    (cmd.charAt(0) === '-' && !KNOWN_CMDS[cmd]));
   // the daemon starts its shell with its own environment, so a termd run
   // from inside a session has TERMD_SESSION (and, for wslogin daemons,
   // TERMD_COOKIE) set: a nested daemon would register in the outer
@@ -546,15 +782,16 @@ function main() {
   // session's output back into its own input.
   // 'session' itself stays allowed: it is the daemon command, which the
   // wslogin bridge starts with TERMD_COOKIE set
+  var allowedInside = { session: 1, list: 1, ping: 1, kill: 1, '-h': 1, '--help': 1, help: 1 };
   if ((process.env.TERMD_SESSION || process.env.TERMD_COOKIE) &&
-      cmd !== 'session' && cmd !== 'list' && cmd !== 'kill' &&
-      cmd !== '-h' && cmd !== '--help' && cmd !== 'help') {
+      (loginMode || !allowedInside[cmd])) {
     console.log('termd: refusing to run inside termd session ' +
       (process.env.TERMD_SESSION || process.env.TERMD_COOKIE) +
       '; detach with Ctrl-] first (list and kill are allowed)');
     process.exit(1);
   }
-  if (!cmd) {
+  if (loginMode) {
+    if (shellArg) process.env.TERMD_SHELL = shellArg;
     collectList(function (list) {
       var free = list.filter(function (s) { return !s.owner; });
       if (list.length > 0 && free.length > 0) clientAttach(free[0].id, false);
@@ -562,14 +799,16 @@ function main() {
     });
     return;
   }
+  if (cmd === '-c') { execShell(shellArg || realShell(), ['-c'].concat(argv.slice(1))); return; }
   switch (cmd) {
-    case 'session': runSession(parseInt(process.argv[3], 10) || 80, parseInt(process.argv[4], 10) || 24); break;
+    case 'session': runSession(parseInt(argv[1], 10) || 80, parseInt(argv[2], 10) || 24); break;
     case 'daemon': clientNew(); break;
     case 'new': clientNew(); break;
-    case 'attach': clientAttach(process.argv[3], false); break;
-    case 'view': clientAttach(process.argv[3], true); break;
+    case 'attach': clientAttach(argv[1], false); break;
+    case 'view': clientAttach(argv[1], true); break;
     case 'list': clientList(); break;
-    case 'kill': if (!process.argv[3]) { usage(); process.exit(2); } clientKill(process.argv[3]); break;
+    case 'ping': clientPing(); break;
+    case 'kill': if (!argv[1]) { usage(); process.exit(2); } clientKill(argv[1]); break;
     case '-h': case '--help': case 'help': usage(); break;
     default: console.log('termd: unknown command ' + cmd); usage(); process.exit(2);
   }
