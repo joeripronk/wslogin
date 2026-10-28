@@ -206,10 +206,27 @@ function runSession(cols, rows) {
 
   var server = http.createServer(function (req, res) { res.end('termd\n'); });
   var wss = new WebSocket.Server({ server: server });
+  // the proxy user allowed on the socket: TERMD_PROXY_UID at spawn
+  // (wslogin passes its own uid, see termd-bridge.js), else the owner of
+  // the registry dir's parent (the wslogin base for CLI daemons started
+  // in the wslogin registry, own uid for plain $XDG_RUNTIME_DIR/termd)
+  var proxyUid = null;
+  if (process.env.TERMD_PROXY_UID) {
+    var n = Number(process.env.TERMD_PROXY_UID);
+    proxyUid = Number.isInteger(n) ? n : null;
+    if (proxyUid === null) {
+      console.log('termd: ignoring non-numeric TERMD_PROXY_UID ' + process.env.TERMD_PROXY_UID);
+    }
+  } else {
+    try { proxyUid = fs.statSync(path.dirname(regDir())).uid; }
+    catch (e) { console.log('termd: cannot stat registry parent for proxy uid: ' + e.message); }
+  }
   wss.on('connection', function (ws, req) {
     var cred = null;
     try { cred = req.socket.getPeerCredentials(); } catch (e) {}
-    if (cred && cred.uid !== 0 && cred.uid !== process.getuid()) {
+    // root, the owning user and the proxy user may connect; the socket's
+    // ACLs restrict who can reach it, this rejects the rest
+    if (cred && cred.uid !== 0 && cred.uid !== process.getuid() && cred.uid !== proxyUid) {
       ws.close();
       return;
     }

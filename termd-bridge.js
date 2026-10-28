@@ -66,6 +66,7 @@ function termdSpawn(username, sessioncookie, cols, rows, meta, cb) {
     'LANG=en_US.UTF-8', 'COLORTERM=truecolor',
     'TERMD_DIR=' + termdDir(username),
     'TERMD_LOG=' + logfile,
+    'TERMD_PROXY_UID=' + process.getuid(),
     'TERMD_COOKIE=' + sessioncookie];
   if (meta.viewid) args.push('VIEWID=' + meta.viewid);
   if (meta.viewurl) args.push('VIEWURL=' + meta.viewurl);
