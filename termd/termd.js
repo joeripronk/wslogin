@@ -133,7 +133,11 @@ function runSession(cols, rows) {
 
   session.pty = pty.spawn(shell, ['-l'], {
     name: 'xterm-256color', cols: cols, rows: rows,
-    cwd: process.env.HOME || '/', encoding: null, env: process.env
+    cwd: process.env.HOME || '/', encoding: null,
+    // TERMD_SESSION lets `termd list` inside the shell mark its own
+    // session (the registry id; TERMD_COOKIE is wslogin's cookie for
+    // wslogin-started daemons and differs from it)
+    env: Object.assign({}, process.env, { TERMD_SESSION: id })
   });
   session.pty.on('data', function (data) {
     term.write(data);
@@ -314,7 +318,8 @@ function clientList() {
     for (var i = 0; i < found.length; i++) {
       var s = found[i];
       out.push(s.id + '  ' + s.cols + 'x' + s.rows + '  ' + (s.owner ? 'attached' : 'detached') +
-        (s.title ? '  ' + s.title : ''));
+        (s.title ? '  ' + s.title : '') +
+        (s.id === process.env.TERMD_SESSION ? '  <- your session' : ''));
     }
     console.log(out.length ? out.join('\n') : 'no sessions');
   });
@@ -534,6 +539,21 @@ function usage() {
 
 function main() {
   var cmd = process.argv[2];
+  // the daemon starts its shell with its own environment, so a termd run
+  // from inside a session has TERMD_SESSION (and, for wslogin daemons,
+  // TERMD_COOKIE) set: a nested daemon would register in the outer
+  // registry and append to the outer log, and an attach would feed the
+  // session's output back into its own input.
+  // 'session' itself stays allowed: it is the daemon command, which the
+  // wslogin bridge starts with TERMD_COOKIE set
+  if ((process.env.TERMD_SESSION || process.env.TERMD_COOKIE) &&
+      cmd !== 'session' && cmd !== 'list' && cmd !== 'kill' &&
+      cmd !== '-h' && cmd !== '--help' && cmd !== 'help') {
+    console.log('termd: refusing to run inside termd session ' +
+      (process.env.TERMD_SESSION || process.env.TERMD_COOKIE) +
+      '; detach with Ctrl-] first (list and kill are allowed)');
+    process.exit(1);
+  }
   if (!cmd) {
     collectList(function (list) {
       var free = list.filter(function (s) { return !s.owner; });
