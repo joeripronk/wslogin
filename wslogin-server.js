@@ -477,6 +477,75 @@ function termd_resume(meta) {
   });
 }
 
+// Adopt CLI-started termd daemons: `termd new` (and login-shell mode)
+// registers in the same registry wslogin uses, but the session has no log
+// in session_dir and no map entry, so the picker never shows it. Scan the
+// registry dirs, probe the sockets wslogin does not know, and add the live
+// daemons as detached sessions; a reconnect links them like any termd
+// session (termd_cleanup_gone's finish_session is a no-op for their
+// session_dir-less logs, so the sweep removes the ghosts).
+function termd_scan() {
+  var users;
+  try { users = fs.readdirSync(termd_base); } catch (e) { return; }
+  for (var i = 0; i < users.length; i++) {
+    var username = users[i];
+    var dir = path.join(termd_base, username);
+    var files;
+    try { files = fs.readdirSync(dir); } catch (e) { continue; }
+    for (var j = 0; j < files.length; j++) {
+      if (!files[j].endsWith('.sock')) continue;
+      var id = files[j].slice(0, -5);
+      var known = false;
+      for (const user in sessions) {
+        for (const cookie in sessions[user]) {
+          var s = sessions[user][cookie];
+          if (s && s.termd === id) known = true;
+        }
+      }
+      if (known) continue;
+      var meta = read_session_header(path.join(dir, 'sess-' + id + '.jsonl'));
+      if (!meta || meta.username !== username || !meta.sessioncookie) continue;
+      if (!meta.termd || !meta.termd.startsWith(dir + path.sep)) continue;
+      // wslogin-started daemons have their session log in session_dir;
+      // the startup scan resumes them, and an existing log means the
+      // session is wslogin's to manage (or already finished)
+      try {
+        if (fs.existsSync(session_log_path(username, meta.sessioncookie))) continue;
+      } catch (e) { continue; }
+      termd_adopt_cli(username, meta);
+    }
+  }
+}
+
+function termd_adopt_cli(username, meta) {
+  termd.probeSock(meta.termd, function (info) {
+    if (!info) return;
+    var sessioncookie = meta.sessioncookie;
+    if (sessions[username] && sessions[username][sessioncookie]) return;
+    var reconnectid = read_reconnect_token(username, sessioncookie) || uuid_v4();
+    sessions[username] = sessions[username] || {};
+    var session = sessions[username][sessioncookie] = {
+      viewid: meta.viewid, shareid: meta.shareid,
+      reconnectid: reconnectid, connections: {}
+    };
+    session.sessioncookie = sessioncookie;
+    session.termd = path.basename(meta.termd).replace(/\.sock$/, '');
+    session.cols = info.cols || meta.cols || 80;
+    session.rows = info.rows || meta.rows || 24;
+    session.pty = false;
+    reconnects[reconnectid] = {username: username, sessioncookie: sessioncookie};
+    if (meta.viewid) views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
+    if (meta.shareid) shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
+    try {
+      fs.mkdirSync(path.dirname(session_log_path(username, sessioncookie)),
+        {recursive: true});
+    } catch (e) {}
+    save_reconnect_token(username, sessioncookie);
+    console.log("adopted cli termd session "+sessioncookie+" for "+username);
+    notifyPickers(username);
+  });
+}
+
 // Link wslogin to a detached termd session (owner or viewer, by view).
 // The daemon sends attached+resize+snapshot on link; wire_session
 // relays them to the connections (the reconnecting client is paused and
@@ -639,6 +708,7 @@ function finish_interrupted_sessions() {
   walk(session_dir, '');
 }
 finish_interrupted_sessions();
+termd_scan();
 var wwwdir = "www"; 
 
 var playback = null;
@@ -820,6 +890,7 @@ setInterval(function() {
 // tell wslogin, so probe the registry sockets periodically and clean up
 // the ghosts.
 var termd_sweep = setInterval(function() {
+  termd_scan();
   for (const username in sessions) {
     for (const sessioncookie in sessions[username]) {
       var session = sessions[username][sessioncookie];
@@ -1476,6 +1547,7 @@ wsServer.on('request', function(request) {
   // picker (with snapshots), or fall back to the login form when there are
   // none. The client replies with 'pick' (chosen reconnectid) or 'newsess'.
   function offerDisconnected(username, connection) {
+    termd_scan();
     var list = listDisconnected(username);
     if (list.length > 0) {
       connection.username = username;
@@ -1496,6 +1568,7 @@ wsServer.on('request', function(request) {
   // the picker so they choose one (or start a new session) instead of being
   // attached to the first one automatically.
   function ssoAutoLogin(ssoUser) {
+    termd_scan();
     if (listDisconnected(ssoUser).length > 0) {
       // Let the client authenticate itself first: browser tabs keep a
       // reconnect token in sessionStorage and answer the login prompt

@@ -153,7 +153,15 @@ function runSession(cols, rows) {
   // 0600: the meta and the recording are readable only by the session
   // user (the wslogin service user gets in through the ACLs on the dirs)
   fs.writeFileSync(metaPath(id), JSON.stringify({ id: id, cols: cols, rows: rows, start: now(), shell: shell }), { mode: 0o600 });
-  fs.writeFileSync(logfile, '', { mode: 0o600, flag: 'a' });
+  // 0660 (not 0600): the log dir has a default ACL granting the wslogin
+  // service user rw on new files, but the ACL mask is the intersection of
+  // that entry with the file's group permission bits - a 0600 create zeroes
+  // the mask, masks the wslogin entry away and the service can no longer
+  // read the header it uses to find the daemon (session start fails); 0660
+  // keeps the mask rw- so wslogin keeps its rw. Other users stay out as
+  // long as each user has a private group (the common default); a shared
+  // primary group would give its members rw on the recording
+  fs.writeFileSync(logfile, '', { mode: 0o660, flag: 'a' });
   var header = {
     username: os.userInfo().username, sessioncookie: process.env.TERMD_COOKIE || id,
     cols: cols, rows: rows, starttime: now(), shell: shell, termd: sockPath(id) };
