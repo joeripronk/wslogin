@@ -1,0 +1,14 @@
+{
+  "name": "termd",
+  "version": "0.1.0",
+  "description": "reattachable terminal daemon with integrated recording",
+  "main": "termd.js",
+  "bin": { "termd": "termd.js" },
+  "license": "MIT",
+  "dependencies": {
+    "@xterm/addon-serialize": "0.14.0",
+    "@xterm/headless": "6.0.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.0.0"
+  }
+}

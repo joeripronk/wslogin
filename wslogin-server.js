@@ -268,7 +268,7 @@ var termd_base = config.termd_dir
   : '/run/wslogin/termd';
 var termd_command = config.termd_command
   ? path.resolve(String(config.termd_command))
-  : path.join(__dirname, 'termd.js');
+  : path.join(__dirname, 'termd', 'termd.js');
 var termd = require('./termd-bridge');
 termd.init({
   termdBase: termd_base, termdCommand: termd_command, nodeCommand: process.execPath,
