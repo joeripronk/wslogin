@@ -204,7 +204,14 @@ function dropPrivileges(username) {
   // process list. sudo -b sends the child's stdio to /dev/null, so pipe
   // the output through systemd-cat to keep it in the journal (plain
   // /dev/null when systemd-cat is not installed).
-  var cmd = ['env', 'WSLOGIN_CONFIG='+configPath, process.execPath]
+  // sudo resets the environment, so systemd drop-in settings (e.g. the
+  // UV_USE_IO_URING=0 stall workaround) must be re-passed explicitly here
+  // or the detached server silently runs without them.
+  var envvars = ['WSLOGIN_CONFIG='+configPath];
+  if (process.env.UV_USE_IO_URING !== undefined) {
+    envvars.push('UV_USE_IO_URING='+process.env.UV_USE_IO_URING);
+  }
+  var cmd = ['env'].concat(envvars).concat([process.execPath])
     .concat(process.argv.slice(1)).map(shQuote).join(' ');
   var has_cat = spawnSync('sh', ['-c', 'command -v systemd-cat'], { encoding: 'utf8' }).status === 0;
   var redir = has_cat ? ' 2>&1 | systemd-cat -t wslogin' : ' >/dev/null 2>&1';
