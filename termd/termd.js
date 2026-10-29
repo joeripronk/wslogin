@@ -15,6 +15,9 @@
 // then register in wslogin's registry and show in the browser picker),
 // else $XDG_RUNTIME_DIR/termd; termd_dir from /etc/wslogin/config.ini,
 // default /run/wslogin/termd. The client scans both dirs.
+// the recording goes to wslogin's session_dir (same layout as wslogin's
+// own logs, see sessionLogPath) when wslogin is installed and the user's
+// log dir is writable there, else to sess-<id>.jsonl in the registry.
 // clients speak the wslogin framing: '\x01' + raw data, '\x00' + JSON.
 // daemon speaks: '\x00' resize, '\x01' snapshot/output, '\x00' b64, '\x00' exit.
 
@@ -45,7 +48,50 @@ function regDir() {
 }
 function sockPath(id) { return path.join(regDir(), id + '.sock'); }
 function metaPath(id) { return path.join(regDir(), id + '.meta'); }
-function logPath(id) { return process.env.TERMD_LOG || path.join(regDir(), 'sess-' + id + '.jsonl'); }
+function logPath(id) {
+  if (process.env.TERMD_LOG) return process.env.TERMD_LOG;
+  var cookie = process.env.TERMD_COOKIE || id;
+  return sessionLogPath(cookie) || path.join(regDir(), 'sess-' + id + '.jsonl');
+}
+
+// wslogin publishes its resolved session log layout (dir + template from
+// the server config) as .session-logs.json in the termd registry base,
+// written by wslogin-server at startup and in the sweep. CLI daemons
+// write their recording to <session_dir>/<username>/<cookie>.json like
+// wslogin-started sessions, so playback and the uploader see them; the
+// per-user log dir is ACLed for the user by wslogin (wslogin login,
+// adoption of a CLI daemon). No marker, no marker layout, an unusable
+// cookie, or a log dir the user cannot write (a user who never touched
+// wslogin) all fall back to the registry log sess-<id>.jsonl.
+var wsloginLogsCache = null;
+function wsloginLogs() {
+  if (wsloginLogsCache !== null) return wsloginLogsCache;
+  var reg = wsloginRegDir();
+  if (!reg) { wsloginLogsCache = false; return false; }
+  try {
+    var j = JSON.parse(fs.readFileSync(
+      path.join(path.dirname(reg), '.session-logs.json'), 'utf8'));
+    wsloginLogsCache = (j && typeof j.dir === 'string' && typeof j.template === 'string')
+      ? j : false;
+  } catch (e) { wsloginLogsCache = false; }
+  return wsloginLogsCache;
+}
+function safeCookie(cookie) { return /^[A-Za-z0-9._-]+$/.test(String(cookie)); }
+function sessionLogPath(cookie) {
+  var w = wsloginLogs();
+  if (!w || !safeCookie(cookie)) return null;
+  var user;
+  // the real uid, not $USER: $USER is user-controlled and would let a
+  // user write recordings into another user's session dir
+  try { user = os.userInfo().username; } catch (e) { return null; }
+  var rel = w.template.replace(/<username>/g, user).replace(/<session>/g, String(cookie));
+  if (!rel.endsWith('.json') || path.isAbsolute(rel) ||
+      path.normalize(rel).split(path.sep).indexOf('..') >= 0) return null;
+  var file = path.join(w.dir, rel);
+  try { fs.accessSync(path.dirname(file), fs.constants.W_OK | fs.constants.X_OK); }
+  catch (e) { return null; }
+  return file;
+}
 
 // registry dir of the wslogin-started sessions of the current user:
 // <termd_dir>/<user> with termd_dir from the wslogin config (readable
@@ -150,9 +196,13 @@ function runSession(cols, rows) {
   session.term = term; session.ser = ser;
 
   var logfile = logPath(id);
-  // 0600: the meta and the recording are readable only by the session
-  // user (the wslogin service user gets in through the ACLs on the dirs)
-  fs.writeFileSync(metaPath(id), JSON.stringify({ id: id, cols: cols, rows: rows, start: now(), shell: shell }), { mode: 0o600 });
+  // 0660 (not 0600, same reason as the log below): wslogin's termd_scan
+  // reads the sessioncookie from the meta to find the session log in
+  // session_dir; the ACL mask is the intersection with the file's group
+  // bits, so a 0600 create masks wslogin's inherited entry away. Other
+  // users stay out as long as each user has a private group.
+  fs.writeFileSync(metaPath(id), JSON.stringify({ id: id, cols: cols, rows: rows, start: now(), shell: shell,
+    sessioncookie: process.env.TERMD_COOKIE || id }), { mode: 0o660 });
   // 0660 (not 0600): the log dir has a default ACL granting the wslogin
   // service user rw on new files, but the ACL mask is the intersection of
   // that entry with the file's group permission bits - a 0600 create zeroes
@@ -618,12 +668,17 @@ function clientNew() {
         // identify our own daemon by the cookie in its log header:
         // a wslogin session started in the same window would otherwise
         // pass the fresh-by-mtime filter
-        var log = process.env.TERMD_LOG || path.join(entry.dir, 'sess-' + entry.id + '.jsonl');
+        var log = process.env.TERMD_LOG || sessionLogPath(marker)
+          || path.join(entry.dir, 'sess-' + entry.id + '.jsonl');
         try {
           var d = JSON.parse(fs.readFileSync(log, 'utf8').split('\n')[0]);
           if (!d || d.c !== 4) return false;
           var m = JSON.parse(d.d);
-          return m.sessioncookie === marker;
+          // the session_dir log path does not depend on the entry, so
+          // every entry reads the same header: match the socket too,
+          // otherwise all entries match and we attach a random daemon
+          return m.sessioncookie === marker &&
+            m.termd === path.join(entry.dir, entry.id + '.sock');
         } catch (e) { return false; }
       });
       if (mine.length === 0 && tries++ < 20) { setTimeout(attachNew, 250); return; }

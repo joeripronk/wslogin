@@ -49,16 +49,26 @@ function ensureTermdDir(username) {
   if (mk.status !== 0) console.error('mkdir ' + termdDir(username) + ' as ' + username + ' failed: ' + mk.stderr);
 }
 
+// The session log dir of a user: created by wslogin (so it lives in
+// session_dir, which the service user owns) with the session user
+// ACL-granted rwx (daemons started by the user write the recording
+// there) and a default ACL that keeps the service user rw on the logs
+// (tailer, finish rename) and their dir.
+function ensureLogDir(username) {
+  var dir = path.dirname(deps.sessionLogPath(username, 'x'));
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+  var dacl = deps.spawnSync('setfacl', ['-m', 'u:' + username + ':rwx', dir]);
+  if (dacl.status !== 0) console.error('setfacl log dir for ' + username + ' failed: ' + dacl.stderr);
+  var dfacl = deps.spawnSync('setfacl', ['-d', '-m', 'u:' + deps.wsloginUser + ':rw', dir]);
+  if (dfacl.status !== 0) console.error('setfacl default acl on log dir for ' + username + ' failed: ' + dfacl.stderr);
+}
+
 function termdSpawn(username, sessioncookie, cols, rows, meta, cb) {
   ensureTermdDir(username);
   var u = deps.lookupUser(username);
   if (!u) { cb(new Error('user ' + username + ' not found')); return; }
   var logfile = deps.sessionLogPath(username, sessioncookie);
-  fs.mkdirSync(path.dirname(logfile), { recursive: true });
-  var dacl = deps.spawnSync('setfacl', ['-m', 'u:' + username + ':rwx', path.dirname(logfile)]);
-  if (dacl.status !== 0) console.error('setfacl log dir for ' + username + ' failed: ' + dacl.stderr);
-  var dfacl = deps.spawnSync('setfacl', ['-d', '-m', 'u:' + deps.wsloginUser + ':rw', path.dirname(logfile)]);
-  if (dfacl.status !== 0) console.error('setfacl default acl on log dir for ' + username + ' failed: ' + dfacl.stderr);
+  ensureLogDir(username);
   var prefix = deps.userRunPrefix(username);
   var args = ['env',
     'HOME=' + u.home, 'USER=' + username, 'LOGNAME=' + username,
@@ -227,6 +237,7 @@ function termdLink(username, id, view) {
 module.exports = {
   init: init,
   ensureTermdDir: ensureTermdDir,
+  ensureLogDir: ensureLogDir,
   termdSpawn: termdSpawn,
   termdList: termdList,
   termdSnapshot: termdSnapshot,

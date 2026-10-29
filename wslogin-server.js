@@ -477,14 +477,35 @@ function termd_resume(meta) {
   });
 }
 
+// Publish the resolved session log layout for the termd CLI: daemons
+// started with `termd new` write their recording to session_dir with the
+// same template wslogin uses (see sessionLogPath in termd.js), so
+// playback and the uploader see CLI sessions like wslogin's own. The
+// marker carries the server-resolved paths; termd.js cannot resolve a
+// relative session_dir against the app dir itself.
+function termd_write_logs_marker() {
+  try {
+    // the base is normally created by the install scripts and by
+    // ensureTermdDir on the first login; create it here so a fresh boot
+    // has the marker before any login
+    fs.mkdirSync(termd_base, {recursive: true, mode: 0o755});
+    fs.writeFileSync(path.join(termd_base, '.session-logs.json'),
+      JSON.stringify({dir: session_dir, template: session_template}) + '\n',
+      {mode: 0o644});
+  } catch (e) {}
+}
+
 // Adopt CLI-started termd daemons: `termd new` (and login-shell mode)
-// registers in the same registry wslogin uses, but the session has no log
-// in session_dir and no map entry, so the picker never shows it. Scan the
-// registry dirs, probe the sockets wslogin does not know, and add the live
-// daemons as detached sessions; a reconnect links them like any termd
-// session (termd_cleanup_gone's finish_session is a no-op for their
-// session_dir-less logs, so the sweep removes the ghosts).
+// registers in the same registry wslogin uses, so the session shows in
+// the picker and reconnect works. Scan the registry dirs, probe the
+// sockets wslogin does not know, and add the live daemons as detached
+// sessions. Their log is in session_dir (named by the cookie in the
+// registry meta, cookie prefixed 'cli-' by the CLI); daemons of users
+// whose log dir wslogin never ACLed fall back to the registry log
+// sess-<id>.jsonl. wslogin-started daemons (no 'cli-' cookie, log in
+// session_dir) are resumed by finish_interrupted_sessions, not adopted.
 function termd_scan() {
+  termd_write_logs_marker();
   var users;
   try { users = fs.readdirSync(termd_base); } catch (e) { return; }
   for (var i = 0; i < users.length; i++) {
@@ -503,16 +524,35 @@ function termd_scan() {
         }
       }
       if (known) continue;
-      var meta = read_session_header(path.join(dir, 'sess-' + id + '.jsonl'));
-      if (!meta || meta.username !== username || !meta.sessioncookie) continue;
-      if (!meta.termd || !meta.termd.startsWith(dir + path.sep)) continue;
-      // wslogin-started daemons have their session log in session_dir;
-      // the startup scan resumes them, and an existing log means the
-      // session is wslogin's to manage (or already finished)
+      var meta = null;
       try {
-        if (fs.existsSync(session_log_path(username, meta.sessioncookie))) continue;
-      } catch (e) { continue; }
-      termd_adopt_cli(username, meta);
+        meta = JSON.parse(fs.readFileSync(path.join(dir, id + '.meta'), 'utf8'));
+      } catch (e) {}
+      var header = null, fromRegistry = false;
+      if (meta && /^[A-Za-z0-9._-]+$/.test(String(meta.sessioncookie || ''))) {
+        try {
+          header = read_session_header(session_log_path(username, meta.sessioncookie));
+        } catch (e) {}
+      }
+      if (!header) {
+        // daemons predating the session_dir logs (no cookie in the
+        // meta): their header is in the registry log
+        header = read_session_header(path.join(dir, 'sess-' + id + '.jsonl'));
+        fromRegistry = true;
+      }
+      if (!header || header.username !== username || !header.sessioncookie) continue;
+      if (!header.termd || !header.termd.startsWith(dir + path.sep)) continue;
+      if (fromRegistry) {
+        // wslogin-started daemons have their session log in session_dir;
+        // the startup scan resumes them, and an existing log means the
+        // session is wslogin's to manage (or already finished)
+        try {
+          if (fs.existsSync(session_log_path(username, header.sessioncookie))) continue;
+        } catch (e) { continue; }
+      } else if (!String(header.sessioncookie).startsWith('cli-')) {
+        continue;
+      }
+      termd_adopt_cli(username, header);
     }
   }
 }
@@ -536,10 +576,15 @@ function termd_adopt_cli(username, meta) {
     reconnects[reconnectid] = {username: username, sessioncookie: sessioncookie};
     if (meta.viewid) views[meta.viewid] = {sessioncookie: sessioncookie, username: username};
     if (meta.shareid) shares[meta.shareid] = {sessioncookie: sessioncookie, username: username};
-    try {
-      fs.mkdirSync(path.dirname(session_log_path(username, sessioncookie)),
-        {recursive: true});
-    } catch (e) {}
+    // create the session log dir with the ACLs termdSpawn gives wslogin
+    // sessions: the daemon writes its recording in session_dir when the
+    // dir is there and writable for it, and the reconnect token sidecar
+    // needs it now that the session is wslogin's to manage. session_log_path
+    // throws on an unsafe template, and this runs in a probe callback -
+    // an uncaught throw there would take down the server
+    try { termd.ensureLogDir(username); } catch (e) {
+      console.error("cannot prepare the log dir for "+username+": "+e.message);
+    }
     save_reconnect_token(username, sessioncookie);
     console.log("adopted cli termd session "+sessioncookie+" for "+username);
     notifyPickers(username);
@@ -697,8 +742,11 @@ function finish_interrupted_sessions() {
       if (!parts) continue;
       var file = path.join(dir, entry.name);
       var meta = read_session_header(file);
-      if (meta && meta.termd && meta.username && meta.sessioncookie
-          && meta.termd.startsWith(termd_base + path.sep)) {
+      // session_dir is writable for the session users (their daemons write
+      // their recordings there), so a log may claim any username in its
+      // header; resume only from a header that names its own directory
+      if (meta && meta.termd && meta.username && meta.username === parts.username
+          && meta.sessioncookie && meta.termd.startsWith(termd_base + path.sep)) {
         termd_resume(meta);
       } else {
         finish_path(file);
